@@ -6,6 +6,7 @@ import { effectiveAuthority, SQL_AUTOMATIC_COMPENSATION_AUTHORITY, SQL_AUTOMATIC
 import { assertShadowObservationSchema, deriveShadowSemantics } from "./shadowSemantics.js";
 import { composeReadiness, probeCredentialAvailability, runPreflight, type IntegrationReadiness, type PreflightProbe, type PreflightStatus } from "./readiness.js";
 import type { SecretProvider } from "./secretProvider.js";
+import { pruneIdempotencyKeys, withIdempotency, type IdempotentOperation } from "./idempotency.js";
 import { emptyMetrics, METRIC_DEFINITIONS, optionalMetricNumber, requireBreakdown, requireMetricInt, resolveRange, type CanonicalMetrics, type InterventionKind, type InterventionSummary, type MetricRange } from "./canonicalMetrics.js";
 import type { OutcomeResolution } from "../model/resolution.js";
 import { runFailureLabEngine } from "./failureLabEngine.js";
@@ -1114,6 +1115,17 @@ export class ProductRepository {
   async attestSdkInstalled(scope:TenantScope):Promise<void>{const progress=await this.onboardingProgress(scope);const completed=progress.completed as boolean[];if(!completed.slice(0,6).every(Boolean))throw new Error("Complete provider, EffectSpec, and API-key setup before SDK attestation");const result=await this.db.query(`UPDATE nyst_environments SET onboarding_stage=GREATEST(onboarding_stage,7) WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 RETURNING environment_id`,[scope.environment_id,scope.project_id,scope.organization_id]);if(!result.rows.length)throw new Error("Resource belongs to a different tenant scope");}
 
   private async audit(scope:TenantScope,userId:string,eventType:string,targetType:string,targetId:string,detail:Record<string,unknown>):Promise<void>{await this.db.query(`INSERT INTO nyst_audit_events(audit_event_id,organization_id,project_id,environment_id,actor_user_id,event_type,target_type,target_id,detail) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,[randomUUID(),scope.organization_id,scope.project_id,scope.environment_id,userId,eventType,targetType,targetId,detail]);}
+
+  /**
+   * Run a control-plane operation at most once per (environment, operation,
+   * idempotency key). See idempotency.ts for the exact replay/conflict rules.
+   */
+  async idempotent<T>(scope:TenantScope,operation:IdempotentOperation,key:string|null,body:unknown,operationFn:()=>Promise<T>):Promise<{value:T;replayed:boolean}>{
+    return withIdempotency(this.db,scope,operation,key,body,operationFn);
+  }
+
+  /** Maintenance sweep. Never called on the request hot path. */
+  async pruneIdempotencyKeys():Promise<number>{return pruneIdempotencyKeys(this.db);}
 
   private async requireTenantScope(scope: TenantScope): Promise<void> {
     const result = await this.db.query(`SELECT 1 FROM nyst_environments WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`, [scope.environment_id, scope.project_id, scope.organization_id]);
