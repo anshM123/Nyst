@@ -8,6 +8,8 @@ import { actionPage, actionsPage, effectRegistryPage, failureLabPage, genericPag
 import { digest, ProductRepository } from "./productRepository.js";
 import type { PreflightProbeResult } from "./readiness.js";
 import type { SecretProvider } from "./secretProvider.js";
+import { NYST_SAFETY_FLOOR } from "./policyTemplates.js";
+import { protectionReportCsv } from "./protectionReport.js";
 import { sanitizeForProduct } from "./sanitize.js";
 import type { EffectSpecDescriptor, ProductCommitter, ProductContext, ProductPrincipal } from "./types.js";
 import type { InMemoryOperationalMetrics } from "./scheduler.js";
@@ -23,6 +25,37 @@ const API_SCOPES = new Set(["actions:read", "actions:write", "receipts:read", "i
  * is unconditional: the operation runs at most once and an exact replay returns
  * the stored response without re-running anything.
  */
+/**
+ * Authoritative monetary value of an action, taken ONLY from the structured
+ * EffectSpec input. Nyst never infers an amount from free text; an effect
+ * without a structured amount reports null and a monetary budget then fails
+ * closed rather than guessing.
+ */
+function authoritativeAmountMinor(input: unknown): number | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const value = (input as Record<string, unknown>).amount_minor;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+function authoritativeCurrency(input: unknown): string | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const value = (input as Record<string, unknown>).currency;
+  return typeof value === "string" && /^[a-z]{3}$/.test(value) ? value : null;
+}
+
+function optionalInteger(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) throw Object.assign(new Error("Limits must be positive integers"), { statusCode: 400 });
+  return value;
+}
+
+function metricRange(value: unknown): "24h" | "7d" | "30d" | "custom" | "all" {
+  const text = value === undefined ? "7d" : String(value);
+  if (text !== "24h" && text !== "7d" && text !== "30d" && text !== "custom" && text !== "all") {
+    throw Object.assign(new Error("range must be one of 24h, 7d, 30d, custom, all"), { statusCode: 400 });
+  }
+  return text;
+}
+
 function idempotencyKey(request: FastifyRequest): string | null {
   const raw = request.headers["idempotency-key"];
   const value = Array.isArray(raw) ? raw[0] : raw;
@@ -108,7 +141,15 @@ export async function buildProductServer(options: ProductServerOptions): Promise
    * and belongs on the Shadow endpoint, because Nyst must never imply it
    * controlled an action it did not.
    */
-  app.post("/v1/actions", api(async (principal, request) => { requireScope(principal, "actions:write"); requireCsrf(request, principal); if (!options.commit) throw Object.assign(new Error("Commit unavailable"), { statusCode: 503 }); const body = object(request.body); const effect = string(body.effect, 200); const businessKey = string(body.businessKey, 463); const agentId = await options.repository.resolveActingAgent(principal, body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36)); const execution = await options.repository.resolveExecutionMode(principal, agentId, effect); if (execution.mode === "shadow") throw Object.assign(new Error(execution.reason), { statusCode: 409 }); const policy=await options.repository.currentPolicy(principal,effect); if(policy.execution_mode==="approval_required"&&(principal.kind!=="session"||body.approved!==true)) throw Object.assign(new Error("Human approval required before execution"),{statusCode:409}); const availability = await options.repository.requireEffectSpec(principal, effect, options.effect_specs, options.production === true); const namespacedKey = `${principal.environment_id}:${businessKey}`; const started=Date.now(); const result = await options.commit({ effect, businessKey: namespacedKey, displayBusinessKey: businessKey, input: withCredentialReference(body.input, availability.credential_ref), credential_ref: availability.credential_ref, policy_version_id: policy.policy_version_id, environment_mode: execution.mode === "canary" ? "canary" : "enforced", agent_id: agentId }, principal); options.metrics?.observe("action_commit_latency_ms",Date.now()-started); await options.repository.recordResolutionTransition(result.action.action_id,result.resolution,"action_commit"); return sanitizeForProduct({ ...result, execution_mode: execution.mode, canary_rule_id: execution.canary_rule_id }); }, options.repository));
+  app.post("/v1/actions", api(async (principal, request) => { requireScope(principal, "actions:write"); requireCsrf(request, principal); if (!options.commit) throw Object.assign(new Error("Commit unavailable"), { statusCode: 503 }); const body = object(request.body); const effect = string(body.effect, 200); const businessKey = string(body.businessKey, 463); const agentId = await options.repository.resolveActingAgent(principal, body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36)); const execution = await options.repository.resolveExecutionMode(principal, agentId, effect); if (execution.mode === "shadow") throw Object.assign(new Error(execution.reason), { statusCode: 409 }); const policy=await options.repository.currentPolicy(principal,effect); if(policy.execution_mode==="approval_required"&&(principal.kind!=="session"||body.approved!==true)) throw Object.assign(new Error("Human approval required before execution"),{statusCode:409}); const availability = await options.repository.requireEffectSpec(principal, effect, options.effect_specs, options.production === true); const namespacedKey = `${principal.environment_id}:${businessKey}`;
+    // ADMISSION GATE: Emergency Freeze and Blast Radius are evaluated together,
+    // in one linearized statement, BEFORE any provider preparation happens.
+    const admission = await options.repository.admitConsequence(principal, { agent_id: agentId, effect_name: effect, business_key: businessKey, amount_minor: authoritativeAmountMinor(body.input), currency: authoritativeCurrency(body.input) });
+    // A blocked consequence never becomes an action, so there is no action row to
+    // hang a Human Review on. The durable intervention written by admitConsequence
+    // IS the operator-facing artefact, and Needs Attention surfaces it beside
+    // action-backed reviews. Inventing an action here would be fabricating truth.
+    if (!admission.admitted) throw Object.assign(new Error(admission.reason), { statusCode: 409, nyst_blocked_by: admission.blocked_by }); const started=Date.now(); const result = await options.commit({ effect, businessKey: namespacedKey, displayBusinessKey: businessKey, input: withCredentialReference(body.input, availability.credential_ref), credential_ref: availability.credential_ref, policy_version_id: policy.policy_version_id, environment_mode: execution.mode === "canary" ? "canary" : "enforced", agent_id: agentId }, principal); options.metrics?.observe("action_commit_latency_ms",Date.now()-started); await options.repository.linkAdmission(admission.admission_id, result.action.action_id); await options.repository.recordResolutionTransition(result.action.action_id,result.resolution,"action_commit"); return sanitizeForProduct({ ...result, execution_mode: execution.mode, canary_rule_id: execution.canary_rule_id }); }, options.repository));
   app.get("/v1/actions/:id", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, sanitizeForProduct(await options.repository.actionDetail(principal, routeId(request))));}, options.repository));
   app.get("/v1/actions/:id/evidence", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, sanitizeForProduct(await options.repository.evidence(principal, routeId(request))));}, options.repository));
   app.get("/v1/actions/:id/resolutions", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, sanitizeForProduct(await options.repository.resolutions(principal, routeId(request))));}, options.repository));
@@ -129,6 +170,23 @@ export async function buildProductServer(options: ProductServerOptions): Promise
 
   /** What mode WOULD this Agent + EffectSpec execute under right now, and why. */
   app.get("/v1/execution-mode", api(async (principal,request)=>{requireAnyScope(principal,["actions:read","integrations:read"]);const query=request.query as {agent_id?:unknown;effect?:unknown};const agentId=query.agent_id===undefined?null:string(String(query.agent_id),36);return options.repository.resolveExecutionMode(principal,agentId,string(String(query.effect??""),200));},options.repository));
+
+  /* ---------------- Blast Radius (Phase 10) ---------------- */
+  app.get("/v1/blast-radius", api(async (principal)=>{requireAnyScope(principal,["actions:read","integrations:read"]);return {budgets:await options.repository.blastRadiusBudgets(principal),recent_decisions:await options.repository.blastRadiusDecisions(principal)};},options.repository));
+  app.post("/v1/blast-radius", api(async (principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const body=object(request.body);const windowSeconds=Number(body.window_seconds);if(!Number.isInteger(windowSeconds)||windowSeconds<60||windowSeconds>86400)throw Object.assign(new Error("window_seconds must be an integer between 60 and 86400"),{statusCode:400});const idempotent=await options.repository.idempotent(principal,"blast_radius.configure",idempotencyKey(request),body,async()=>options.repository.createBlastRadiusBudget(principal,principal.user_id!,{agent_id:body.agent_id===undefined||body.agent_id===null?null:string(body.agent_id,36),effect_name:body.effect_name===undefined||body.effect_name===null?null:string(body.effect_name,200),window_seconds:windowSeconds,max_actions_per_window:optionalInteger(body.max_actions_per_window),max_amount_minor_per_action:optionalInteger(body.max_amount_minor_per_action),max_amount_minor_per_window:optionalInteger(body.max_amount_minor_per_window),currency:body.currency===undefined||body.currency===null?null:string(body.currency,3)}));return idempotent.value;},options.repository));
+
+  /* ---------------- Emergency Freeze (Phase 11) ---------------- */
+  app.get("/v1/freezes", api(async (principal)=>{requireAnyScope(principal,["actions:read","integrations:read"]);return options.repository.freezes(principal);},options.repository));
+  app.post("/v1/freezes", api(async (principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const body=object(request.body);const idempotent=await options.repository.idempotent(principal,"freeze.activate",idempotencyKey(request),body,async()=>options.repository.activateFreeze(principal,principal.user_id!,{scope_agent_id:body.scope_agent_id===undefined||body.scope_agent_id===null?null:string(body.scope_agent_id,36),scope_effect_name:body.scope_effect_name===undefined||body.scope_effect_name===null?null:string(body.scope_effect_name,200),reason:body.reason===undefined?"":string(body.reason,500)}));return idempotent.value;},options.repository));
+  app.post("/v1/freezes/:id/release", api(async (principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const body=object(request.body);if(body.confirm!==true)throw Object.assign(new Error("Releasing an Emergency Freeze requires explicit confirmation"),{statusCode:400});const idempotent=await options.repository.idempotent(principal,"freeze.release",idempotencyKey(request),{id:routeId(request),body},async()=>options.repository.releaseFreeze(principal,principal.user_id!,routeId(request),string(body.reason ?? "Released",500)));return idempotent.value;},options.repository));
+
+  /* ---------------- Policy templates (Phase 12) ---------------- */
+  app.get("/v1/policy-templates", api(async (principal)=>{requireAnyScope(principal,["actions:read","integrations:read"]);return {templates:await options.repository.policyTemplates(),safety_floor:NYST_SAFETY_FLOOR};},options.repository));
+  app.post("/v1/policy-templates/:template", api(async (principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const template=String((request.params as {template?:unknown}).template??"");if(template!=="access_revocation"&&template!=="financial_action"&&template!=="high_risk_production")throw Object.assign(new Error("Unknown policy template"),{statusCode:400});const body=object(request.body);const effect=body.effect_name===undefined||body.effect_name===null?null:string(body.effect_name,200);const idempotent=await options.repository.idempotent(principal,"policy.create_version",idempotencyKey(request),{template,effect},async()=>options.repository.createPolicyFromTemplate(principal,principal.user_id!,template,effect));return idempotent.value;},options.repository));
+
+  /* ---------------- Protection Report (Phase 9) ---------------- */
+  app.get("/v1/protection-report", api(async (principal,request)=>{requireScope(principal,"actions:read");if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const query=request.query as {range?:unknown;from?:unknown;to?:unknown;format?:unknown};const range=metricRange(query.range);const report=await options.repository.protectionReport(principal,options.secrets,range,query.from===undefined?undefined:String(query.from),query.to===undefined?undefined:String(query.to));return report;},options.repository));
+  app.get("/v1/protection-report.csv", api(async (principal,request,reply)=>{requireScope(principal,"actions:read");if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const query=request.query as {range?:unknown};const report=await options.repository.protectionReport(principal,options.secrets,metricRange(query.range));reply.header("Content-Type","text/csv; charset=utf-8");reply.header("Content-Disposition",`attachment; filename="nyst-protection-report.csv"`);return protectionReportCsv(report);},options.repository));
 
   app.get("/v1/effect-specs", api(async (principal) => {requireAnyScope(principal,["actions:read","integrations:read"]);return options.repository.effectSpecConfiguration(principal, options.effect_specs, options.production === true);}, options.repository));
   app.put("/v1/effect-specs/:effect", api(async (principal,request)=>{if(principal.kind!=="session")throw Object.assign(new Error("Session required"),{statusCode:403});requireCsrf(request,principal);const effect=string(String((request.params as {effect?:unknown}).effect??""),200);const descriptor=options.effect_specs.find(item=>item.effect_name===effect);if(!descriptor)throw Object.assign(new Error("Unknown EffectSpec"),{statusCode:400});const body=object(request.body);if(typeof body.enabled!=="boolean")throw Object.assign(new Error("Boolean enabled required"),{statusCode:400});if(descriptor.provider==="fake"&&options.production===true&&body.enabled)throw Object.assign(new Error("Fake provider unavailable in production"),{statusCode:409});await options.repository.configureEffectSpec(principal,descriptor,body.enabled);return {effect_name:descriptor.effect_name,spec_version:descriptor.spec_version,enabled:body.enabled};},options.repository));

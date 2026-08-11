@@ -7,6 +7,9 @@ import { assertShadowObservationSchema, deriveShadowSemantics } from "./shadowSe
 import { composeReadiness, probeCredentialAvailability, runPreflight, type IntegrationReadiness, type PreflightProbe, type PreflightStatus } from "./readiness.js";
 import type { SecretProvider } from "./secretProvider.js";
 import { pruneIdempotencyKeys, withIdempotency, type IdempotentOperation } from "./idempotency.js";
+import { admitConsequence, linkAdmissionToAction, type AdmissionDecision, type AdmissionRequest } from "./admission.js";
+import { POLICY_TEMPLATES, type PolicyTemplateId } from "./policyTemplates.js";
+import { buildProtectionReport, type HighestRiskIncident, type ProtectionReport } from "./protectionReport.js";
 import { emptyMetrics, METRIC_DEFINITIONS, optionalMetricNumber, requireBreakdown, requireMetricInt, resolveRange, type CanonicalMetrics, type InterventionKind, type InterventionSummary, type MetricRange } from "./canonicalMetrics.js";
 import type { OutcomeResolution } from "../model/resolution.js";
 import { runFailureLabEngine } from "./failureLabEngine.js";
@@ -429,15 +432,15 @@ export class ProductRepository {
       FROM nyst_policy_versions WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 ORDER BY effect_name NULLS FIRST,version DESC`, [scope.environment_id, scope.project_id, scope.organization_id])).rows;
   }
 
-  async createPolicyVersion(scope: TenantScope, userId: string, input: { effect_name: string | null; execution_mode: "automatic" | "approval_required"; auto_continuation: boolean; auto_compensation: boolean; reconcile_timeout_seconds: number }): Promise<Record<string, unknown>> {
+  async createPolicyVersion(scope: TenantScope, userId: string, input: { effect_name: string | null; execution_mode: "automatic" | "approval_required"; auto_continuation: boolean; auto_compensation: boolean; reconcile_timeout_seconds: number; template_id?: string | null }): Promise<Record<string, unknown>> {
     await this.requireTenantScope(scope);
     if (!['automatic','approval_required'].includes(input.execution_mode) || !Number.isInteger(input.reconcile_timeout_seconds) || input.reconcile_timeout_seconds < 30 || input.reconcile_timeout_seconds > 86400) throw new Error("Invalid conservative policy");
     const id = randomUUID();
-    const result = await this.db.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by)
-      SELECT $1,$2,$3,$4,$5,coalesce(max(version),0)+1,$6,'never',$7,$8,$9,$10 FROM nyst_policy_versions
+    const result = await this.db.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by,template_id)
+      SELECT $1,$2,$3,$4,$5,coalesce(max(version),0)+1,$6,'never',$7,$8,$9,$10,$11 FROM nyst_policy_versions
       WHERE environment_id=$2 AND (effect_name IS NOT DISTINCT FROM $5)
-      RETURNING policy_version_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds`,
-      [id, scope.environment_id, scope.project_id, scope.organization_id, input.effect_name, input.execution_mode, input.auto_continuation, input.auto_compensation, input.reconcile_timeout_seconds, userId]);
+      RETURNING policy_version_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,template_id`,
+      [id, scope.environment_id, scope.project_id, scope.organization_id, input.effect_name, input.execution_mode, input.auto_continuation, input.auto_compensation, input.reconcile_timeout_seconds, userId, input.template_id ?? null]);
     await this.audit(scope, userId, "policy.version_created", "policy", id, { effect_name: input.effect_name });
     return result.rows[0]!;
   }
@@ -1283,6 +1286,240 @@ export class ProductRepository {
           reason: "This Agent and EffectSpec are outside the Canary enforcement scope, so the action is evaluated as Shadow." };
   }
 
+
+  /* ==================================================================
+   * BLAST RADIUS (Phase 10) and EMERGENCY FREEZE (Phase 11)
+   * ================================================================== */
+
+  async createBlastRadiusBudget(scope: TenantScope, userId: string, input: {
+    agent_id?: string | null; effect_name?: string | null; window_seconds: number;
+    max_actions_per_window?: number | null; max_amount_minor_per_action?: number | null;
+    max_amount_minor_per_window?: number | null; currency?: string | null;
+  }): Promise<Record<string, unknown>> {
+    await this.requireTenantScope(scope);
+    if (input.agent_id && !UUID_PATTERN.test(input.agent_id)) throw new Error("Invalid Agent identifier");
+    for (const value of [input.max_amount_minor_per_action, input.max_amount_minor_per_window]) {
+      if (value !== null && value !== undefined && (!Number.isInteger(value) || value < 1)) {
+        throw new Error("Monetary limits are integer minor units");
+      }
+    }
+    const result = await this.db.query(`INSERT INTO nyst_blast_radius_budgets(budget_id,environment_id,project_id,organization_id,agent_id,effect_name,window_seconds,max_actions_per_window,max_amount_minor_per_action,max_amount_minor_per_window,currency,created_by)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT(environment_id,agent_id,effect_name) DO UPDATE SET window_seconds=excluded.window_seconds,
+        max_actions_per_window=excluded.max_actions_per_window,max_amount_minor_per_action=excluded.max_amount_minor_per_action,
+        max_amount_minor_per_window=excluded.max_amount_minor_per_window,currency=excluded.currency,enabled=true
+      RETURNING budget_id,agent_id,effect_name,window_seconds,max_actions_per_window,max_amount_minor_per_action,max_amount_minor_per_window,currency,enabled`,
+      [randomUUID(), scope.environment_id, scope.project_id, scope.organization_id, input.agent_id ?? null,
+       input.effect_name ? bounded(input.effect_name, 200, "effect") : null, input.window_seconds,
+       input.max_actions_per_window ?? null, input.max_amount_minor_per_action ?? null,
+       input.max_amount_minor_per_window ?? null, input.currency ?? null, userId]);
+    await this.audit(scope, userId, "blast_radius.configured", "budget", String(result.rows[0]!.budget_id), {});
+    return result.rows[0]!;
+  }
+
+  async blastRadiusBudgets(scope: TenantScope): Promise<Record<string, unknown>[]> {
+    return (await this.db.query(`SELECT b.budget_id,b.agent_id,a.name agent_name,b.effect_name,b.window_seconds,
+        b.max_actions_per_window,b.max_amount_minor_per_action,b.max_amount_minor_per_window,b.currency,b.enabled,
+        (SELECT count(*)::int FROM nyst_consequence_admissions ca WHERE ca.environment_id=b.environment_id AND ca.admitted
+          AND (b.agent_id IS NULL OR ca.agent_id=b.agent_id) AND (b.effect_name IS NULL OR ca.effect_name=b.effect_name)
+          AND ca.decided_at > now() - make_interval(secs => b.window_seconds)) used_actions,
+        (SELECT coalesce(sum(ca.amount_minor),0)::bigint FROM nyst_consequence_admissions ca WHERE ca.environment_id=b.environment_id AND ca.admitted
+          AND (b.agent_id IS NULL OR ca.agent_id=b.agent_id) AND (b.effect_name IS NULL OR ca.effect_name=b.effect_name)
+          AND ca.decided_at > now() - make_interval(secs => b.window_seconds)) used_amount_minor
+      FROM nyst_blast_radius_budgets b LEFT JOIN nyst_agents a USING(agent_id)
+      WHERE b.environment_id=$1 AND b.project_id=$2 AND b.organization_id=$3 ORDER BY b.created_at`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows;
+  }
+
+  async blastRadiusDecisions(scope: TenantScope, limit = 25): Promise<Record<string, unknown>[]> {
+    return (await this.db.query(`SELECT decision_id,budget_id,agent_id,effect_name,decision,limit_kind,observed_value,limit_value,window_seconds,business_key,reason,decided_at
+      FROM nyst_blast_radius_decisions WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3
+      ORDER BY decided_at DESC LIMIT $4`, [scope.environment_id, scope.project_id, scope.organization_id, Math.min(Math.max(1, limit), 200)])).rows;
+  }
+
+  /**
+   * Activate an Emergency Freeze.
+   *
+   * Becomes effective the instant the row commits; admission consults it in
+   * the same statement that admits a consequence, so nothing can slip past the
+   * boundary. Read-only observation and reconciliation are unaffected.
+   */
+  async activateFreeze(scope: TenantScope, userId: string, input: { scope_agent_id?: string | null; scope_effect_name?: string | null; reason?: string }): Promise<Record<string, unknown>> {
+    await this.requireTenantScope(scope);
+    if (input.scope_agent_id && !UUID_PATTERN.test(input.scope_agent_id)) throw new Error("Invalid Agent identifier");
+    const result = await this.db.query(`INSERT INTO nyst_freezes(freeze_id,environment_id,project_id,organization_id,scope_agent_id,scope_effect_name,reason,activated_by)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+      RETURNING freeze_id,scope_agent_id,scope_effect_name,reason,activated_by,activated_at`,
+      [randomUUID(), scope.environment_id, scope.project_id, scope.organization_id,
+       input.scope_agent_id ?? null, input.scope_effect_name ? bounded(input.scope_effect_name, 200, "effect") : null,
+       input.reason ? bounded(input.reason, 500, "freeze reason") : "", userId]).catch((error: unknown) => {
+      if (String(error).includes("nyst_freezes_one_active")) throw new Error("An Emergency Freeze is already active for this exact scope");
+      throw error;
+    });
+    await this.audit(scope, userId, "freeze.activated", "freeze", String(result.rows[0]!.freeze_id), { scope_agent_id: input.scope_agent_id ?? null, scope_effect_name: input.scope_effect_name ?? null });
+    return result.rows[0]!;
+  }
+
+  /** Release a freeze. Requires an explicit authorized actor; never automatic. */
+  async releaseFreeze(scope: TenantScope, userId: string, freezeId: string, reason: string): Promise<Record<string, unknown>> {
+    const result = await this.db.query(`UPDATE nyst_freezes SET released_at=now(),released_by=$5,release_reason=$6
+      WHERE freeze_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4 AND released_at IS NULL
+      RETURNING freeze_id,scope_agent_id,scope_effect_name,activated_at,released_at,released_by`,
+      [freezeId, scope.environment_id, scope.project_id, scope.organization_id, userId, bounded(reason || "Released", 500, "release reason")]);
+    if (!result.rows.length) throw new Error("No active freeze with that identity exists in this tenant scope");
+    await this.audit(scope, userId, "freeze.released", "freeze", freezeId, {});
+    return result.rows[0]!;
+  }
+
+  async freezes(scope: TenantScope): Promise<{ active: Record<string, unknown>[]; history: Record<string, unknown>[] }> {
+    const rows = (await this.db.query(`SELECT f.freeze_id,f.scope_agent_id,a.name scope_agent_name,f.scope_effect_name,f.reason,
+        f.activated_at,u.display_name activated_by_name,f.released_at,f.release_reason
+      FROM nyst_freezes f LEFT JOIN nyst_agents a ON a.agent_id=f.scope_agent_id LEFT JOIN nyst_users u ON u.user_id=f.activated_by
+      WHERE f.environment_id=$1 AND f.project_id=$2 AND f.organization_id=$3 ORDER BY f.activated_at DESC LIMIT 50`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows;
+    return { active: rows.filter((row) => row.released_at === null), history: rows };
+  }
+
+  /** Is any freeze currently covering this scope? Used by the UI banner. */
+  async freezeState(scope: TenantScope): Promise<{ frozen: boolean; freezes: Record<string, unknown>[] }> {
+    const { active } = await this.freezes(scope);
+    return { frozen: active.length > 0, freezes: active };
+  }
+
+  /**
+   * The single admission gate. Records the decision, and on a HOLD also records
+   * a durable intervention and opens Human Review, because a blocked
+   * consequence is exactly the kind of event an operator must see.
+   */
+  async admitConsequence(scope: TenantScope, request: AdmissionRequest): Promise<AdmissionDecision> {
+    const decision = await admitConsequence(this.db, scope, request);
+    if (!decision.admitted) {
+      await this.recordIntervention(scope, {
+        kind: decision.blocked_by === "freeze" ? "freeze_blocked" : "blast_radius_hold",
+        agent_id: request.agent_id ?? null, effect_name: request.effect_name,
+        mode: normalizeMode((await this.environmentControl(scope)).mode),
+        intervention_key: `${decision.blocked_by}:${scope.environment_id}:${request.effect_name}:${request.business_key}`,
+        summary: decision.reason,
+        detail: { limit_kind: decision.limit_kind, observed_value: decision.observed_value, limit_value: decision.limit_value, window_seconds: decision.window_seconds },
+        action_id: null,
+      });
+    }
+    return decision;
+  }
+
+  async linkAdmission(admissionId: string, actionId: string): Promise<void> { await linkAdmissionToAction(this.db, admissionId, actionId); }
+
+  async admissionHistory(scope: TenantScope, limit = 25): Promise<Record<string, unknown>[]> {
+    return (await this.db.query(`SELECT admission_id,agent_id,effect_name,business_key,amount_minor,currency,admitted,blocked_by,reason,decided_at
+      FROM nyst_consequence_admissions WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3
+      ORDER BY decided_at DESC LIMIT $4`, [scope.environment_id, scope.project_id, scope.organization_id, Math.min(Math.max(1, limit), 200)])).rows;
+  }
+
+  /* ==================================================================
+   * POLICY TEMPLATES (Phase 12)
+   * ================================================================== */
+
+  /**
+   * Create a policy version from a built-in template.
+   *
+   * Templates use the EXISTING policy engine — they are ordinary versioned
+   * policies with sensible starting values. There is no second policy engine
+   * and no policy DSL. A customer may then make a template STRICTER; nothing
+   * can make it weaker than the Nyst safety floor, because the floor is
+   * applied by the runtime, not by the policy.
+   */
+  async createPolicyFromTemplate(scope: TenantScope, userId: string, templateId: PolicyTemplateId, effectName: string | null): Promise<Record<string, unknown>> {
+    const template = POLICY_TEMPLATES.find((item) => item.template_id === templateId);
+    if (!template) throw new Error("Unknown policy template");
+    // Written at INSERT time: a policy version is immutable once created, so
+    // the template provenance has to be part of the original row.
+    const created = await this.createPolicyVersion(scope, userId, { effect_name: effectName, ...template.policy, template_id: templateId });
+    return { ...created, template_name: template.name };
+  }
+
+  async policyTemplates(): Promise<typeof POLICY_TEMPLATES> { return POLICY_TEMPLATES; }
+
+
+  /* ==================================================================
+   * PROTECTION REPORT (Phase 9)
+   * ================================================================== */
+
+  /** Assemble the buyer-facing report entirely from persisted records. */
+  async protectionReport(scope: TenantScope, secrets: SecretProvider, rangeLabel: MetricRange["label"] = "7d", from?: string, to?: string, now: Date = new Date()): Promise<ProtectionReport> {
+    const [metrics, info, readiness] = await Promise.all([
+      this.canonicalMetrics(scope, rangeLabel, from, to, now),
+      this.projectInfo(scope),
+      this.integrationsReadiness(scope, secrets, now),
+    ]);
+
+    const unresolved = Number((await this.db.query(
+      `SELECT count(*)::int c FROM nyst_human_reviews WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND status='open'`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows[0]!.c);
+
+    // Highest-risk incident: the most severe UNRESOLVED state Nyst currently
+    // holds, ranked by how little it can prove. Chosen from persisted rows.
+    const incident = (await this.db.query(`SELECT s.action_id,a.effect_name,ag.name agent_name,r.effect_state,r.primary_directive,r.resolved_at,
+        r.retry_disposition,r.continuation_disposition,
+        (a.input->>'amount_minor')::bigint amount_minor,a.input->>'currency' currency
+      FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id) LEFT JOIN nyst_agents ag ON ag.agent_id=s.agent_id
+      JOIN LATERAL(SELECT * FROM outcome_resolutions WHERE action_id=s.action_id ORDER BY resolution_sequence DESC NULLS LAST,resolved_at DESC LIMIT 1) r ON true
+      JOIN nyst_environments env ON env.environment_id=s.environment_id AND env.is_demo=false
+      WHERE s.environment_id=$1 AND s.project_id=$2 AND s.organization_id=$3
+        AND r.effect_state IN ('unprovable','pending','satisfied_unattributed')
+      ORDER BY CASE r.effect_state WHEN 'unprovable' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, r.resolved_at DESC LIMIT 1`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows[0];
+
+    const highest: HighestRiskIncident | null = incident ? {
+      action_id: String(incident.action_id),
+      effect_name: String(incident.effect_name),
+      agent_name: incident.agent_name ? String(incident.agent_name) : null,
+      effect_state: String(incident.effect_state),
+      control_decision: String(incident.primary_directive),
+      occurred_at: new Date(String(incident.resolved_at)).toISOString(),
+      explanation: incidentExplanation(String(incident.effect_state), String(incident.retry_disposition), String(incident.continuation_disposition)),
+      exposure: incident.amount_minor !== null && incident.amount_minor !== undefined && typeof incident.currency === "string"
+        ? { amount_minor: Number(incident.amount_minor), currency: String(incident.currency) } : null,
+    } : null;
+
+    const byAgent = (await this.db.query(`SELECT coalesce(ag.name,'unattributed') agent,count(*)::int actions,
+        (SELECT count(*)::int FROM nyst_intervention_events i WHERE i.environment_id=$1 AND i.agent_id IS NOT DISTINCT FROM s.agent_id) interventions
+      FROM nyst_action_scopes s LEFT JOIN nyst_agents ag ON ag.agent_id=s.agent_id
+      WHERE s.environment_id=$1 AND s.project_id=$2 AND s.organization_id=$3
+      GROUP BY coalesce(ag.name,'unattributed'),s.agent_id ORDER BY actions DESC LIMIT 20`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows
+      .map((row) => ({ agent: String(row.agent), actions: Number(row.actions), interventions: Number(row.interventions) }));
+
+    const byEffect = (await this.db.query(`SELECT a.effect_name,count(*)::int actions,
+        (SELECT count(*)::int FROM nyst_intervention_events i WHERE i.environment_id=$1 AND i.effect_name=a.effect_name) interventions
+      FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id)
+      WHERE s.environment_id=$1 AND s.project_id=$2 AND s.organization_id=$3
+      GROUP BY a.effect_name ORDER BY actions DESC LIMIT 20`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows
+      .map((row) => ({ effect_name: String(row.effect_name), actions: Number(row.actions), interventions: Number(row.interventions) }));
+
+    // Financial exposure is reported ONLY for actions that BOTH carry an
+    // authoritative amount AND actually had a duplicate risk prevented. It is
+    // an exposure figure, never a claimed saving.
+    const exposure = (await this.db.query(`SELECT a.input->>'currency' currency,
+        sum((a.input->>'amount_minor')::bigint) amount_minor, count(*)::int action_count
+      FROM nyst_intervention_events i JOIN nyst_action_scopes s ON s.action_id=i.action_id JOIN outcome_actions a ON a.action_id=i.action_id
+      WHERE i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3
+        AND i.kind='retry_blocked' AND i.mode IN ('canary','enforced')
+        AND a.input ? 'amount_minor' AND a.input ? 'currency'
+      GROUP BY a.input->>'currency' ORDER BY 2 DESC LIMIT 1`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows[0];
+
+    return buildProtectionReport({
+      metrics,
+      environment: { organization: String(info?.organization ?? ""), project: String(info?.project ?? ""), environment: String(info?.environment ?? "") },
+      readiness, unresolved_incidents: unresolved, highest_risk_incident: highest,
+      risk_by_agent: byAgent, risk_by_effect: byEffect,
+      demonstrated_financial_exposure: exposure && exposure.currency
+        ? { currency: String(exposure.currency), amount_minor: Number(exposure.amount_minor), action_count: Number(exposure.action_count) } : null,
+      generated_at: now.toISOString(),
+    });
+  }
+
   private async requireTenantScope(scope: TenantScope): Promise<void> {
     const result = await this.db.query(`SELECT 1 FROM nyst_environments WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`, [scope.environment_id, scope.project_id, scope.organization_id]);
     if (!result.rows.length) throw new Error("Resource belongs to a different tenant scope");
@@ -1294,6 +1531,16 @@ function bounded(value: string, max: number, label: string): string { if (typeof
 function slug(value: string): string { const out = bounded(value, 63, "slug").toLowerCase(); if (!/^[a-z][a-z0-9-]{1,62}$/.test(out)) throw new Error("Invalid slug"); return out; }
 function normalizedEmail(value: string): string { const out = bounded(value, 320, "email").trim().toLowerCase(); if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(out)) throw new Error("Invalid email"); return out; }
 function validDate(value: string): string { const date = new Date(value); if (!Number.isFinite(date.getTime())) throw new Error("Invalid date filter"); return date.toISOString(); }
+
+/** Deterministic causal explanation from the persisted resolution alone. */
+function incidentExplanation(state: string, retry: string, continuation: string): string {
+  const cause = state === "unprovable"
+    ? "Nyst cannot determine what happened externally: the evidence it holds does not support any terminal claim."
+    : state === "pending"
+      ? "The external effect has not settled: the provider may still be converging, or an observation is outstanding."
+      : "The desired external state exists, but the provider cannot attribute it to this exact Nyst action.";
+  return `${cause} Retry is ${retry}; continuation is ${continuation}.`;
+}
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
