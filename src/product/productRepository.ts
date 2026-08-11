@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { compare, hash } from "bcryptjs";
 import type { ActionFilters, EffectSpecDescriptor, ProductContext, ProductPrincipal, TenantScope } from "./types.js";
 import { validateWebhookTarget, type ConservativePolicy, type EnvironmentMode, type FailureScenario, type ShadowObservation } from "./controlPlane.js";
-import { effectiveAuthority, SQL_AUTOMATIC_COMPENSATION_AUTHORITY, SQL_AUTOMATIC_CONTINUATION_AUTHORITY } from "./effectiveAuthority.js";
+import { effectiveAuthority, permittedHumanReviewOperations, SQL_AUTOMATIC_COMPENSATION_AUTHORITY, SQL_AUTOMATIC_CONTINUATION_AUTHORITY, type HumanReviewOperation } from "./effectiveAuthority.js";
 import { assertShadowObservationSchema, deriveShadowSemantics } from "./shadowSemantics.js";
 import { composeReadiness, probeCredentialAvailability, runPreflight, type IntegrationReadiness, type PreflightProbe, type PreflightStatus } from "./readiness.js";
 import type { SecretProvider } from "./secretProvider.js";
@@ -10,9 +10,12 @@ import { pruneIdempotencyKeys, withIdempotency, type IdempotentOperation } from 
 import { admitConsequence, linkAdmissionToAction, type AdmissionDecision, type AdmissionRequest } from "./admission.js";
 import { POLICY_TEMPLATES, type PolicyTemplateId } from "./policyTemplates.js";
 import { buildProtectionReport, type HighestRiskIncident, type ProtectionReport } from "./protectionReport.js";
+import { evaluateGoLiveReadiness, type GoLiveReadiness } from "./goLiveReadiness.js";
+import { PROOF_PACK_ATTESTATIONS, type ProofPack } from "./proofPack.js";
 import { emptyMetrics, METRIC_DEFINITIONS, optionalMetricNumber, requireBreakdown, requireMetricInt, resolveRange, type CanonicalMetrics, type InterventionKind, type InterventionSummary, type MetricRange } from "./canonicalMetrics.js";
 import type { OutcomeResolution } from "../model/resolution.js";
 import { runFailureLabEngine } from "./failureLabEngine.js";
+import { sanitizeForProduct } from "./sanitize.js";
 
 export interface ProductDb {
   query(sql: string, params?: readonly unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
@@ -1065,12 +1068,84 @@ export class ProductRepository {
 
   async humanReviews(scope: TenantScope): Promise<Record<string, unknown>[]> { return (await this.db.query(`SELECT h.human_review_id,h.action_id,h.status,h.reason,h.opened_at,h.reviewed_at,a.effect_name,s.display_business_key FROM nyst_human_reviews h JOIN nyst_action_scopes s USING(action_id) JOIN outcome_actions a USING(action_id) WHERE h.environment_id=$1 AND h.project_id=$2 AND h.organization_id=$3 ORDER BY h.opened_at DESC`,[scope.environment_id,scope.project_id,scope.organization_id])).rows; }
 
-  async updateHumanReview(scope: TenantScope,userId:string,reviewId:string,operation:"acknowledge"|"request_reobservation"):Promise<Record<string,unknown>>{const status=operation==='acknowledge'?'acknowledged':'reobservation_requested';const jobId=randomUUID();const result=await this.db.query(`WITH changed AS (
-      UPDATE nyst_human_reviews SET status=$6,reviewed_by=$5,reviewed_at=now() WHERE human_review_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4 AND status='open' RETURNING *
-    ), job AS (
-      INSERT INTO nyst_reobservation_jobs(reobservation_job_id,human_review_id,action_id,environment_id,project_id,organization_id)
-      SELECT $7,human_review_id,action_id,environment_id,project_id,organization_id FROM changed WHERE $8='request_reobservation' ON CONFLICT(human_review_id) DO NOTHING
-    ) SELECT human_review_id,action_id,status,reviewed_at FROM changed`,[reviewId,scope.environment_id,scope.project_id,scope.organization_id,userId,status,jobId,operation]);if(!result.rows.length)throw new Error("Review is unavailable or already handled");return result.rows[0]!;}
+  /**
+   * HUMAN REVIEW SAFETY (Phase 15).
+   *
+   * A reviewer may ONLY select operations that are already safe under the
+   * runtime and EffectSpec semantics. Explicitly impossible, by construction
+   * rather than by convention:
+   *
+   *   - force retry            there is no operation that sets retry=allowed
+   *   - force continuation     continuation still requires effective authority
+   *   - rewrite EffectState    resolutions are DB-immutable and append-only
+   *   - manufacture evidence   evidence is written only by observers
+   *   - bypass bound policy    compensation re-checks the action-bound policy
+   *   - override provider truth  re-observation is read-only
+   *
+   * The permitted set is derived from effectiveAuthority, so it can never
+   * exceed what Nyst would already have done on its own.
+   */
+  async updateHumanReview(scope: TenantScope, userId: string, reviewId: string, operation: HumanReviewOperation): Promise<Record<string, unknown>> {
+    const review = (await this.db.query(
+      `SELECT human_review_id,action_id,status FROM nyst_human_reviews
+       WHERE human_review_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4`,
+      [reviewId, scope.environment_id, scope.project_id, scope.organization_id])).rows[0];
+    if (!review) throw new Error("Review is unavailable or already handled");
+
+    const authority = await this.effectiveActionAuthority(scope, String(review.action_id));
+    const permitted = authority ? permittedHumanReviewOperations(authority) : (["acknowledge", "request_reobservation", "cancel"] as const);
+    if (!permitted.includes(operation)) {
+      throw Object.assign(new Error(
+        `Human review may not ${operation} this action. Permitted operations are: ${permitted.join(", ")}. ` +
+        "A reviewer can only choose operations that are already safe under the runtime and EffectSpec semantics."), { statusCode: 409 });
+    }
+
+    if (operation === "authorize_compensation") {
+      // Routed through the SAME authorization path automatic recovery uses, so
+      // the action-bound policy and runtime disposition are re-checked. A human
+      // cannot authorize a compensation Nyst would have refused.
+      const latest = (await this.db.query(`SELECT resolution_id FROM outcome_resolutions WHERE action_id=$1 ORDER BY resolution_sequence DESC NULLS LAST,resolved_at DESC LIMIT 1`, [review.action_id])).rows[0];
+      if (!latest) throw new Error("No resolution exists to compensate");
+      await this.authorizeRecovery(scope, String(review.action_id), String(latest.resolution_id), "supported_compensation");
+      await this.audit(scope, userId, "review.compensation_authorized", "action", String(review.action_id), {});
+    }
+
+    const status = operation === "acknowledge" ? "acknowledged"
+      : operation === "request_reobservation" ? "reobservation_requested"
+      : operation === "cancel" ? "cancelled" : "compensation_authorized";
+    const jobId = randomUUID();
+    const result = await this.db.query(`WITH changed AS (
+        UPDATE nyst_human_reviews SET status=$6,reviewed_by=$5,reviewed_at=now()
+        WHERE human_review_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4 AND status='open' RETURNING *
+      ), job AS (
+        INSERT INTO nyst_reobservation_jobs(reobservation_job_id,human_review_id,action_id,environment_id,project_id,organization_id)
+        SELECT $7,human_review_id,action_id,environment_id,project_id,organization_id FROM changed WHERE $8='request_reobservation'
+        ON CONFLICT(human_review_id) DO NOTHING
+      ) SELECT human_review_id,action_id,status,reviewed_at FROM changed`,
+      [reviewId, scope.environment_id, scope.project_id, scope.organization_id, userId, status, jobId, operation]);
+    if (!result.rows.length) throw new Error("Review is unavailable or already handled");
+    await this.audit(scope, userId, `review.${operation}`, "action", String(review.action_id), {});
+    return { ...result.rows[0]!, permitted_operations: permitted };
+  }
+
+  /** What a reviewer is allowed to do with this action, and why. */
+  async humanReviewOptions(scope: TenantScope, actionId: string): Promise<{ permitted: readonly HumanReviewOperation[]; forbidden: readonly string[]; reasons: readonly string[] }> {
+    const authority = await this.effectiveActionAuthority(scope, actionId);
+    const permitted = authority ? permittedHumanReviewOperations(authority) : (["acknowledge", "request_reobservation", "cancel"] as const);
+    return {
+      permitted,
+      // Stated explicitly so the UI can show them as unavailable rather than
+      // simply omitting them, which would leave a reviewer wondering.
+      forbidden: ["force_retry", "force_continuation", "set_effect_state", "author_evidence", "bypass_policy", "override_provider_truth"],
+      reasons: [
+        "Retry is never offered: Nyst forbids an automatic retry of a consequential action under any policy.",
+        authority?.automatic_continuation_allowed
+          ? "Continuation is already authorized by the effective authority; a reviewer does not need to force it."
+          : "Continuation is not offered because the effective authority does not permit it, and a reviewer cannot widen authority.",
+        "EffectState is derived from evidence and is immutable in the database; there is no operation that writes it directly.",
+      ],
+    };
+  }
 
   /**
    * Claim a re-observation job.
@@ -1520,6 +1595,243 @@ export class ProductRepository {
     });
   }
 
+
+  /* ==================================================================
+   * GO-LIVE READINESS (Phase 13)
+   * ================================================================== */
+
+  async goLiveReadiness(scope: TenantScope, secrets: SecretProvider, agentId: string | null, effectName: string, descriptors: readonly EffectSpecDescriptor[], now: Date = new Date()): Promise<GoLiveReadiness> {
+    const descriptor = descriptors.find((item) => item.effect_name === effectName);
+    const provider = descriptor?.provider ?? effectName.split(".")[0] ?? "unknown";
+    const credentialFree = provider === "fake";
+
+    const [enabled, agent, execution, frozen, policy, webhook] = await Promise.all([
+      this.db.query(`SELECT spec_version,enabled FROM nyst_environment_effect_specs WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND effect_name=$4`,
+        [scope.environment_id, scope.project_id, scope.organization_id, effectName]),
+      agentId ? this.db.query(`SELECT agent_id,name,status FROM nyst_agents WHERE agent_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4`,
+        [agentId, scope.environment_id, scope.project_id, scope.organization_id]) : Promise.resolve({ rows: [] as Record<string, unknown>[] }),
+      this.resolveExecutionMode(scope, agentId, effectName),
+      this.freezeState(scope),
+      this.db.query(`SELECT 1 FROM nyst_policy_versions WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 LIMIT 1`,
+        [scope.environment_id, scope.project_id, scope.organization_id]),
+      this.db.query(`SELECT enabled FROM nyst_webhook_endpoints WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`,
+        [scope.environment_id, scope.project_id, scope.organization_id]),
+    ]);
+
+    const integration = credentialFree || !["github", "okta", "stripe"].includes(provider)
+      ? null
+      : await this.integrationReadiness(scope, provider, secrets, now);
+
+    const agentRow = agent.rows[0];
+    return evaluateGoLiveReadiness({
+      agent_id: agentId,
+      agent_name: agentRow ? String(agentRow.name) : null,
+      agent_status: agentRow ? (String(agentRow.status) as "active" | "paused" | "retired") : null,
+      effect_name: effectName,
+      spec_version: enabled.rows[0]?.spec_version ? String(enabled.rows[0]!.spec_version) : null,
+      spec_enabled: enabled.rows[0]?.enabled === true,
+      environment_mode: execution.environment_mode,
+      execution_mode: execution.mode,
+      integration,
+      credential_free_effect: credentialFree,
+      policy_bound: policy.rows.length > 0,
+      frozen: frozen.frozen,
+      // Every registered EffectSpec in this build carries an authoritative
+      // observation method; an unregistered one does not.
+      observation_semantics_available: descriptor !== undefined,
+      recovery_behavior_known: descriptor !== undefined,
+      webhook_required: false,
+      webhook_configured: webhook.rows[0]?.enabled === true,
+    });
+  }
+
+  /** Readiness for every Agent x enabled EffectSpec pair in this environment. */
+  async goLiveMatrix(scope: TenantScope, secrets: SecretProvider, descriptors: readonly EffectSpecDescriptor[], now: Date = new Date()): Promise<GoLiveReadiness[]> {
+    const agents = await this.agents(scope);
+    const enabled = (await this.db.query(`SELECT effect_name FROM nyst_environment_effect_specs WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND enabled ORDER BY effect_name`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows.map((row) => String(row.effect_name));
+    const out: GoLiveReadiness[] = [];
+    for (const agent of agents.length ? agents : [{ agent_id: null }]) {
+      for (const effectName of enabled) {
+        out.push(await this.goLiveReadiness(scope, secrets, agent.agent_id ? String(agent.agent_id) : null, effectName, descriptors, now));
+      }
+    }
+    return out;
+  }
+
+  /* ==================================================================
+   * INCIDENT INBOX (Phase 14) — "Needs Attention"
+   *
+   * Sourced from the DURABLE human review and intervention state that
+   * already exists. There is deliberately no second incident database.
+   * ================================================================== */
+
+  async needsAttention(scope: TenantScope): Promise<Record<string, unknown>[]> {
+    const reviews = (await this.db.query(`SELECT h.human_review_id,h.action_id,h.status,h.reason,h.opened_at,
+        a.effect_name,a.spec_version,ag.name agent_name,s.display_business_key,b.environment_mode,
+        r.effect_state,r.primary_directive,r.retry_disposition,r.continuation_disposition,r.recovery_disposition,
+        extract(epoch FROM (now()-h.opened_at))::bigint age_seconds,
+        EXISTS(SELECT 1 FROM nyst_reobservation_jobs j WHERE j.human_review_id=h.human_review_id AND j.status IN ('requested','executing')) reobservation_in_flight,
+        EXISTS(SELECT 1 FROM nyst_reconciliation_suppressions sup WHERE sup.action_id=h.action_id) automatic_reconciliation_suppressed
+      FROM nyst_human_reviews h
+      JOIN nyst_action_scopes s USING(action_id) JOIN outcome_actions a USING(action_id)
+      LEFT JOIN nyst_agents ag ON ag.agent_id=s.agent_id
+      LEFT JOIN nyst_action_policy_bindings b ON b.action_id=h.action_id
+      JOIN LATERAL(SELECT * FROM outcome_resolutions WHERE action_id=h.action_id ORDER BY resolution_sequence DESC NULLS LAST,resolved_at DESC LIMIT 1) r ON true
+      WHERE h.environment_id=$1 AND h.project_id=$2 AND h.organization_id=$3 AND h.status IN ('open','reobservation_requested')
+      ORDER BY h.opened_at DESC LIMIT 100`, [scope.environment_id, scope.project_id, scope.organization_id])).rows;
+
+    // Held consequences never became actions, so they cannot have a review row.
+    // Their durable intervention IS the incident, and it belongs in the same
+    // inbox rather than in a place nobody looks.
+    const held = (await this.db.query(`SELECT i.intervention_id,i.kind,i.effect_name,i.summary,i.detail,i.occurred_at,ag.name agent_name,i.mode,
+        extract(epoch FROM (now()-i.occurred_at))::bigint age_seconds
+      FROM nyst_intervention_events i LEFT JOIN nyst_agents ag ON ag.agent_id=i.agent_id
+      WHERE i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3
+        AND i.kind IN ('blast_radius_hold','freeze_blocked') AND i.action_id IS NULL
+      ORDER BY i.occurred_at DESC LIMIT 50`, [scope.environment_id, scope.project_id, scope.organization_id])).rows;
+
+    const incidents = reviews.map((row) => {
+      const state = String(row.effect_state);
+      return {
+        incident_id: String(row.human_review_id),
+        source: "human_review" as const,
+        action_id: String(row.action_id),
+        title: incidentTitle(state, String(row.effect_name)),
+        agent: row.agent_name ? String(row.agent_name) : "unattributed",
+        effect_name: String(row.effect_name),
+        spec_version: String(row.spec_version),
+        mode: normalizeMode(row.environment_mode),
+        age_seconds: Number(row.age_seconds),
+        effect_state: state,
+        control_decision: String(row.primary_directive),
+        what_happened: String(row.reason),
+        what_nyst_knows: knownFacts(state, String(row.retry_disposition), String(row.continuation_disposition)),
+        what_nyst_does_not_know: unknownFacts(state),
+        why_nyst_stopped: whyStopped(state, String(row.primary_directive)),
+        automatic_reconciliation_suppressed: row.automatic_reconciliation_suppressed === true,
+        safe_actions: safeActions({
+          status: String(row.status),
+          reobservationInFlight: row.reobservation_in_flight === true,
+          recovery: String(row.recovery_disposition),
+        }),
+      };
+    });
+
+    const heldIncidents = held.map((row) => ({
+      incident_id: String(row.intervention_id),
+      source: "held_consequence" as const,
+      action_id: null,
+      title: row.kind === "freeze_blocked" ? "Consequence blocked by Emergency Freeze" : "Consequence held by Blast Radius",
+      agent: row.agent_name ? String(row.agent_name) : "unattributed",
+      effect_name: String(row.effect_name),
+      spec_version: null,
+      mode: normalizeMode(row.mode),
+      age_seconds: Number(row.age_seconds),
+      effect_state: "not_applied",
+      control_decision: "hold",
+      what_happened: String(row.summary),
+      what_nyst_knows: ["The consequence was never dispatched, so no external effect occurred from this attempt."],
+      what_nyst_does_not_know: ["Whether the caller will retry once the hold is lifted."],
+      why_nyst_stopped: String(row.summary),
+      automatic_reconciliation_suppressed: false,
+      safe_actions: ["acknowledge"],
+    }));
+
+    // Oldest first: the thing that has been waiting longest needs attention most.
+    return [...incidents, ...heldIncidents].sort((left, right) => Number(right.age_seconds) - Number(left.age_seconds));
+  }
+
+  /* ==================================================================
+   * PROOF PACK (Phase 18)
+   * ================================================================== */
+
+  async proofPack(scope: TenantScope, actionId: string, verifyReceipt?: (receipt: unknown) => boolean, now: Date = new Date()): Promise<ProofPack | null> {
+    const detail = await this.actionDetail(scope, actionId);
+    if (!detail) return null;
+
+    const [info, evidence, resolutions, interventions, recovery, review, receipt, events, agent, policy, runtime] = await Promise.all([
+      this.projectInfo(scope),
+      this.evidence(scope, actionId),
+      this.db.query(`SELECT resolution_sequence,effect_state,primary_directive,retry_disposition,continuation_disposition,recovery_disposition,resolved_at,resolution_id
+        FROM outcome_resolutions WHERE action_id=$1 ORDER BY resolution_sequence NULLS FIRST,resolved_at`, [actionId]),
+      this.db.query(`SELECT kind,mode,summary,detail,occurred_at FROM nyst_intervention_events WHERE action_id=$1 ORDER BY occurred_at`, [actionId]),
+      this.db.query(`SELECT operation,status,dispatch_state,attempt,needs_review_reason,created_at,completed_at FROM nyst_recovery_executions WHERE action_id=$1 ORDER BY created_at`, [actionId]),
+      this.db.query(`SELECT human_review_id,status,reason,opened_at,reviewed_at FROM nyst_human_reviews WHERE action_id=$1`, [actionId]),
+      this.receipt(scope, actionId),
+      this.db.query(`SELECT event_type,occurred_at,delivered_at FROM nyst_webhook_events WHERE action_id=$1 ORDER BY occurred_at`, [actionId]),
+      this.db.query(`SELECT ag.agent_id,ag.name,ag.owner,ag.framework FROM nyst_action_scopes s JOIN nyst_agents ag USING(agent_id) WHERE s.action_id=$1`, [actionId]),
+      this.db.query(`SELECT p.policy_version_id,p.version,p.execution_mode,p.retry_mode,p.auto_continuation,p.auto_compensation,p.reconcile_timeout_seconds,p.template_id,
+          b.environment_mode,b.reconcile_deadline_at,b.bound_at FROM nyst_action_policy_bindings b JOIN nyst_policy_versions p USING(policy_version_id) WHERE b.action_id=$1`, [actionId]),
+      this.db.query(`SELECT dispatch_status,dispatch_attempts FROM outcome_runtime WHERE action_id=$1`, [actionId]),
+    ]);
+
+    const latest = resolutions.rows.at(-1);
+    const action = detail as Record<string, unknown>;
+    const plan = (action.dispatch_plan ?? null) as Record<string, unknown> | null;
+    const correlation = (plan?.correlation ?? null) as { method?: unknown; value?: unknown } | null;
+    const policyRow = policy.rows[0];
+    const verified = receipt && verifyReceipt ? verifyReceipt(receipt) : null;
+
+    return {
+      proof_pack_version: 1,
+      generated_at: now.toISOString(),
+      provenance: "assembled_from_persisted_records",
+      action: {
+        action_id: actionId,
+        business_key: String(action.display_business_key ?? action.business_key ?? ""),
+        effect_name: String(action.effect_name ?? ""),
+        spec_version: String(action.spec_version ?? ""),
+        input_hash: String(action.input_hash ?? ""),
+        internal_state: String(action.internal_state ?? ""),
+        created_at: String(action.created_at ?? ""),
+      },
+      agent: agent.rows[0] ? { agent_id: String(agent.rows[0]!.agent_id), name: String(agent.rows[0]!.name), owner: String(agent.rows[0]!.owner), framework: String(agent.rows[0]!.framework) } : null,
+      environment: { organization: String(info?.organization ?? ""), project: String(info?.project ?? ""), environment: String(info?.environment ?? ""),
+        mode: policyRow ? String(policyRow.environment_mode) : "unknown" },
+      policy: policyRow ? {
+        policy_version_id: String(policyRow.policy_version_id), version: Number(policyRow.version),
+        execution_mode: String(policyRow.execution_mode), retry_mode: String(policyRow.retry_mode),
+        auto_continuation: policyRow.auto_continuation === true, auto_compensation: policyRow.auto_compensation === true,
+        reconcile_timeout_seconds: Number(policyRow.reconcile_timeout_seconds),
+        template_id: policyRow.template_id ? String(policyRow.template_id) : null,
+        bound_at: String(policyRow.bound_at ?? ""), reconcile_deadline_at: String(policyRow.reconcile_deadline_at ?? ""),
+      } : null,
+      intent: action.input ?? null,
+      dispatch_boundary: {
+        correlation_method: correlation?.method ? String(correlation.method) : null,
+        correlation_value: correlation?.value ? String(correlation.value) : null,
+        idempotency_key: plan?.idempotency_key ? String(plan.idempotency_key) : null,
+        provider: plan?.provider ? String(plan.provider) : null,
+        operation: plan?.operation ? String(plan.operation) : null,
+        dispatch_status: runtime.rows[0]?.dispatch_status ? String(runtime.rows[0]!.dispatch_status) : null,
+        dispatch_attempts: runtime.rows[0]?.dispatch_attempts === undefined ? null : Number(runtime.rows[0]!.dispatch_attempts),
+      },
+      evidence: (evidence ?? []) as ReadonlyArray<Record<string, unknown>>,
+      resolution_history: resolutions.rows,
+      current: latest ? {
+        effect_state: String(latest.effect_state),
+        control: { primary: String(latest.primary_directive), retry: String(latest.retry_disposition), continuation: String(latest.continuation_disposition), recovery: String(latest.recovery_disposition) },
+        reason_code: String(((receipt?.control ?? {}) as Record<string, unknown>).reason_code ?? ""),
+        explanation: String(((receipt?.control ?? {}) as Record<string, unknown>).explanation ?? ""),
+      } : null,
+      interventions: interventions.rows,
+      recovery_history: recovery.rows,
+      human_review: review.rows[0] ?? null,
+      receipt: receipt ? sanitizeForProduct(receipt) as Record<string, unknown> : null,
+      receipt_verification: {
+        verified,
+        note: verified === null
+          ? "No verifier was supplied, so the signature was not checked in this bundle."
+          : verified
+            ? "The Ed25519 software signature over the canonical receipt verified successfully. This is tamper evidence, not hardware attestation."
+            : "SIGNATURE VERIFICATION FAILED. Treat this receipt as untrustworthy and investigate.",
+      },
+      webhook_events: events.rows,
+      attestations: PROOF_PACK_ATTESTATIONS,
+    };
+  }
+
   private async requireTenantScope(scope: TenantScope): Promise<void> {
     const result = await this.db.query(`SELECT 1 FROM nyst_environments WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`, [scope.environment_id, scope.project_id, scope.organization_id]);
     if (!result.rows.length) throw new Error("Resource belongs to a different tenant scope");
@@ -1547,4 +1859,73 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 /** Narrow a persisted mode string to the EnvironmentMode union, failing closed on Shadow. */
 function normalizeMode(value: unknown): EnvironmentMode {
   return value === "shadow" ? "shadow" : value === "canary" ? "canary" : "enforced";
+}
+
+/* --------------------------------------------------------------------------
+ * Incident narration. Every string below is derived from persisted state; none
+ * of it is a template filled with plausible-sounding detail.
+ * -------------------------------------------------------------------------- */
+
+function incidentTitle(state: string, effectName: string): string {
+  switch (state) {
+    case "unprovable": return `${effectName} outcome unprovable`;
+    case "pending": return `${effectName} still unresolved`;
+    case "satisfied_unattributed": return `${effectName} goal present but unattributed`;
+    case "not_applied": return `${effectName} did not take effect`;
+    default: return `${effectName} needs attention`;
+  }
+}
+
+function knownFacts(state: string, retry: string, continuation: string): string[] {
+  const facts = [`Retry is ${retry}. Continuation is ${continuation}.`];
+  switch (state) {
+    case "satisfied_unattributed":
+      facts.push("The desired external state exists right now.", "Nyst read it back from the provider's system of record.");
+      break;
+    case "pending":
+      facts.push("The provider has not yet settled into a state Nyst can call terminal.");
+      break;
+    case "unprovable":
+      facts.push("Nyst holds evidence about the request, but none of it establishes what happened externally.");
+      break;
+    case "not_applied":
+      facts.push("Nyst has affirmative evidence that the intended effect is absent.");
+      break;
+  }
+  return facts;
+}
+
+function unknownFacts(state: string): string[] {
+  switch (state) {
+    case "satisfied_unattributed":
+      return ["Whether THIS action caused the observed state. The provider offers no action-correlated read-back, so another actor may have produced it."];
+    case "pending":
+      return ["The final external state.", "Whether the provider will converge or has silently failed."];
+    case "unprovable":
+      return ["Whether the external effect occurred at all.", "Whether a retry would duplicate it."];
+    case "not_applied":
+      return ["Whether the original dispatch left the process, which is what determines if a retry is safe."];
+    default:
+      return ["The full external state."];
+  }
+}
+
+function whyStopped(state: string, primary: string): string {
+  if (primary === "hold") return "Nyst is holding because continuing would depend on an external fact it cannot yet establish.";
+  if (primary === "escalate") return "Nyst escalated because no safe automatic path remains: proceeding would require guessing.";
+  if (state === "satisfied_unattributed") return "Nyst will not claim credit for a state it cannot attribute, and will not repeat a mutation that may already have happened.";
+  return "Nyst stopped rather than take an action whose safety it could not establish.";
+}
+
+/**
+ * The operations a human may take. Every one is read-only, an acknowledgement,
+ * or an operation the runtime already permits. There is no force-continue,
+ * no manual EffectState edit, and no evidence authoring.
+ */
+function safeActions(input: { status: string; reobservationInFlight: boolean; recovery: string }): string[] {
+  const actions: string[] = ["acknowledge"];
+  if (!input.reobservationInFlight && input.status === "open") actions.push("request_reobservation");
+  if (input.recovery === "compensate") actions.push("authorize_supported_compensation");
+  actions.push("cancel_workflow");
+  return actions;
 }
