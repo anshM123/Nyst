@@ -16,7 +16,7 @@ describe("Gate 8 product security and SDK contracts", () => {
     assert.match(loginPage(), /<script src="\/assets\/login\.js" defer><\/script>/); assert.doesNotMatch(loginPage(), /<script>[^<]/);
     const receipt=receiptPage({action_id:"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",effect_name:"fake"},{effect:{state:"verified"},control:{primary:"continue"},payload:"<script>bad()</script>"},true);assert.match(receipt,/Signature verification/);assert.match(receipt,/VALID/);assert.match(receipt,/Export JSON/);assert.doesNotMatch(receipt,/<script>bad/);
     assert.match(actionsPage([],"Actions",{state:`"><img src=x onerror=bad>`}),/Filter actions/);assert.doesNotMatch(actionsPage([],"Actions",{state:`"><img src=x onerror=bad>`}),/<img src=x/);
-    const demo=offboardingPage([]);for(const text of ["Narrow integrated recovery","No offboarding runs","Nothing is fabricated for this environment"])assert.match(demo,new RegExp(text));
+    const demo=offboardingPage([]);for(const text of ["Okta suspension","No offboarding runs","Nothing is fabricated for this environment"])assert.match(demo,new RegExp(text));
   });
   it("SDK sends the API key only in authorization and supports commit/retrieval", async () => {
     const seen: Array<{ url: string; auth: string | null; body: string | null }> = [];

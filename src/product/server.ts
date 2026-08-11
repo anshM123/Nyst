@@ -4,7 +4,7 @@ import { join } from "node:path";
 import cookie from "@fastify/cookie";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { APP_CSS, APP_JS, LOGIN_JS, PRODUCT_ENHANCEMENT_CSS } from "./assets.js";
-import { actionPage, actionsPage, effectRegistryPage, failureLabPage, genericPage, integrationsPage, loginPage, offboardingPage, onboardingPage, overviewPage, policiesPage, receiptPage, receiptsPage, reviewsPage, settingsPage } from "./dashboard.js";
+import { actionPage, actionsPage, agentsPage, effectRegistryPage, failureLabPage, genericPage, integrationsPage, loginPage, needsAttentionPage, offboardingPage, onboardingPage, overviewPage, policiesPage, protectionPage, receiptPage, receiptsPage, reviewsPage, settingsPage, type ShellContext } from "./dashboard.js";
 import { digest, ProductRepository } from "./productRepository.js";
 import type { PreflightProbeResult } from "./readiness.js";
 import type { SecretProvider } from "./secretProvider.js";
@@ -136,23 +136,90 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   });
   app.post("/v1/auth/logout", async (request, reply) => { const principal = await apiPrincipal(request, reply, options.repository); if (!principal) return; requireCsrf(request, principal); const session = request.cookies[SESSION_COOKIE]; if (session) await options.repository.deleteSession(session); reply.clearCookie(SESSION_COOKIE, { path: "/" }); return { ok: true }; });
 
-  app.get("/", pageHandler(async (principal) => overviewPage(await options.repository.impactMetrics(principal)), options.repository));
-  app.get("/actions", pageHandler(async (principal,request) => {const selected=filters(request.query);return actionsPage(await options.repository.listActions(principal,selected),"Actions",selected);}, options.repository));
-  app.get("/actions/:id", pageHandler(async (principal, request, reply) => { const id = routeId(request); const action = await options.repository.actionDetail(principal, id); if (!action) return reply.code(404).type("text/html").send(genericPage("Not found", "That action does not exist in this environment.")); const evidence = await options.repository.evidence(principal, id) ?? []; const resolutions = await options.repository.resolutions(principal, id) ?? []; return actionPage(action, evidence, resolutions); }, options.repository));
-  app.get("/effect-specs", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository,principal,options.effect_specs,options.production===true)), options.repository));
-  app.get("/effect-registry", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository,principal,options.effect_specs,options.production===true)), options.repository));
-  app.get("/policies",pageHandler(async principal=>policiesPage(await options.repository.policyHistory(principal)),options.repository));
-  app.get("/failure-lab",pageHandler(async principal=>failureLabPage(await options.repository.failureLabRuns(principal),await options.repository.environmentControl(principal)),options.repository));
-  app.get("/evidence", pageHandler(async (principal) => actionsPage(await options.repository.listActions(principal), "Evidence"), options.repository));
-  app.get("/receipts", pageHandler(async (principal) => receiptsPage(await options.repository.listActions(principal)), options.repository));
-  app.get("/receipts/:id", pageHandler(async (principal,request,reply)=>{const id=routeId(request);const action=await options.repository.actionDetail(principal,id);const receipt=await options.repository.receipt(principal,id);if(!action||!receipt)return reply.code(404).type("text/html").send(genericPage("Not found","That receipt does not exist in this environment."));const valid=options.verify_receipt?options.verify_receipt(receipt):null;return receiptPage(action,receipt,valid);},options.repository));
+
+  /**
+   * Shell context every page shares: where you are, what mode you are in,
+   * whether anything is frozen, and how many incidents are waiting.
+   *
+   * Read from persisted state on every render, never cached, so the freeze
+   * banner and the attention badge cannot go stale.
+   */
+  async function pageContext(principal: ProductPrincipal): Promise<ShellContext> {
+    const [info, control, freezes, attention, tenantContext] = await Promise.all([
+      options.repository.projectInfo(principal),
+      options.repository.environmentControl(principal),
+      options.repository.freezeState(principal),
+      options.repository.needsAttention(principal),
+      options.repository.context(principal),
+    ]);
+    const active = freezes.freezes[0];
+    return {
+      project: String(info?.project ?? ""),
+      environment: String(info?.environment ?? ""),
+      mode: control.mode,
+      attention: attention.length,
+      projects: tenantContext.projects,
+      selected_project_id: tenantContext.selected_project_id,
+      selected_environment_id: tenantContext.selected_environment_id,
+      frozen: active ? {
+        reason: String(active.reason ?? ""),
+        actor: String(active.activated_by_name ?? "an operator"),
+        since: String(active.activated_at ?? ""),
+        scope: active.scope_agent_name || active.scope_effect_name
+          ? [active.scope_agent_name, active.scope_effect_name].filter(Boolean).join(" · ")
+          : "the whole environment",
+      } : null,
+    };
+  }
+
+  app.get("/", pageHandler(async (principal) => overviewPage(await options.repository.overview(principal), await pageContext(principal)), options.repository));
+  app.get("/needs-attention", pageHandler(async (principal) => needsAttentionPage(await options.repository.needsAttention(principal), await pageContext(principal)), options.repository));
+  app.get("/agents", pageHandler(async (principal) => agentsPage(await options.repository.agents(principal), await pageContext(principal)), options.repository));
+  app.get("/actions", pageHandler(async (principal, request) => { const selected = filters(request.query); return actionsPage(await options.repository.listActions(principal, selected), "Actions", selected, await pageContext(principal)); }, options.repository));
+  app.get("/actions/:id", pageHandler(async (principal, request, reply) => {
+    const id = routeId(request);
+    const action = await options.repository.actionDetail(principal, id);
+    if (!action) return reply.code(404).type("text/html").send(genericPage("Not found", "That action does not exist in this environment."));
+    const [evidence, resolutions, context] = await Promise.all([
+      options.repository.evidence(principal, id), options.repository.resolutions(principal, id), pageContext(principal),
+    ]);
+    return actionPage(action, evidence ?? [], resolutions ?? [], context);
+  }, options.repository));
+  app.get("/protection", pageHandler(async (principal) => {
+    if (!options.secrets) return genericPage("Protection", "No SecretProvider is configured, so readiness cannot be evaluated.");
+    const [report, readiness, context] = await Promise.all([
+      options.repository.protectionReport(principal, options.secrets, "all"),
+      options.repository.goLiveMatrix(principal, options.secrets, options.effect_specs),
+      pageContext(principal),
+    ]);
+    return protectionPage(report, readiness, context);
+  }, options.repository));
+  app.get("/effect-specs", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository, principal, options.effect_specs, options.production === true), await pageContext(principal)), options.repository));
+  app.get("/effect-registry", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository, principal, options.effect_specs, options.production === true), await pageContext(principal)), options.repository));
+  app.get("/policies", pageHandler(async (principal) => policiesPage(await options.repository.policyHistory(principal), await pageContext(principal)), options.repository));
+  app.get("/failure-lab", pageHandler(async (principal) => failureLabPage(await options.repository.failureLabRuns(principal), await options.repository.environmentControl(principal), await pageContext(principal)), options.repository));
+  app.get("/receipts", pageHandler(async (principal) => receiptsPage(await options.repository.listActions(principal), await pageContext(principal)), options.repository));
+  app.get("/receipts/:id", pageHandler(async (principal, request, reply) => {
+    const id = routeId(request);
+    const action = await options.repository.actionDetail(principal, id);
+    const receipt = await options.repository.receipt(principal, id);
+    if (!action || !receipt) return reply.code(404).type("text/html").send(genericPage("Not found", "That receipt does not exist in this environment."));
+    return receiptPage(action, receipt, options.verify_receipt ? options.verify_receipt(receipt) : null, await pageContext(principal));
+  }, options.repository));
   app.get("/exports/:id", api(async (principal,request,reply)=>{requireScope(principal,"receipts:read");const receipt=await options.repository.receipt(principal,routeId(request));if(!receipt)return reply.code(404).send({error:"not_found",request_id:request.id});reply.header("Content-Disposition",`attachment; filename="nyst-${routeId(request)}.json"`);return {receipt:sanitizeForProduct(receipt),signature_valid:options.verify_receipt?options.verify_receipt(receipt):null};},options.repository));
-  app.get("/integrations", pageHandler(async (principal) => integrationsPage(await options.repository.integrations(principal),await options.repository.effectSpecStatuses(principal,options.effect_specs,options.production===true)), options.repository));
-  app.get("/offboarding", pageHandler(async (principal) => offboardingPage(await options.repository.offboardingRuns(principal)), options.repository));
-  app.get("/demo", pageHandler(async (principal) => failureLabPage(await options.repository.failureLabRuns(principal),await options.repository.environmentControl(principal)), options.repository));
-  app.get("/reviews",pageHandler(async principal=>reviewsPage(await options.repository.humanReviews(principal)),options.repository));
-  app.get("/onboarding",pageHandler(async principal=>onboardingPage(await options.repository.onboardingProgress(principal),await options.repository.effectSpecStatuses(principal,options.effect_specs,options.production===true)),options.repository));
-  app.get("/settings", pageHandler(async (principal) => settingsPage(await options.repository.projectInfo(principal),await options.repository.environmentControl(principal),await options.repository.webhookStatus(principal),await options.repository.apiKeys(principal)), options.repository));
+  app.get("/integrations", pageHandler(async (principal) => {
+    const readiness = options.secrets ? await options.repository.integrationsReadiness(principal, options.secrets) : [];
+    return integrationsPage(readiness as unknown as Record<string, unknown>[], await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true), await pageContext(principal));
+  }, options.repository));
+  app.get("/demo", pageHandler(async (principal) => failureLabPage(await options.repository.failureLabRuns(principal), await options.repository.environmentControl(principal), await pageContext(principal)), options.repository));
+  app.get("/evidence", pageHandler(async (principal) => actionsPage(await options.repository.listActions(principal), "Evidence", {}, await pageContext(principal)), options.repository));
+  app.get("/offboarding", pageHandler(async (principal) => offboardingPage(await options.repository.offboardingRuns(principal), await pageContext(principal)), options.repository));
+  app.get("/reviews", pageHandler(async (principal) => reviewsPage(await options.repository.humanReviews(principal), await pageContext(principal)), options.repository));
+  app.get("/onboarding", pageHandler(async (principal) => onboardingPage(await options.repository.onboardingProgress(principal), await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true), await pageContext(principal)), options.repository));
+  app.get("/settings", pageHandler(async (principal) => settingsPage(
+    await options.repository.projectInfo(principal), await options.repository.environmentControl(principal),
+    await options.repository.webhookStatus(principal), await options.repository.apiKeys(principal),
+    await options.repository.freezes(principal), await pageContext(principal)), options.repository));
 
   app.get("/v1/overview", api(async (principal) => {requireScope(principal,"actions:read");return options.repository.overview(principal);}, options.repository));
   app.get("/v1/actions", api(async (principal, request) => {requireScope(principal,"actions:read");return options.repository.listActions(principal, filters(request.query));}, options.repository));

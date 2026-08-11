@@ -65,7 +65,7 @@ describe("Nyst v0.2.2 Phase 1 correctness", { skip: databaseUrl ? false : "DATAB
     const metrics = await repository.canonicalMetrics(tenant);
     assert.ok(metrics.unsafe_retries_prevented_enforced >= 1, "backend must persist a real enforced prevention");
     const html = overviewPage(metrics);
-    const card = /Unsafe retries prevented<\/span><strong>(\d+)<\/strong>/.exec(html) ?? /<strong>(\d+)<\/strong><small>Blocked/.exec(html);
+    const card = /Unsafe retries prevented<\/span>\s*<strong class="value">(\d+)<\/strong>/.exec(html);
     assert.ok(card, "Overview must render an Unsafe retries prevented card");
     assert.equal(Number(card[1]), metrics.unsafe_retries_prevented_enforced);
   });
@@ -79,7 +79,7 @@ describe("Nyst v0.2.2 Phase 1 correctness", { skip: databaseUrl ? false : "DATAB
     const metrics = await repository.canonicalMetrics(empty);
     assert.equal(metrics.unsafe_retries_prevented_enforced, 0);
     assert.equal(metrics.consequential_actions, 0);
-    assert.match(overviewPage(metrics), /<strong>0<\/strong>/);
+    assert.match(overviewPage(metrics), /<strong class="value">0<\/strong>/);
   });
 
   it("1A: every required canonical metric is present and numeric — no undefined masking", async () => {

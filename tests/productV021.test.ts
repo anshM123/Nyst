@@ -18,13 +18,36 @@ function resolution(state:EffectState,primary:OutcomeResolution["control"]["prim
 describe("v0.2.1 canonical action presentation",()=>{
   it("selects the greatest durable resolution sequence, not array order",()=>{const newest=resolution("satisfied_unattributed","do_not_retry",2);const oldest=resolution("pending","hold",1);assert.equal(latestResolution([newest,oldest])?.resolution_id,newest.resolution_id);assert.deepEqual(resolutionHistory([oldest,newest]).map(item=>item.resolution_sequence),[2,1])});
   for(const [state,primary] of [["verified","continue"],["not_applied","do_not_retry"],["pending","hold"],["compensated","escalate"],["satisfied_unattributed","do_not_retry"],["unprovable","escalate"]] as const){it(`renders canonical nested ${state} and ${primary}`,()=>{const html=actionPage({action_id:randomUUID(),effect_name:"fake",business_key:"case",environment_mode:"enforced"},[],[resolution(state,primary,1) as unknown as Record<string,unknown>]);assert.match(html,new RegExp(`>${state}<`));assert.match(html,new RegExp(`>${primary.replaceAll("_"," ").toUpperCase()}<`));assert.doesNotMatch(html,/INVESTIGATE/)})}
-  it("shows only active evidence cited by the current resolution",()=>{const cited=randomUUID(),uncited=randomUUID(),superseded=randomUUID(),correction=randomUUID();const current=latestResolution([resolution("satisfied_unattributed","do_not_retry",2,[cited,superseded])])!;const evidence=[{evidence_id:cited,seq:1,source:"provider.read",observed_disposition:"effect_present",strength:"authoritative",attribution:"unattributed"},{evidence_id:uncited,seq:2,source:"unrelated",observed_disposition:"effect_present",strength:"authoritative",attribution:"attributed"},{evidence_id:superseded,seq:3,source:"old.read",observed_disposition:"effect_present",strength:"authoritative",attribution:"attributed"},{evidence_id:correction,seq:4,source:"correction",observed_disposition:"indeterminate",strength:"corroborative",attribution:"indeterminate",supersedes_evidence_id:superseded}];const explanation=currentExplanation({effect_name:"fake"},evidence,current);assert.deepEqual(explanation.facts.map(fact=>fact.evidence_id),[cited]);assert.match(explanation.attribution_note??"",/not attributable/);const html=actionPage({action_id:randomUUID(),effect_name:"fake",business_key:"case"},evidence,[current.document as unknown as Record<string,unknown>]);const proof=html.slice(html.indexOf('<ul class="check-list">'),html.indexOf('</ul>'));assert.match(proof,/provider\.read/);assert.doesNotMatch(proof,/unrelated|old\.read|correction/);assert.match(html,/old\.read/,'historical evidence remains visible in the timeline')});
+  it("shows only active evidence cited by the current resolution",()=>{const cited=randomUUID(),uncited=randomUUID(),superseded=randomUUID(),correction=randomUUID();const current=latestResolution([resolution("satisfied_unattributed","do_not_retry",2,[cited,superseded])])!;const evidence=[{evidence_id:cited,seq:1,source:"provider.read",observed_disposition:"effect_present",strength:"authoritative",attribution:"unattributed"},{evidence_id:uncited,seq:2,source:"unrelated",observed_disposition:"effect_present",strength:"authoritative",attribution:"attributed"},{evidence_id:superseded,seq:3,source:"old.read",observed_disposition:"effect_present",strength:"authoritative",attribution:"attributed"},{evidence_id:correction,seq:4,source:"correction",observed_disposition:"indeterminate",strength:"corroborative",attribution:"indeterminate",supersedes_evidence_id:superseded}];const explanation=currentExplanation({effect_name:"fake"},evidence,current);assert.deepEqual(explanation.facts.map(fact=>fact.evidence_id),[cited]);assert.match(explanation.attribution_note??"",/not attributable/);const html=actionPage({action_id:randomUUID(),effect_name:"fake",business_key:"case"},evidence,[current.document as unknown as Record<string,unknown>]);const proof=html.slice(html.indexOf('<ul class="because">'),html.indexOf('</ul>',html.indexOf('<ul class="because">')));assert.match(proof,/provider\.read/);assert.doesNotMatch(proof,/unrelated|old\.read|correction/);assert.match(html,/old\.read/,'historical evidence remains visible in the timeline')});
 });
 
 describe("v0.2.1 browser control safety",()=>{
-  it("captures webhook controls before asynchronous confirmation clears Event.currentTarget",()=>{
-    assert.match(APP_JS,/const button=e\.currentTarget,enabled=button\.dataset\.enabled==='true',form=button\.closest\('form'\)/);
-    assert.match(APP_JS,/send\('\/v1\/webhooks\/decision\/enabled','PUT',\{enabled\}\)/);
-    assert.doesNotMatch(APP_JS,/decision\/enabled'[\s\S]{0,160}e\.currentTarget/);
+  it("browser controls capture their element before awaiting, and hold no authoritative safety logic", () => {
+    // The v0.2.1 bug: reading `event.currentTarget` AFTER an await, by which
+    // point the browser has cleared it. The fix is to capture the element into
+    // a local first. Assert the property, not one historical line of source.
+    const handlers = APP_JS.split("addEventListener").slice(1);
+    assert.ok(handlers.length > 0, "the client script installs handlers");
+    for (const handler of handlers) {
+      const firstAwait = handler.indexOf("await");
+      if (firstAwait < 0) continue;
+      const beforeAwait = handler.slice(0, firstAwait);
+      const afterAwait = handler.slice(firstAwait);
+      assert.doesNotMatch(afterAwait, /currentTarget/,
+        "currentTarget must never be read after an await; capture the element first");
+      if (/currentTarget/.test(beforeAwait)) {
+        assert.match(beforeAwait, /const\s+\w+\s*=\s*event\.currentTarget/,
+          "currentTarget must be captured into a local before any await");
+      }
+    }
+    // Mutating calls must carry CSRF and an idempotency key, and must lock the
+    // control while in flight so a double click cannot issue two commands.
+    assert.match(APP_JS, /x-nyst-csrf/);
+    assert.match(APP_JS, /idempotency-key/);
+    assert.match(APP_JS, /button\.disabled\s*=\s*true/);
+    // No authoritative safety decision may live in the browser.
+    for (const forbidden of [/effect_state\s*=/, /retry\s*=\s*["']allowed/, /force[_ ]continue/i]) {
+      assert.doesNotMatch(APP_JS, forbidden, "the browser never decides safety");
+    }
   });
 });
