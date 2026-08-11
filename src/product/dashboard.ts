@@ -798,7 +798,7 @@ export function settingsPage(info: Record<string, unknown> | null, control: Reco
       <div><dt>Organization</dt><dd>${escape(String(info?.organization ?? ""))}</dd></div>
       <div><dt>Project</dt><dd>${escape(String(info?.project ?? ""))}</dd></div>
       <div><dt>Environment</dt><dd>${escape(String(info?.environment ?? ""))}</dd></div>
-      <div><dt>Rollout mode</dt><dd><span class="mode ${escape(String(control.mode))}">${escape(String(control.mode))}</span></dd></div>
+      <div><dt>Rollout mode</dt><dd>${control.mode ? `<span class="mode ${escape(String(control.mode))}">${escape(String(control.mode))}</span>` : "—"}</dd></div>
     </dl></div>
   </section>
 
