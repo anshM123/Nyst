@@ -12,6 +12,7 @@ import { POLICY_TEMPLATES, type PolicyTemplateId } from "./policyTemplates.js";
 import { buildProtectionReport, type HighestRiskIncident, type ProtectionReport } from "./protectionReport.js";
 import { evaluateGoLiveReadiness, type GoLiveReadiness } from "./goLiveReadiness.js";
 import { PROOF_PACK_ATTESTATIONS, type ProofPack } from "./proofPack.js";
+import { operationalHealth, recordWorkerHeartbeat, type OperationalHealth, type WorkerKind } from "./operationalHealth.js";
 import { emptyMetrics, METRIC_DEFINITIONS, optionalMetricNumber, requireBreakdown, requireMetricInt, resolveRange, type CanonicalMetrics, type InterventionKind, type InterventionSummary, type MetricRange } from "./canonicalMetrics.js";
 import type { OutcomeResolution } from "../model/resolution.js";
 import { runFailureLabEngine } from "./failureLabEngine.js";
@@ -1831,6 +1832,12 @@ export class ProductRepository {
       attestations: PROOF_PACK_ATTESTATIONS,
     };
   }
+
+  /** Operational health across every queue and worker. Never tenant-scoped. */
+  async operationalHealth(now: Date = new Date()): Promise<OperationalHealth> { return operationalHealth(this.db, now); }
+
+  /** Called by each worker loop so the product can tell a dead worker from an idle one. */
+  async recordWorkerHeartbeat(kind: WorkerKind, instance: string): Promise<void> { return recordWorkerHeartbeat(this.db, kind, instance); }
 
   private async requireTenantScope(scope: TenantScope): Promise<void> {
     const result = await this.db.query(`SELECT 1 FROM nyst_environments WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`, [scope.environment_id, scope.project_id, scope.organization_id]);

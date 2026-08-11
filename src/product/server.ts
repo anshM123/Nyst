@@ -9,6 +9,10 @@ import { digest, ProductRepository } from "./productRepository.js";
 import type { PreflightProbeResult } from "./readiness.js";
 import type { SecretProvider } from "./secretProvider.js";
 import { NYST_SAFETY_FLOOR } from "./policyTemplates.js";
+import { healthMetricsText } from "./operationalHealth.js";
+
+/** Single source of the product version string. */
+export const NYST_VERSION = "0.2.2";
 import { protectionReportCsv } from "./protectionReport.js";
 import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
@@ -110,8 +114,18 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.get("/assets/login.js", async (_request, reply) => reply.type("application/javascript; charset=utf-8").send(LOGIN_JS));
   app.get("/assets/app.js", async (_request, reply) => reply.type("application/javascript; charset=utf-8").send(APP_JS));
   for(const asset of ["nyst-mark.png","nyst-wordmark.png","nyst-domain-wordmark.png","favicon.png"] as const)app.get(`/brand/${asset}`,async(_request,reply)=>reply.type("image/png").send(readFileSync(join(process.cwd(),"public","brand",asset))));
-  app.get("/health",async()=>({status:"ok",service:"nyst-web",version:"0.2.1"}));
-  app.get("/ready",async(_request,reply)=>{try{await options.repository.health();return {status:"ready"}}catch{return reply.code(503).send({status:"not_ready"})}});
+  // Liveness: is this process up at all? Deliberately unauthenticated and
+  // dependency-free so a load balancer can use it.
+  app.get("/health",async()=>({status:"ok",service:"nyst-web",version:NYST_VERSION}));
+  // Readiness: can this process actually serve? Requires the database.
+  app.get("/ready",async(_request,reply)=>{try{await options.repository.health();return {status:"ready",service:"nyst-web",version:NYST_VERSION}}catch{return reply.code(503).send({status:"not_ready",reason:"database_unreachable"})}});
+
+  /**
+   * Operational health (Phase 23). PROTECTED: it reveals queue depths and
+   * worker liveness, which is operational intelligence. It never reveals a
+   * credential, a credential reference, or a provider payload.
+   */
+  app.get("/v1/operational-health", api(async (principal,request)=>{requireAnyScope(principal,["actions:read","integrations:read"]);const health=await options.repository.operationalHealth();const query=request.query as {format?:unknown};if(String(query.format??"json")==="prometheus")return healthMetricsText(health);return health;},options.repository));
   app.get("/login", async (_request, reply) => reply.type("text/html; charset=utf-8").send(loginPage()));
   app.post("/v1/auth/login", async (request, reply) => {
     const body = object(request.body); const organization = string(body.organization, 63); const email = string(body.email, 320); const password = string(body.password, 1024);
