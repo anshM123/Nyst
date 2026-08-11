@@ -15,7 +15,7 @@ import {
 } from "../model/resolution.js";
 import type { EffectAssessment, EffectSpec } from "../spec/effectSpec.js";
 import type { DispatchGuard, NewEvidence, Store } from "../store/store.js";
-import { applySafetyFloors } from "../engine/safetyFloors.js";
+import { applyDispatchBoundaryFloor, applySafetyFloors } from "../engine/safetyFloors.js";
 import { DECISION_POLICY_VERSION } from "../engine/resolver.js";
 import type { DispatchClaim, DispatchStatus } from "./runtimeState.js";
 import {
@@ -392,29 +392,13 @@ export class NystRuntime {
 
     const runtimeState = await this.store.runtime.get(action.action_id);
     if (!runtimeState) throw new Error(`Runtime state missing for ${action.action_id}`);
-    let decision: ControlDecision = floored.decision;
-    if (
-      decision.retry === "allowed" &&
-      !spec.provider_idempotency_semantics &&
-      runtimeState.dispatch_status !== "definitely_not_sent"
-    ) {
-      decision = {
-        ...decision,
-        primary: decision.primary === "retry" ? "hold" : decision.primary,
-        retry: "forbidden",
-        reason_code: "CORE.RUNTIME_RETRY_REQUIRES_PROVEN_NOT_SENT",
-        explanation: `${decision.explanation} [core runtime adjusted: provider has no idempotency and dispatch was not proven unsent]`,
-      };
-    }
-    if (runtimeState.dispatch_attempts >= 2 && decision.retry === "allowed") {
-      decision = {
-        ...decision,
-        primary: decision.primary === "retry" ? "hold" : decision.primary,
-        retry: "forbidden",
-        reason_code: "CORE.RUNTIME_RETRY_BUDGET_EXHAUSTED",
-        explanation: `${decision.explanation} [core runtime adjusted: retry budget exhausted]`,
-      };
-    }
+    // One shared implementation of the dispatch-boundary retry floor, used
+    // identically by the Enforced runtime and by Shadow evaluation.
+    let decision: ControlDecision = applyDispatchBoundaryFloor(floored.decision, {
+      dispatch_status: runtimeState.dispatch_status === "definitely_not_sent" ? "definitely_not_sent" : "may_have_been_sent",
+      provider_idempotency_semantics: spec.provider_idempotency_semantics,
+      dispatch_attempts: runtimeState.dispatch_attempts,
+    });
 
     const now = this.clock.now();
     if (floored.state === "pending") {

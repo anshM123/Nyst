@@ -92,6 +92,10 @@ describe("Gate 8 product API, auth, tenant isolation, scheduler, and continuatio
   });
 
   it("issues one-use 30-second continuation leases and rejects stale evidence or cross-tenant consumption", async () => {
+    // v0.2.1 issued this lease from the runtime disposition alone. Automatic
+    // continuation now additionally requires the action-bound policy to permit
+    // it, so the policy must genuinely authorize it BEFORE the action is bound.
+    await repository.createPolicyVersion(tenantA, tenantA.user_id, { effect_name: null, execution_mode: "automatic", auto_continuation: true, auto_compensation: false, reconcile_timeout_seconds: 300 });
     const harness = makeRuntimeHarness({}, store); let resolution = (await harness.runtime.commit(harness.spec.effect_name, `${tenantA.environment_id}:lease-${suffix}`, runtimeInput("definitely_applied", { repository_id: `lease-${suffix}` }), EMPTY_CONTEXT, { establish_dispatch_eligibility: (action) => repository.scopeAction(tenantA, action.action_id, `lease-${suffix}`) })).resolution;
     await harness.runtime.authorizeContinuation(resolution.action_id, resolution.resolution_id); assert(resolution.runtime);
     const lease = await repository.issueContinuationLease(tenantA, resolution.action_id, resolution.resolution_id, resolution.runtime.resolution_sequence, resolution.runtime.evidence_sequence);
@@ -100,6 +104,14 @@ describe("Gate 8 product API, auth, tenant isolation, scheduler, and continuatio
     const stale = await repository.issueContinuationLease(tenantA, resolution.action_id, resolution.resolution_id, resolution.runtime.resolution_sequence, resolution.runtime.evidence_sequence);
     await store.evidence.append({ action_id: resolution.action_id, evidence_schema_version: 1, source: "gate8.stale-test", verification_method: "none", kind: "transport_error", strength: "transport_only", observed_disposition: "indeterminate", attribution: "indeterminate", provider_object_id: null, provider_event_id: randomUUID(), observed_at: harness.clock.now().timestamp, provider_timestamp: null, payload: { category: "new_evidence" }, correlation: { method: "test", value: resolution.action_id }, signing: null, clock: harness.clock.now(), supersedes_evidence_id: null });
     assert.equal(await repository.consumeContinuationLease(tenantA, stale.lease), null);
+
+    // The same runtime authority under a policy that forbids automatic
+    // continuation must produce no lease at all (I7 — intersection, not union).
+    await repository.createPolicyVersion(tenantA, tenantA.user_id, { effect_name: null, execution_mode: "automatic", auto_continuation: false, auto_compensation: false, reconcile_timeout_seconds: 300 });
+    const restricted = (await harness.runtime.commit(harness.spec.effect_name, `${tenantA.environment_id}:lease-blocked-${suffix}`, runtimeInput("definitely_applied", { repository_id: `lease-blocked-${suffix}` }), EMPTY_CONTEXT, { establish_dispatch_eligibility: (action) => repository.scopeAction(tenantA, action.action_id, `lease-blocked-${suffix}`) })).resolution;
+    assert(restricted.runtime);
+    assert.equal(restricted.control.continuation, "allowed", "runtime authority must still allow continuation for this to prove the intersection");
+    await assert.rejects(() => repository.issueContinuationLease(tenantA, restricted.action_id, restricted.resolution_id, restricted.runtime!.resolution_sequence, restricted.runtime!.evidence_sequence), /authorize/i);
   });
 
   it("rejects direct tenant-scope rewrites and deletion", async () => {

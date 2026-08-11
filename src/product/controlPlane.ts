@@ -1,8 +1,24 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 import type { ControlDecision } from "../model/controlDecision.js";
+import { constrainControlDecision } from "./effectiveAuthority.js";
 
-export type EnvironmentMode = "shadow" | "enforced";
+/**
+ * Rollout modes.
+ *
+ *   shadow   — Nyst evaluates observed effects and risk but does NOT control
+ *              the action. Never say "prevented".
+ *   canary   — Nyst controls a DETERMINISTIC, explicitly scoped slice
+ *              (Agent + EffectSpec + Environment). Never probabilistic.
+ *   enforced — the action routes through Nyst safety control.
+ *
+ * Each historical action stores the mode it was created under and is never
+ * reinterpreted when the environment mode later changes.
+ */
+export type EnvironmentMode = "shadow" | "canary" | "enforced";
+
+/** Modes in which Nyst actually controls the action and may claim prevention. */
+export const CONTROLLING_MODES: readonly EnvironmentMode[] = ["canary", "enforced"];
 export type FailureScenario = "response_lost" | "timeout_before_send" | "delayed_observation" | "reconcile_rate_limit" | "duplicate_caller" | "process_crash" | "offboarding_demo";
 
 export interface ConservativePolicy {
@@ -45,16 +61,16 @@ export function assessShadow(observation: ShadowObservation): ShadowAssessment {
   };
 }
 
-/** A customer policy may only reduce an already-derived runtime decision. */
+/**
+ * A customer policy may only reduce an already-derived runtime decision.
+ *
+ * DEPRECATED as an independent implementation. It now delegates to the single
+ * canonical intersection in effectiveAuthority.ts so there is exactly one
+ * definition of effective authority in the product. It is retained only
+ * because it is part of the published surface.
+ */
 export function constrainDecision(decision: ControlDecision, policy: ConservativePolicy): ControlDecision {
-  const retry = "forbidden" as const;
-  const continuation = policy.auto_continuation ? decision.continuation : "blocked" as const;
-  const recovery = policy.auto_compensation ? decision.recovery : (decision.recovery === "compensate" ? "escalate" : decision.recovery);
-  const primary = decision.primary === "retry" ? "escalate"
-    : decision.primary === "continue" && continuation !== "allowed" ? "hold"
-    : decision.primary === "compensate" && recovery !== "compensate" ? "escalate"
-    : decision.primary;
-  return { ...decision, primary, retry, continuation, recovery };
+  return constrainControlDecision(decision, policy);
 }
 
 export function deterministicExplanation(action: Record<string, unknown>, evidence: Record<string, unknown>[], resolution: Record<string, unknown> | null): Record<string, unknown> {

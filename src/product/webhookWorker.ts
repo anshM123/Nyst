@@ -13,13 +13,15 @@ export class EnvironmentWebhookSecretSource implements WebhookSecretSource {
 }
 
 export class NystDecisionWebhookWorker {
-  constructor(private readonly db:ProductDb,private readonly secrets:WebhookSecretSource=new EnvironmentWebhookSecretSource(),private readonly requestFetch:typeof fetch=fetch,private readonly leaseMs=30_000,private readonly resolveAddresses:(host:string)=>Promise<Array<{address:string}>>=async host=>lookup(host,{all:true,verbatim:true})){}
+  constructor(private readonly db:ProductDb,private readonly secrets:WebhookSecretSource=new EnvironmentWebhookSecretSource(),private readonly requestFetch:typeof fetch=fetch,private readonly leaseMs=30_000,private readonly resolveAddresses:(host:string)=>Promise<Array<{address:string}>>=async host=>lookup(host,{all:true,verbatim:true}),
+    /** Optionally shard this worker to one environment. Omit for a global pool. */
+    private readonly environmentId:string|null=null){}
   async runOne():Promise<boolean>{
     const token=randomUUID();
     const claim=await this.db.query(`WITH candidate AS (
-      SELECT e.webhook_event_id FROM nyst_webhook_events e WHERE e.delivered_at IS NULL AND e.terminal_at IS NULL AND e.next_attempt_at<=now() AND (e.claimed_until IS NULL OR e.claimed_until<now()) ORDER BY e.next_attempt_at,e.webhook_event_id FOR UPDATE SKIP LOCKED LIMIT 1
+      SELECT e.webhook_event_id FROM nyst_webhook_events e JOIN nyst_webhook_endpoints w USING(webhook_endpoint_id) WHERE e.delivered_at IS NULL AND e.terminal_at IS NULL AND e.next_attempt_at<=now() AND (e.claimed_until IS NULL OR e.claimed_until<now()) AND ($3::uuid IS NULL OR w.environment_id=$3::uuid) ORDER BY e.next_attempt_at,e.webhook_event_id FOR UPDATE OF e SKIP LOCKED LIMIT 1
     ) UPDATE nyst_webhook_events e SET claim_token=$1,claimed_until=now()+($2::text||' milliseconds')::interval FROM candidate c WHERE e.webhook_event_id=c.webhook_event_id
-      RETURNING e.webhook_event_id,e.payload,e.occurred_at,e.event_type,e.action_id,e.resolution_id,(SELECT target_url FROM nyst_webhook_endpoints WHERE webhook_endpoint_id=e.webhook_endpoint_id) target_url,(SELECT signing_secret_ref FROM nyst_webhook_endpoints WHERE webhook_endpoint_id=e.webhook_endpoint_id) signing_secret_ref,(SELECT count(*)::int+1 FROM nyst_webhook_attempts WHERE webhook_event_id=e.webhook_event_id) attempt_number`,[token,this.leaseMs]);
+      RETURNING e.webhook_event_id,e.payload,e.occurred_at,e.event_type,e.action_id,e.resolution_id,(SELECT target_url FROM nyst_webhook_endpoints WHERE webhook_endpoint_id=e.webhook_endpoint_id) target_url,(SELECT signing_secret_ref FROM nyst_webhook_endpoints WHERE webhook_endpoint_id=e.webhook_endpoint_id) signing_secret_ref,(SELECT count(*)::int+1 FROM nyst_webhook_attempts WHERE webhook_event_id=e.webhook_event_id) attempt_number`,[token,this.leaseMs,this.environmentId]);
     const row=claim.rows[0];if(!row)return false;
     const eventId=String(row.webhook_event_id);const attempt=Math.max(1,Number(row.attempt_number));let responseStatus:number|null=null;let errorCode:string|null=null;
     try{

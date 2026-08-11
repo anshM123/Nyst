@@ -432,3 +432,52 @@ function dedupe(xs: string[]): string[] {
 function stripAdjustmentSuffix(explanation: string): string {
   return explanation.replace(/ \[core safety adjusted: [^\]]*\]$/, "");
 }
+
+/**
+ * DISPATCH-BOUNDARY RETRY FLOOR (runtime layer).
+ *
+ * The EffectSpec floors above reason about EVIDENCE. This floor reasons about
+ * the DISPATCH BOUNDARY: even when the goal is proven absent, a retry is only
+ * safe if the provider offers idempotency semantics, or Nyst durably knows the
+ * original request never left. "Absent now" plus "we might have sent it" is
+ * still a duplicate-effect risk (invariant I1/I3).
+ *
+ * Extracted so the Enforced runtime and Shadow evaluation apply the IDENTICAL
+ * rule. Previously the runtime applied it inline and Shadow did not, which let
+ * Shadow report a retry as permitted that Enforced would have refused.
+ */
+export interface DispatchBoundaryFacts {
+  /** Durable knowledge of whether the provider request left the process. */
+  dispatch_status: "definitely_not_sent" | "may_have_been_sent" | "sent";
+  /** Provider idempotency semantics, or null when the provider has none. */
+  provider_idempotency_semantics: string | null;
+  /** How many dispatch attempts this logical action has already made. */
+  dispatch_attempts: number;
+}
+
+export function applyDispatchBoundaryFloor(decision: ControlDecision, facts: DispatchBoundaryFacts): ControlDecision {
+  let result = decision;
+  if (
+    result.retry === "allowed" &&
+    !facts.provider_idempotency_semantics &&
+    facts.dispatch_status !== "definitely_not_sent"
+  ) {
+    result = {
+      ...result,
+      primary: result.primary === "retry" ? "hold" : result.primary,
+      retry: "forbidden",
+      reason_code: "CORE.RUNTIME_RETRY_REQUIRES_PROVEN_NOT_SENT",
+      explanation: `${result.explanation} [core runtime adjusted: provider has no idempotency and dispatch was not proven unsent]`,
+    };
+  }
+  if (facts.dispatch_attempts >= 2 && result.retry === "allowed") {
+    result = {
+      ...result,
+      primary: result.primary === "retry" ? "hold" : result.primary,
+      retry: "forbidden",
+      reason_code: "CORE.RUNTIME_RETRY_BUDGET_EXHAUSTED",
+      explanation: `${result.explanation} [core runtime adjusted: retry budget exhausted]`,
+    };
+  }
+  return result;
+}

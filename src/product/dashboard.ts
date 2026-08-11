@@ -1,17 +1,44 @@
 import { currentExplanation, latestResolution, resolutionHistory } from "./actionPresentation.js";
 import { sanitizeForProduct } from "./sanitize.js";
+import type { CanonicalMetrics, InterventionSummary } from "./canonicalMetrics.js";
 
 const nav=[["/","Overview"],["/actions","Actions"],["/policies","Policies"],["/effect-registry","Effect Registry"],["/failure-lab","Failure Lab"],["/integrations","Integrations"],["/reviews","Human Review"],["/settings","Settings"]] as const;
 
 export function loginPage():string{return page("Login",`<main class="login"><section class="login-brand"><div class="brand-lockup"><img src="/brand/nyst-wordmark.png" alt="Nyst"></div><p class="eyebrow">Safety control plane</p><h1>Know what happened.<br>Control what happens next.</h1><p>Nyst sits between autonomous software and the systems it changes.</p></section><section class="panel login-card"><h2>Sign in to Nyst</h2><form id="login-form"><label>Organization<input name="organization" autocomplete="organization" required></label><label>Email<input name="email" type="email" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Continue</button><p id="login-error" role="alert"></p></form></section></main>`,false,"/assets/login.js")}
 
-export function overviewPage(data:Record<string,unknown>):string{const mode=String(data.mode??"enforced");const shadow=mode==="shadow";const cards=[
-  ["Consequential actions",data.consequential_actions??0,"Durable logical actions in this environment"],
-  ["Ambiguous executions",data.ambiguous_executions??data.shadow_ambiguous??0,"Distinct incidents, not repeated observations"],
-  [shadow?"Unsafe retries detected":"Unsafe retries prevented",shadow?data.unsafe_retry_detected_shadow??0:data.unsafe_retries_prevented??0,shadow?"Would-have-blocked; Nyst did not control execution":"Blocked by enforced runtime policy"],
-  ["Automatically resolved",data.auto_resolved??0,"Authorized recovery executions completed"],
-  ["Human escalations",data.human_escalations??0,"Actions requiring bounded review"],
-] as const;return shell("Overview",`<header class="hero"><div><p class="eyebrow">CONNECT → ROUTE → CONTROL → RECOVER → PROVE</p><h1>The safety control plane for consequential actions.</h1><p class="lede">Nyst determines what actually happened after autonomous software changes production—and decides what is safe next.</p></div><span class="mode ${mode}">${escape(mode.toUpperCase())}</span></header><section class="metric-grid">${cards.map(([name,value,note])=>`<article class="metric"><span>${escape(name)}</span><strong>${escape(String(value))}</strong><small>${escape(note)}</small></article>`).join("")}</section><section class="value-flow"><article><b>01</b><span>Agent</span><small>declares durable intent</small></article><i>→</i><article class="nyst-node"><img src="/brand/nyst-mark.png" alt=""><span>Nyst</span><small>controls ambiguity</small></article><i>→</i><article><b>03</b><span>Provider</span><small>external consequence</small></article></section><section><div class="section-head"><div><p class="eyebrow">Why Nyst exists</p><h2>Recent interventions</h2></div><a href="/actions">Open action ledger →</a></div>${actionTable(rows(data.recent))}</section>`)}
+/**
+ * Overview.
+ *
+ * Typed against CanonicalMetrics, not `Record<string, unknown>`. That is the
+ * structural half of the 1A fix: a field-name drift between the metric service
+ * and this card is now a compile error instead of a silent zero.
+ */
+export function overviewPage(data:CanonicalMetrics):string{const mode=data.mode;const shadow=mode==="shadow";const cards:ReadonlyArray<readonly [string,number,string]>=[
+  ["Consequential actions",data.consequential_actions,"Durable logical actions in this environment"],
+  ["Ambiguous executions",data.ambiguous_executions,"Distinct incidents, not repeated observations"],
+  shadow
+    ? ["Unsafe retries detected",data.unsafe_retries_detected_shadow,"Would-have-blocked; Nyst did not control execution"] as const
+    : ["Unsafe retries prevented",data.unsafe_retries_prevented_enforced,"Blocked by Nyst while controlling the action"] as const,
+  shadow
+    ? ["Unsafe continuations detected",data.unsafe_continuations_detected_shadow,"Would-have-held; Nyst did not control execution"] as const
+    : ["Unsafe continuations prevented",data.unsafe_continuations_prevented_enforced,"Held by Nyst while controlling the action"] as const,
+  ["Automatically resolved",data.auto_resolved,"Authorized recovery executions completed"],
+  ["Human escalations",data.human_escalations,"Actions requiring bounded review"],
+];return shell("Overview",`<header class="hero"><div><p class="eyebrow">CONNECT → ROUTE → CONTROL → RECOVER → PROVE</p><h1>The safety control plane for consequential actions.</h1><p class="lede">Nyst determines what actually happened after autonomous software changes production—and decides what is safe next.</p></div><span class="mode ${mode}">${escape(mode.toUpperCase())}</span></header><section class="metric-grid">${cards.map(([name,value,note])=>`<article class="metric"><span>${escape(name)}</span><strong>${escape(String(value))}</strong><small>${escape(note)}</small></article>`).join("")}</section><section class="value-flow"><article><b>01</b><span>Agent</span><small>declares durable intent</small></article><i>→</i><article class="nyst-node"><img src="/brand/nyst-mark.png" alt=""><span>Nyst</span><small>controls ambiguity</small></article><i>→</i><article><b>03</b><span>Provider</span><small>external consequence</small></article></section><section><div class="section-head"><div><p class="eyebrow">Durable records, never inferred from current state</p><h2>Recent interventions</h2></div><a href="/actions">Open action ledger →</a></div>${interventionTable(data.recent_interventions)}</section>`)}
+
+/** Recent Interventions renders durable intervention records only. */
+function interventionTable(items:readonly InterventionSummary[]):string{
+  if(!items.length)return `<p class="empty">No interventions have been recorded in this environment yet.</p>`;
+  return `<div class="table-scroll"><table><thead><tr><th scope="col">Intervention</th><th scope="col">Effect</th><th scope="col">Agent</th><th scope="col">Mode</th><th scope="col">When</th></tr></thead><tbody>${items.map(item=>`<tr><td><strong>${escape(INTERVENTION_LABELS[item.kind]??item.kind)}</strong><br><small>${escape(item.summary)}</small></td><td>${escape(item.effect_name)}</td><td>${escape(item.agent_name??"unattributed")}</td><td><span class="mode ${escape(item.mode)}">${escape(item.mode)}</span></td><td>${escape(item.occurred_at)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+const INTERVENTION_LABELS:Readonly<Record<string,string>>={
+  retry_blocked:"BLOCKED RETRY",continuation_blocked:"HELD CONTINUATION",auto_resolved:"AUTO-RESOLVED",
+  human_review_opened:"HUMAN REVIEW",shadow_retry_would_have_been_blocked:"SHADOW WOULD-HAVE-BLOCKED RETRY",
+  shadow_continuation_would_have_been_blocked:"SHADOW WOULD-HAVE-HELD CONTINUATION",
+  blast_radius_hold:"BLAST RADIUS HOLD",freeze_blocked:"FROZEN",recovery_needs_review:"RECOVERY NEEDS REVIEW",
+};
+
 
 export function actionsPage(actions:Record<string,unknown>[],title="Actions",filters:Record<string,unknown>={}):string{return shell(title,`<header><p class="eyebrow">Consequential action ledger</p><h1>${escape(title)}</h1><p class="lede">One logical identity. One consequence boundary. Evidence-bounded truth.</p></header>${title==="Actions"?filterForm(filters):""}${actionTable(actions)}`)}
 

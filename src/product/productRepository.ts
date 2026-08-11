@@ -1,7 +1,12 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { compare, hash } from "bcryptjs";
 import type { ActionFilters, EffectSpecDescriptor, ProductContext, ProductPrincipal, TenantScope } from "./types.js";
-import { assessEffectShadow, validateWebhookTarget, type ConservativePolicy, type EnvironmentMode, type FailureScenario, type ShadowObservation } from "./controlPlane.js";
+import { validateWebhookTarget, type ConservativePolicy, type EnvironmentMode, type FailureScenario, type ShadowObservation } from "./controlPlane.js";
+import { effectiveAuthority, SQL_AUTOMATIC_COMPENSATION_AUTHORITY, SQL_AUTOMATIC_CONTINUATION_AUTHORITY } from "./effectiveAuthority.js";
+import { assertShadowObservationSchema, deriveShadowSemantics } from "./shadowSemantics.js";
+import { composeReadiness, probeCredentialAvailability, runPreflight, type IntegrationReadiness, type PreflightProbe, type PreflightStatus } from "./readiness.js";
+import type { SecretProvider } from "./secretProvider.js";
+import { emptyMetrics, METRIC_DEFINITIONS, optionalMetricNumber, requireBreakdown, requireMetricInt, resolveRange, type CanonicalMetrics, type InterventionKind, type InterventionSummary, type MetricRange } from "./canonicalMetrics.js";
 import type { OutcomeResolution } from "../model/resolution.js";
 import { runFailureLabEngine } from "./failureLabEngine.js";
 
@@ -126,12 +131,22 @@ export class ProductRepository {
     return result.rows.length === 1;
   }
 
-  async scopeAction(scope: TenantScope, actionId: string, displayBusinessKey: string): Promise<void> {
+  /**
+   * Establish durable tenant (and Agent) ownership BEFORE the action becomes
+   * dispatch-eligible. Invariant I4.
+   *
+   * The Agent binding is written at INSERT time and nyst_action_scopes is
+   * immutable, so a historical action can never be re-attributed to a
+   * different Agent, and a cross-tenant Agent id fails the composite foreign
+   * key rather than being silently accepted.
+   */
+  async scopeAction(scope: TenantScope, actionId: string, displayBusinessKey: string, agentId: string | null = null): Promise<void> {
     const display = bounded(displayBusinessKey, 500, "business key");
-    await this.db.query(`INSERT INTO nyst_action_scopes(action_id,environment_id,project_id,organization_id,display_business_key)
-      SELECT a.action_id,$2::uuid,$3::uuid,$4::uuid,$5::text FROM outcome_actions a
+    if (agentId !== null && !UUID_PATTERN.test(agentId)) throw new Error("Invalid Agent identifier");
+    await this.db.query(`INSERT INTO nyst_action_scopes(action_id,environment_id,project_id,organization_id,display_business_key,agent_id)
+      SELECT a.action_id,$2::uuid,$3::uuid,$4::uuid,$5::text,$6::uuid FROM outcome_actions a
       WHERE a.action_id=$1::uuid AND a.business_key=$2::uuid::text||':'||$5::text
-      ON CONFLICT(action_id) DO NOTHING`, [actionId, scope.environment_id, scope.project_id, scope.organization_id, display]);
+      ON CONFLICT(action_id) DO NOTHING`, [actionId, scope.environment_id, scope.project_id, scope.organization_id, display, agentId]);
     const check = await this.db.query(`SELECT 1 FROM nyst_action_scopes WHERE action_id=$1 AND organization_id=$2 AND project_id=$3 AND environment_id=$4`, [actionId, scope.organization_id, scope.project_id, scope.environment_id]);
     if (!check.rows.length) throw new Error("Action already belongs to a different tenant scope");
     const action = await this.db.query(`SELECT effect_name FROM outcome_actions WHERE action_id=$1`, [actionId]);
@@ -249,25 +264,6 @@ export class ProductRepository {
     return (result.rows[0]?.full_document as Record<string, unknown> | undefined) ?? null;
   }
 
-  async overview(scope: TenantScope): Promise<Record<string, unknown>> {
-    const params = [scope.organization_id, scope.project_id, scope.environment_id];
-    const result = await this.db.query(`WITH latest AS (SELECT DISTINCT ON (r.action_id) r.* FROM outcome_resolutions r ORDER BY r.action_id,r.resolution_sequence DESC NULLS LAST,r.resolved_at DESC), scoped AS (
-      SELECT a.action_id,a.created_at,a.effect_name,coalesce(a.dispatch_plan->>'provider',split_part(a.effect_name,'.',1)) provider,l.effect_state,l.primary_directive,l.retry_disposition
-      FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id) LEFT JOIN latest l USING(action_id)
-      WHERE s.organization_id=$1 AND s.project_id=$2 AND s.environment_id=$3), marked AS (SELECT scoped.*,
-        EXISTS(SELECT 1 FROM outcome_evidence e WHERE e.action_id=scoped.action_id AND e.strength='transport_only') ambiguous
-        FROM scoped)
-      SELECT count(*)::int total,
-       coalesce(jsonb_object_agg(effect_state,state_count) FILTER(WHERE effect_state IS NOT NULL),'{}') states,
-       coalesce(jsonb_object_agg(primary_directive,decision_count) FILTER(WHERE primary_directive IS NOT NULL),'{}') decisions,
-       coalesce(jsonb_object_agg(coalesce(provider,'internal'),provider_count),'{}') providers,
-       count(*) FILTER(WHERE ambiguous AND retry_disposition='forbidden')::int unsafe_retries_prevented,
-       count(*) FILTER(WHERE ambiguous AND effect_state IN('verified','satisfied_unattributed','not_applied'))::int ambiguous_reconciled
-      FROM (SELECT *,count(*) OVER(PARTITION BY effect_state) state_count,count(*) OVER(PARTITION BY primary_directive) decision_count,count(*) OVER(PARTITION BY provider) provider_count FROM marked) x`, params);
-    const recent = await this.listActions(scope, { limit: 8 });
-    return { ...(result.rows[0] ?? { total: 0, states: {}, decisions: {} }), recent };
-  }
-
   async integrations(scope: TenantScope): Promise<Record<string, unknown>[]> {
     return (await this.db.query(`SELECT i.provider,i.configured,i.credential_ref,i.last_verified_at,
       (SELECT max(a.created_at) FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id) WHERE s.organization_id=i.organization_id AND s.project_id=i.project_id AND s.environment_id=i.environment_id AND split_part(a.effect_name,'.',1)=i.provider) last_protected_action_at,
@@ -303,28 +299,91 @@ export class ProductRepository {
     FROM nyst_organizations o JOIN nyst_projects p USING(organization_id) JOIN nyst_environments e USING(project_id,organization_id)
     WHERE o.organization_id=$1 AND p.project_id=$2 AND e.environment_id=$3`,[scope.organization_id,scope.project_id,scope.environment_id]);return result.rows[0]??null; }
 
+  /**
+   * Issue a continuation lease.
+   *
+   * v0.2.1 checked only the runtime continuation disposition here, so
+   * `POST /v1/actions/:id/continuation-leases` granted automatic continuation
+   * even when the action-bound policy set `auto_continuation = false`. That
+   * was a direct I7 violation and a complete bypass of customer policy.
+   *
+   * The authority is now the INTERSECTION, checked in two places that must
+   * both agree: `effectiveAuthority()` in the application, and the
+   * SQL_AUTOMATIC_CONTINUATION_AUTHORITY predicate inside the statement so a
+   * second process or a future code path cannot route around it.
+   *
+   * Emergency Freeze adds a further restriction to both statements in Phase 11.
+   *
+   * The policy consulted is the IMMUTABLE ACTION-BOUND version from
+   * nyst_action_policy_bindings — never the current environment policy — so a
+   * later policy edit cannot retroactively widen a historical action.
+   */
   async issueContinuationLease(scope: TenantScope, actionId: string, resolutionId: string, resolutionSequence: number, evidenceSequence: number): Promise<{ lease: string; expires_at: string }> {
+    const authority = await this.effectiveActionAuthority(scope, actionId, resolutionId);
+    if (!authority) throw new Error("Continuation authorization is unavailable for this action in this tenant scope");
+    if (!authority.automatic_continuation_allowed) {
+      throw new Error(
+        `Effective authority does not authorize automatic continuation (${authority.reductions.join(", ") || "runtime continuation blocked"}). ` +
+        "Customer policy may only reduce Nyst authority; it is never unioned with it."
+      );
+    }
     const lease = `nyst_lease_${randomBytes(32).toString("base64url")}`; const expiresAt = new Date(Date.now() + 30_000).toISOString();
     const result = await this.db.query(`INSERT INTO nyst_continuation_leases(lease_hash,action_id,resolution_id,organization_id,resolution_sequence,evidence_sequence,expires_at)
       SELECT $1,$2,$3,$4,$5,$6,$7 FROM nyst_action_scopes s JOIN outcome_runtime rt USING(action_id)
       JOIN outcome_resolutions r ON r.action_id=s.action_id AND r.resolution_id=$3
+      JOIN nyst_action_policy_bindings b ON b.action_id=s.action_id
+      JOIN nyst_policy_versions p ON p.policy_version_id=b.policy_version_id
       WHERE s.action_id=$2 AND s.organization_id=$4 AND s.project_id=$8 AND s.environment_id=$9
-        AND rt.resolution_sequence=$5 AND rt.evidence_sequence=$6 AND r.continuation_disposition='allowed'
+        AND rt.resolution_sequence=$5 AND rt.evidence_sequence=$6
+        AND ${SQL_AUTOMATIC_CONTINUATION_AUTHORITY}
       RETURNING lease_hash`, [digest(lease), actionId, resolutionId, scope.organization_id, resolutionSequence, evidenceSequence, expiresAt, scope.project_id, scope.environment_id]);
-    if (!result.rows.length) throw new Error("Continuation authorization became stale before lease issuance");
+    if (!result.rows.length) throw new Error("Continuation authorization became stale, or the bound policy does not authorize it");
     return { lease, expires_at: expiresAt };
   }
 
+  /**
+   * Consume a continuation lease. The intersection is re-evaluated at
+   * consumption time, not merely at issuance: a stale sequence or a policy
+   * that no longer authorizes automatic continuation must still block it.
+   */
   async consumeContinuationLease(scope: TenantScope, lease: string): Promise<{ action_id: string; resolution_id: string } | null> {
     if (!/^nyst_lease_[A-Za-z0-9_-]{40,100}$/.test(lease)) return null;
     const result = await this.db.query(`UPDATE nyst_continuation_leases l SET consumed_at=now()
-      FROM nyst_action_scopes s,outcome_runtime rt,outcome_resolutions r
+      FROM nyst_action_scopes s,outcome_runtime rt,outcome_resolutions r,nyst_action_policy_bindings b,nyst_policy_versions p
       WHERE l.lease_hash=$1 AND l.consumed_at IS NULL AND l.expires_at>now()
         AND s.action_id=l.action_id AND s.organization_id=$2 AND s.project_id=$3 AND s.environment_id=$4
         AND rt.action_id=l.action_id AND rt.resolution_sequence=l.resolution_sequence AND rt.evidence_sequence=l.evidence_sequence
-        AND r.resolution_id=l.resolution_id AND r.action_id=l.action_id AND r.continuation_disposition='allowed'
+        AND r.resolution_id=l.resolution_id AND r.action_id=l.action_id
+        AND b.action_id=l.action_id AND p.policy_version_id=b.policy_version_id
+        AND ${SQL_AUTOMATIC_CONTINUATION_AUTHORITY}
       RETURNING l.action_id,l.resolution_id`, [digest(lease), scope.organization_id, scope.project_id, scope.environment_id]);
     const row = result.rows[0]; return row ? { action_id: String(row.action_id), resolution_id: String(row.resolution_id) } : null;
+  }
+
+  /**
+   * THE canonical effective-authority read. Every automatic authority path
+   * derives permission from this, so there is exactly one definition of what
+   * Nyst is allowed to do next for a given action.
+   */
+  async effectiveActionAuthority(scope: TenantScope, actionId: string, resolutionId?: string): Promise<(ReturnType<typeof effectiveAuthority> & { policy_version_id: string; resolution_id: string }) | null> {
+    const result = await this.db.query(`SELECT r.resolution_id,r.primary_directive,r.retry_disposition,r.continuation_disposition,r.recovery_disposition,
+        p.policy_version_id,p.execution_mode,p.auto_continuation,p.auto_compensation,p.reconcile_timeout_seconds
+      FROM nyst_action_scopes s
+      JOIN nyst_action_policy_bindings b ON b.action_id=s.action_id
+      JOIN nyst_policy_versions p ON p.policy_version_id=b.policy_version_id
+      JOIN LATERAL(SELECT * FROM outcome_resolutions WHERE action_id=s.action_id
+        AND ($5::uuid IS NULL OR resolution_id=$5::uuid)
+        ORDER BY resolution_sequence DESC NULLS LAST,resolved_at DESC LIMIT 1) r ON true
+      WHERE s.action_id=$1 AND s.environment_id=$2 AND s.project_id=$3 AND s.organization_id=$4`,
+      [actionId, scope.environment_id, scope.project_id, scope.organization_id, resolutionId ?? null]);
+    const row = result.rows[0]; if (!row) return null;
+    const authority = effectiveAuthority(
+      { primary: row.primary_directive as never, retry: row.retry_disposition as never, continuation: row.continuation_disposition as never, recovery: row.recovery_disposition as never },
+      { policy_version_id: String(row.policy_version_id), execution_mode: row.execution_mode === "approval_required" ? "approval_required" : "automatic",
+        retry_mode: "never", auto_continuation: row.auto_continuation === true, auto_compensation: row.auto_compensation === true,
+        reconcile_timeout_seconds: Number(row.reconcile_timeout_seconds) },
+    );
+    return { ...authority, policy_version_id: String(row.policy_version_id), resolution_id: String(row.resolution_id) };
   }
 
   async environmentControl(scope: TenantScope): Promise<{ mode: EnvironmentMode; is_demo: boolean; onboarding_stage: number }> {
@@ -384,30 +443,103 @@ export class ProductRepository {
     if (!result.rows.length && !check.rows.length) throw new Error("Action policy/mode binding is stale or belongs to another environment");
   }
 
-  async recordShadowEvaluation(scope: TenantScope, effectName: string, businessKey: string, observation: ShadowObservation): Promise<Record<string, unknown>> {
-    const control = await this.environmentControl(scope); if (control.mode !== "shadow") throw new Error("Shadow evaluations require a Shadow environment");
-    const configured=await this.db.query(`SELECT enabled FROM nyst_environment_effect_specs WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND effect_name=$4`,[scope.environment_id,scope.project_id,scope.organization_id,effectName]);
-    if(configured.rows[0]?.enabled!==true)throw new Error("Shadow EffectSpec is unavailable or disabled for this environment");
-    const assessment = assessEffectShadow(effectName,observation); const id = randomUUID();
-    const result = await this.db.query(`INSERT INTO nyst_shadow_evaluations(shadow_evaluation_id,environment_id,project_id,organization_id,effect_name,business_key,observation,observed_ambiguous,attempted_retry,attempted_continuation,retry_would_have_been_blocked,continuation_would_have_been_blocked,assessment)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-      ON CONFLICT(environment_id,effect_name,business_key) DO UPDATE SET observation=excluded.observation,observed_ambiguous=excluded.observed_ambiguous,attempted_retry=excluded.attempted_retry,attempted_continuation=excluded.attempted_continuation,retry_would_have_been_blocked=excluded.retry_would_have_been_blocked,continuation_would_have_been_blocked=excluded.continuation_would_have_been_blocked,assessment=excluded.assessment
+  /**
+   * Record a Shadow evaluation.
+   *
+   * v0.2.1 checked only that the effect was enabled, never the VERSION, and
+   * derived the result with hand-written per-provider comparison logic that
+   * could drift from Enforced. Both are fixed:
+   *
+   *   - the caller must name the EXACT version the environment has enabled;
+   *     there is no implicit current/latest substitution;
+   *   - derivation runs the shared EffectSpec pipeline (primitives A-E) via
+   *     deriveShadowSemantics, so Shadow and Enforced cannot disagree;
+   *   - the version is persisted, so a later environment version change never
+   *     reinterprets a historical Shadow record.
+   */
+  async recordShadowEvaluation(scope: TenantScope, effectName: string, businessKey: string, observation: ShadowObservation, specVersion: string, agentId: string | null = null): Promise<Record<string, unknown>> {
+    const control = await this.environmentControl(scope);
+    if (control.mode !== "shadow") throw new Error("Shadow evaluations require a Shadow environment");
+    const configured = await this.db.query(`SELECT enabled,spec_version FROM nyst_environment_effect_specs WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND effect_name=$4`,
+      [scope.environment_id, scope.project_id, scope.organization_id, effectName]);
+    const row = configured.rows[0];
+    if (row?.enabled !== true) throw new Error("Shadow EffectSpec is unavailable or disabled for this environment");
+    if (String(row.spec_version) !== specVersion) {
+      throw new Error(`Shadow requires the exact enabled EffectSpec version. ${effectName} is enabled at ${String(row.spec_version)}; ${specVersion} was requested.`);
+    }
+    assertShadowObservationSchema(effectName, observation.provider_state ?? {});
+    // A-E only. There is no provider dispatch on this path.
+    const derivation = deriveShadowSemantics(effectName, specVersion, observation);
+    const id = randomUUID();
+    const result = await this.db.query(`INSERT INTO nyst_shadow_evaluations(shadow_evaluation_id,environment_id,project_id,organization_id,effect_name,spec_version,agent_id,business_key,observation,observed_ambiguous,attempted_retry,attempted_continuation,retry_would_have_been_blocked,continuation_would_have_been_blocked,assessment)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT(environment_id,effect_name,business_key) DO UPDATE SET observation=excluded.observation,spec_version=excluded.spec_version,agent_id=excluded.agent_id,observed_ambiguous=excluded.observed_ambiguous,attempted_retry=excluded.attempted_retry,attempted_continuation=excluded.attempted_continuation,retry_would_have_been_blocked=excluded.retry_would_have_been_blocked,continuation_would_have_been_blocked=excluded.continuation_would_have_been_blocked,assessment=excluded.assessment
       WHERE nyst_shadow_evaluations.project_id=excluded.project_id AND nyst_shadow_evaluations.organization_id=excluded.organization_id
-      RETURNING shadow_evaluation_id,effect_name,business_key,assessment,created_at`, [id, scope.environment_id, scope.project_id, scope.organization_id, bounded(effectName,200,"effect"), bounded(businessKey,463,"business key"), observation, assessment.observed_ambiguous, observation.attempted_retry, observation.attempted_continuation, assessment.retry_would_have_been_blocked, assessment.continuation_would_have_been_blocked, assessment]);
-    if (!result.rows.length) throw new Error("Shadow record belongs to a different tenant scope"); return result.rows[0]!;
+      RETURNING shadow_evaluation_id,effect_name,spec_version,business_key,assessment,created_at`,
+      [id, scope.environment_id, scope.project_id, scope.organization_id, bounded(effectName, 200, "effect"), bounded(specVersion, 200, "spec version"), agentId,
+       bounded(businessKey, 463, "business key"), observation, derivation.observed_ambiguous, observation.attempted_retry, observation.attempted_continuation,
+       derivation.retry_would_have_been_blocked, derivation.continuation_would_have_been_blocked, derivation]);
+    if (!result.rows.length) throw new Error("Shadow record belongs to a different tenant scope");
+    const stored = result.rows[0]!;
+    const shadowId = String(stored.shadow_evaluation_id);
+    // Shadow interventions are counterfactual. The schema itself forbids a
+    // Shadow row from carrying an Enforced prevention kind.
+    if (derivation.retry_would_have_been_blocked) {
+      await this.recordIntervention(scope, { kind: "shadow_retry_would_have_been_blocked", shadow_evaluation_id: shadowId, agent_id: agentId,
+        effect_name: effectName, mode: "shadow", intervention_key: `shadow_retry:${shadowId}`,
+        summary: "Enforced Mode would have blocked this retry. Shadow did not control the action.",
+        detail: { effect_state: derivation.effect_state, spec_version: specVersion } });
+    }
+    if (derivation.continuation_would_have_been_blocked) {
+      await this.recordIntervention(scope, { kind: "shadow_continuation_would_have_been_blocked", shadow_evaluation_id: shadowId, agent_id: agentId,
+        effect_name: effectName, mode: "shadow", intervention_key: `shadow_continuation:${shadowId}`,
+        summary: "Enforced Mode would have held this continuation. Shadow did not control the action.",
+        detail: { effect_state: derivation.effect_state, spec_version: specVersion } });
+    }
+    return stored;
   }
 
-  async impactMetrics(scope: TenantScope): Promise<Record<string, unknown>> {
+  /**
+   * THE canonical metric service.
+   *
+   * Overview, the Protection Report, and the impact API all call this. v0.2.1
+   * had `overview()` and `impactMetrics()` computing differently-named,
+   * differently-defined versions of the same idea, and the Overview card read
+   * a field the backend never produced, so real Enforced prevention rendered
+   * as 0.
+   *
+   * Grounding rules encoded in the SQL below:
+   *   - demo environments are excluded;
+   *   - Failure Lab runs live in their own table and are never counted;
+   *   - "prevented" counts come only from durable Canary/Enforced intervention
+   *     records; Shadow can only ever contribute to "detected";
+   *   - every count is DISTINCT on the logical subject, so a scheduler run,
+   *     a repeated observation, or a page refresh cannot inflate it.
+   */
+  async canonicalMetrics(scope: TenantScope, rangeLabel: MetricRange["label"] = "all", from?: string, to?: string, now: Date = new Date()): Promise<CanonicalMetrics> {
     const control = await this.environmentControl(scope);
+    const range = resolveRange(rangeLabel, from, to, now);
+    if (control.is_demo) {
+      // A demo environment has no production truth to report. Returning a
+      // fully-typed zeroed contract is honest; inventing numbers is not.
+      return { ...emptyMetrics(control.mode, range) };
+    }
+    const params = [scope.environment_id, scope.project_id, scope.organization_id, range.from, range.sql_upper_bound];
     const result = await this.db.query(`WITH scoped_actions AS (
-        SELECT s.action_id,a.effect_name,coalesce(a.dispatch_plan->>'provider',split_part(a.effect_name,'.',1)) provider,a.created_at
-        FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id) JOIN nyst_environments env USING(environment_id,project_id,organization_id)
+        SELECT s.action_id,s.agent_id,a.effect_name,coalesce(a.dispatch_plan->>'provider',split_part(a.effect_name,'.',1)) provider,a.created_at
+        FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id)
+        JOIN nyst_environments env ON env.environment_id=s.environment_id AND env.project_id=s.project_id AND env.organization_id=s.organization_id
         WHERE s.environment_id=$1 AND s.project_id=$2 AND s.organization_id=$3 AND env.is_demo=false
+          AND a.created_at>=$4::timestamptz AND ($5::timestamptz IS NULL OR a.created_at<=$5::timestamptz)
       ), active_evidence AS (
         SELECT e.* FROM outcome_evidence e JOIN scoped_actions s USING(action_id)
         WHERE NOT EXISTS(SELECT 1 FROM outcome_evidence correction WHERE correction.action_id=e.action_id AND correction.supersedes_evidence_id=e.evidence_id)
       ), ambiguous AS (
         SELECT DISTINCT action_id FROM active_evidence WHERE kind='transport_error' OR strength='transport_only'
+      ), scoped_interventions AS (
+        SELECT i.* FROM nyst_intervention_events i
+        WHERE i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3
+          AND ($5::timestamptz IS NULL OR i.occurred_at<=$5::timestamptz) AND i.occurred_at>=$4::timestamptz
       ), latest AS (
         SELECT DISTINCT ON(t.action_id) t.* FROM nyst_resolution_transitions t JOIN scoped_actions s USING(action_id)
         ORDER BY t.action_id,t.resolution_sequence DESC,t.transition_id DESC
@@ -417,30 +549,123 @@ export class ProductRepository {
       ) SELECT
         (SELECT count(*)::int FROM scoped_actions) consequential_actions,
         (SELECT count(*)::int FROM ambiguous) ambiguous_executions,
-        (SELECT count(DISTINCT action_id)::int FROM nyst_control_events WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND event_kind='retry_blocked') unsafe_retries_prevented_enforced,
-        (SELECT count(DISTINCT action_id)::int FROM nyst_control_events WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND event_kind='continuation_blocked') unsafe_continuations_prevented_enforced,
-        (SELECT count(*)::int FROM nyst_shadow_evaluations WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND retry_would_have_been_blocked) unsafe_retries_detected_shadow,
-        (SELECT count(DISTINCT action_id)::int FROM nyst_control_events WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND event_kind='automatic_recovery_completed') auto_resolved,
-        (SELECT count(DISTINCT action_id)::int FROM nyst_human_reviews WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3) human_escalations,
-        (SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY duration_ms) FROM durations) median_reconciliation_duration,
-        (SELECT coalesce(jsonb_object_agg(key,count),'{}') FROM (SELECT provider key,count(*)::int count FROM scoped_actions GROUP BY provider) q) provider_breakdown,
-        (SELECT coalesce(jsonb_object_agg(key,count),'{}') FROM (SELECT effect_name key,count(*)::int count FROM scoped_actions GROUP BY effect_name) q) effect_breakdown`, [scope.environment_id, scope.project_id, scope.organization_id]);
-    const recent=await this.listActions(scope,{limit:8});
-    const metrics=result.rows[0]??{};return { mode: control.mode, ...metrics,unsafe_retry_detected_shadow:metrics.unsafe_retries_detected_shadow??0, recent, metric_definitions: {
-      consequential_actions:"distinct durable non-demo logical actions", ambiguous_executions:"distinct actions with active transport_error or transport_only evidence",
-      unsafe_retries_prevented_enforced:"distinct actions with persisted enforced retry_blocked control events", unsafe_retries_detected_shadow:"distinct Shadow records that report would-have-blocked retry; never prevention",
-      unsafe_continuations_prevented_enforced:"distinct actions with persisted enforced continuation_blocked events", auto_resolved:"distinct actions with completed automatic recovery control events",
-      human_escalations:"distinct actions with durable human review", median_reconciliation_duration:"median milliseconds from intent creation to current terminal resolution"
-    } };
+        (SELECT count(DISTINCT action_id)::int FROM scoped_interventions WHERE kind='retry_blocked' AND mode IN('canary','enforced')) unsafe_retries_prevented_enforced,
+        (SELECT count(DISTINCT action_id)::int FROM scoped_interventions WHERE kind='continuation_blocked' AND mode IN('canary','enforced')) unsafe_continuations_prevented_enforced,
+        (SELECT count(DISTINCT shadow_evaluation_id)::int FROM scoped_interventions WHERE kind='shadow_retry_would_have_been_blocked') unsafe_retries_detected_shadow,
+        (SELECT count(DISTINCT shadow_evaluation_id)::int FROM scoped_interventions WHERE kind='shadow_continuation_would_have_been_blocked') unsafe_continuations_detected_shadow,
+        (SELECT count(DISTINCT action_id)::int FROM scoped_interventions WHERE kind='auto_resolved') auto_resolved,
+        (SELECT count(DISTINCT action_id)::int FROM scoped_interventions WHERE kind='human_review_opened') human_escalations,
+        (SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY duration_ms) FROM durations) median_reconciliation_duration_ms,
+        (SELECT coalesce(jsonb_object_agg(key,count),'{}'::jsonb) FROM (SELECT provider key,count(*)::int count FROM scoped_actions GROUP BY provider) q) provider_breakdown,
+        (SELECT coalesce(jsonb_object_agg(key,count),'{}'::jsonb) FROM (SELECT effect_name key,count(*)::int count FROM scoped_actions GROUP BY effect_name) q) effect_breakdown,
+        (SELECT coalesce(jsonb_object_agg(key,count),'{}'::jsonb) FROM (
+          SELECT coalesce(ag.name,'unattributed') key,count(*)::int count FROM scoped_actions sa
+          LEFT JOIN nyst_agents ag ON ag.agent_id=sa.agent_id GROUP BY coalesce(ag.name,'unattributed')) q) agent_breakdown`, params);
+
+    const row = result.rows[0];
+    if (!row) throw new Error("Nyst metric contract violation: the canonical metrics query returned no row.");
+
+    const interventions = await this.db.query(`SELECT i.intervention_id,i.kind,i.action_id,i.shadow_evaluation_id,i.agent_id,ag.name agent_name,i.effect_name,i.mode,i.summary,i.occurred_at
+      FROM nyst_intervention_events i LEFT JOIN nyst_agents ag ON ag.agent_id=i.agent_id
+      WHERE i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND ($5::timestamptz IS NULL OR i.occurred_at<=$5::timestamptz) AND i.occurred_at>=$4::timestamptz
+      ORDER BY i.occurred_at DESC,i.intervention_id DESC LIMIT 12`, params);
+
+    return {
+      mode: control.mode,
+      range,
+      consequential_actions: requireMetricInt(row, "consequential_actions"),
+      ambiguous_executions: requireMetricInt(row, "ambiguous_executions"),
+      unsafe_retries_prevented_enforced: requireMetricInt(row, "unsafe_retries_prevented_enforced"),
+      unsafe_retries_detected_shadow: requireMetricInt(row, "unsafe_retries_detected_shadow"),
+      unsafe_continuations_prevented_enforced: requireMetricInt(row, "unsafe_continuations_prevented_enforced"),
+      unsafe_continuations_detected_shadow: requireMetricInt(row, "unsafe_continuations_detected_shadow"),
+      auto_resolved: requireMetricInt(row, "auto_resolved"),
+      human_escalations: requireMetricInt(row, "human_escalations"),
+      median_reconciliation_duration_ms: optionalMetricNumber(row, "median_reconciliation_duration_ms"),
+      recent_interventions: interventions.rows.map((item): InterventionSummary => ({
+        intervention_id: String(item.intervention_id),
+        kind: item.kind as InterventionKind,
+        action_id: item.action_id ? String(item.action_id) : null,
+        shadow_evaluation_id: item.shadow_evaluation_id ? String(item.shadow_evaluation_id) : null,
+        agent_id: item.agent_id ? String(item.agent_id) : null,
+        agent_name: item.agent_name ? String(item.agent_name) : null,
+        effect_name: String(item.effect_name),
+        mode: item.mode as EnvironmentMode,
+        summary: String(item.summary),
+        occurred_at: new Date(String(item.occurred_at)).toISOString(),
+      })),
+      provider_breakdown: requireBreakdown(row, "provider_breakdown"),
+      effect_breakdown: requireBreakdown(row, "effect_breakdown"),
+      agent_breakdown: requireBreakdown(row, "agent_breakdown"),
+      metric_definitions: METRIC_DEFINITIONS,
+    };
   }
 
-  async testIntegration(scope:TenantScope,provider:string,env:NodeJS.ProcessEnv=process.env):Promise<Record<string,unknown>>{
+  /**
+   * Back-compatible alias. Kept so existing API consumers keep working, but it
+   * now returns the SAME canonical contract rather than a second definition.
+   */
+  async impactMetrics(scope: TenantScope): Promise<CanonicalMetrics> { return this.canonicalMetrics(scope); }
+
+  /** Overview reads the canonical contract. There is no second definition. */
+  async overview(scope: TenantScope): Promise<CanonicalMetrics> { return this.canonicalMetrics(scope); }
+
+  async integrationReadiness(scope:TenantScope,provider:string,secrets:SecretProvider,now:Date=new Date()):Promise<IntegrationReadiness>{
     if(!["github","okta","stripe"].includes(provider))throw new Error("Unsupported integration provider");
-    const result=await this.db.query(`SELECT integration_id,credential_ref,configured FROM nyst_integrations WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,[scope.environment_id,scope.project_id,scope.organization_id,provider]);
-    const row=result.rows[0];if(!row||row.configured!==true)throw new Error("Integration is not configured");
-    const expected=EXPECTED_PROVIDER_REFS[provider];if(row.credential_ref!==expected)throw new Error("Credential reference does not match the supported provider topology");
-    const variable=String(expected).slice(4);const available=typeof env[variable]==="string"&&env[variable]!.length>0;
-    return {provider,configured:true,credential_reference_valid:true,credential_available_to_process:available,provider_mutation_performed:false,read_only_preflight_performed:false,status:available?"credential_ready":"credential_unavailable"};
+    const row=(await this.db.query(`SELECT i.credential_ref,i.configured,
+        (SELECT status FROM nyst_integration_preflights WHERE environment_id=$1 AND provider=$4 ORDER BY performed_at DESC LIMIT 1) last_status,
+        (SELECT performed_at FROM nyst_integration_preflights WHERE environment_id=$1 AND provider=$4 ORDER BY performed_at DESC LIMIT 1) last_at,
+        (SELECT coalesce(array_agg(effect_name ORDER BY effect_name),ARRAY[]::text[]) FROM nyst_environment_effect_specs
+          WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND enabled AND split_part(effect_name,'.',1)=$4) enabled_effects
+      FROM (SELECT 1) one
+      LEFT JOIN nyst_integrations i ON i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND i.provider=$4`,
+      [scope.environment_id,scope.project_id,scope.organization_id,provider])).rows[0]??{};
+    const credentialRef=typeof row.credential_ref==="string"?row.credential_ref:null;
+    const configured=row.configured===true&&credentialRef!==null;
+    const enabledEffects=Array.isArray(row.enabled_effects)?row.enabled_effects.map(String):[];
+    const credential=configured?await probeCredentialAvailability(secrets,credentialRef):{available:false,category:"credential_unavailable" as const};
+    return composeReadiness({
+      provider, available:true, enabled:enabledEffects.length>0, configured,
+      credential_available:credential.available, credential_failure:credential.category,
+      last_preflight_at:row.last_at?new Date(String(row.last_at)).toISOString():null,
+      last_preflight_status:(row.last_status as PreflightStatus|undefined)??null,
+      enabled_effect_specs:enabledEffects, now,
+    });
+  }
+
+  /**
+   * Run and persist a bounded READ-ONLY provider preflight.
+   *
+   * Invariant I20: preflight may never mutate provider state. The persisted
+   * row carries a CHECK constraint fixing provider_mutation_performed=false,
+   * and runPreflight throws if a probe self-reports a mutation.
+   */
+  async runIntegrationPreflight(scope:TenantScope,provider:string,secrets:SecretProvider,probe:PreflightProbe,now:Date=new Date()):Promise<Record<string,unknown>>{
+    if(!["github","okta","stripe"].includes(provider))throw new Error("Unsupported integration provider");
+    await this.requireTenantScope(scope);
+    const row=(await this.db.query(`SELECT credential_ref,configured FROM nyst_integrations WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,
+      [scope.environment_id,scope.project_id,scope.organization_id,provider])).rows[0];
+    const reference=row?.configured===true&&typeof row.credential_ref==="string"?row.credential_ref:null;
+    const record=await runPreflight(provider,reference,secrets,probe,now);
+    const stored=await this.db.query(`INSERT INTO nyst_integration_preflights(preflight_id,environment_id,project_id,organization_id,provider,status,account_identity,scope_result,resource_result,failure_detail,provider_mutation_performed,performed_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false,$11) RETURNING preflight_id,provider,status,account_identity,scope_result,resource_result,failure_detail,provider_mutation_performed,performed_at`,
+      [randomUUID(),scope.environment_id,scope.project_id,scope.organization_id,provider,record.status,record.account_identity,record.scope_result,record.resource_result,record.failure_detail,record.performed_at]);
+    if(record.status==="verified_ready"){
+      await this.db.query(`UPDATE nyst_integrations SET last_verified_at=$5 WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,
+        [scope.environment_id,scope.project_id,scope.organization_id,provider,record.performed_at]);
+    }
+    return { ...stored.rows[0]!, read_only_preflight_performed: true };
+  }
+
+  /** Every configured provider's readiness in one call, for the Integrations page. */
+  async integrationsReadiness(scope:TenantScope,secrets:SecretProvider,now:Date=new Date()):Promise<IntegrationReadiness[]>{
+    return Promise.all((["github","okta","stripe"] as const).map((provider)=>this.integrationReadiness(scope,provider,secrets,now)));
+  }
+
+  async preflightHistory(scope:TenantScope,provider:string,limit=10):Promise<Record<string,unknown>[]>{
+    return (await this.db.query(`SELECT preflight_id,provider,status,account_identity,scope_result,resource_result,failure_detail,provider_mutation_performed,performed_at
+      FROM nyst_integration_preflights WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4 ORDER BY performed_at DESC LIMIT $5`,
+      [scope.environment_id,scope.project_id,scope.organization_id,provider,Math.min(Math.max(1,limit),50)])).rows;
   }
 
   async markIntegrationVerified(scope:TenantScope,provider:string):Promise<void>{const result=await this.db.query(`UPDATE nyst_integrations SET last_verified_at=now() WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4 AND configured RETURNING integration_id`,[scope.environment_id,scope.project_id,scope.organization_id,provider]);if(!result.rows.length)throw new Error("Integration is unavailable in this tenant scope");}
@@ -466,20 +691,123 @@ export class ProductRepository {
         SELECT $15,w.webhook_endpoint_id,t.action_id,t.resolution_id,t.resolution_sequence,t.evidence_sequence,t.event_type,$16,t.occurred_at,1 FROM transition t JOIN nyst_webhook_endpoints w ON w.environment_id=t.environment_id AND w.project_id=t.project_id AND w.organization_id=t.organization_id AND w.enabled
         ON CONFLICT(webhook_endpoint_id,action_id,resolution_id,event_type) DO NOTHING RETURNING webhook_event_id
       ) SELECT transition_id FROM transition`,[transitionId,actionId,resolution.resolution_id,origin,eventType,resolution.effect.state,resolution.control.primary,resolution.control.retry,resolution.control.continuation,resolution.control.recovery,resolution.runtime.resolution_sequence,resolution.runtime.evidence_sequence,`/v1/actions/${actionId}/receipt`,resolution.trust.resolved_at,eventId,payload,randomUUID(),randomUUID()]);
+    // Durable intervention records (1K). Keyed on the LOGICAL intervention, so
+    // scheduler runs, repeated observations, and webhook retries collapse onto
+    // one row instead of inflating the count. Only a controlling mode
+    // (canary/enforced) may record a prevention; Shadow physically cannot,
+    // because a Shadow row has no action-bound policy binding and the schema
+    // check constraint forbids the kind.
+    await this.recordInterventionsForTransition(actionId,resolution);
     return result.rows.length===1;
   }
 
-  async escalateOverdueReconciliations(nowIso=new Date().toISOString()):Promise<number>{
-    const overdue=await this.db.query(`SELECT s.action_id,s.environment_id,s.project_id,s.organization_id,r.resolution_id
-      FROM nyst_action_scopes s JOIN nyst_action_policy_bindings b USING(action_id)
+  /**
+   * A bound policy reconciliation deadline expired.
+   *
+   * v0.2.1 deleted the job row, but `scheduler.sync()` re-derives jobs from
+   * `outcome_runtime.next_check_at`, so the very next sync — or any process
+   * restart — resurrected automatic reconciliation on an action that had
+   * already been escalated to a human.
+   *
+   * Suppression is now a durable product-level fact in
+   * `nyst_reconciliation_suppressions`, which `sync()` consults. Note what is
+   * deliberately NOT done here:
+   *   - the external EffectState is not touched (I14: a policy timeout can
+   *     change control behaviour but can never change external truth);
+   *   - `outcome_runtime.next_check_at` is preserved as historical runtime
+   *     evidence, it simply stops being an authority to schedule work.
+   * Human Review can still request a NEW read-only re-observation.
+   */
+  /**
+   * Derive the durable interventions implied by a transition.
+   *
+   * An intervention is recorded only when Nyst ACTUALLY controlled the action
+   * (canary/enforced) AND the action was genuinely ambiguous — a forbidden
+   * retry on an unambiguous action is not a prevention, it is just policy.
+   */
+  private async recordInterventionsForTransition(actionId:string,resolution:OutcomeResolution):Promise<void>{
+    const context=(await this.db.query(`SELECT s.environment_id,s.project_id,s.organization_id,s.agent_id,a.effect_name,b.environment_mode,
+        EXISTS(SELECT 1 FROM outcome_evidence e WHERE e.action_id=s.action_id AND (e.kind='transport_error' OR e.strength='transport_only')
+          AND NOT EXISTS(SELECT 1 FROM outcome_evidence c WHERE c.action_id=e.action_id AND c.supersedes_evidence_id=e.evidence_id)) ambiguous
+      FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id) JOIN nyst_action_policy_bindings b USING(action_id)
+      WHERE s.action_id=$1`,[actionId])).rows[0];
+    if(!context)return;
+    const mode=normalizeMode(context.environment_mode);
+    if(mode==="shadow")return; // Shadow never prevents anything.
+    if(context.ambiguous!==true)return;
+    const scope={environment_id:String(context.environment_id),project_id:String(context.project_id),organization_id:String(context.organization_id)};
+    const base={action_id:actionId,agent_id:context.agent_id?String(context.agent_id):null,effect_name:String(context.effect_name),mode} as const;
+    if(resolution.control.retry==="forbidden"){
+      await this.recordIntervention(scope,{...base,kind:"retry_blocked",intervention_key:`retry_blocked:${actionId}`,
+        summary:"Nyst blocked an unsafe retry after execution became ambiguous.",
+        detail:{effect_state:resolution.effect.state,reason_code:resolution.control.reason_code}});
+    }
+    if(resolution.control.continuation==="blocked"){
+      await this.recordIntervention(scope,{...base,kind:"continuation_blocked",intervention_key:`continuation_blocked:${actionId}`,
+        summary:"Nyst held an unsafe downstream continuation until the external effect was established.",
+        detail:{effect_state:resolution.effect.state,reason_code:resolution.control.reason_code}});
+    }
+  }
+
+  async escalateOverdueReconciliations(nowIso=new Date().toISOString(),environmentId:string|null=null):Promise<number>{
+    const overdue=await this.db.query(`SELECT s.action_id,s.environment_id,s.project_id,s.organization_id,s.agent_id,a.effect_name,b.environment_mode,r.resolution_id
+      FROM nyst_action_scopes s JOIN nyst_action_policy_bindings b USING(action_id) JOIN outcome_actions a ON a.action_id=s.action_id
       JOIN LATERAL(SELECT resolution_id,effect_state,primary_directive FROM outcome_resolutions WHERE action_id=s.action_id ORDER BY resolution_sequence DESC NULLS LAST,resolution_id DESC LIMIT 1) r ON true
-      WHERE b.reconcile_deadline_at<=$1 AND r.effect_state IN('pending','unprovable') AND NOT EXISTS(SELECT 1 FROM nyst_human_reviews h WHERE h.action_id=s.action_id)`,[nowIso]);
-    let count=0;for(const row of overdue.rows){const reviewId=randomUUID();const inserted=await this.db.query(`WITH review AS (
-        INSERT INTO nyst_human_reviews(human_review_id,action_id,environment_id,project_id,organization_id,status,reason)
-        VALUES($1,$2,$3,$4,$5,'open','Policy reconciliation deadline expired; external truth is unchanged and human review is required.') ON CONFLICT(action_id) DO NOTHING RETURNING *
-      ), stopped AS (DELETE FROM nyst_reconciliation_jobs WHERE action_id=$2)
-      SELECT human_review_id FROM review`,[reviewId,row.action_id,row.environment_id,row.project_id,row.organization_id]);if(inserted.rows.length){count++;await this.queueLifecycleWebhookByAction(String(row.action_id),"human_review.required");}}
+      WHERE b.reconcile_deadline_at<=$1 AND ($2::uuid IS NULL OR s.environment_id=$2::uuid)
+        AND r.effect_state IN('pending','unprovable') AND NOT EXISTS(SELECT 1 FROM nyst_human_reviews h WHERE h.action_id=s.action_id)`,[nowIso,environmentId]);
+    let count=0;
+    for(const row of overdue.rows){
+      const reviewId=randomUUID();
+      const inserted=await this.db.query(`WITH review AS (
+          INSERT INTO nyst_human_reviews(human_review_id,action_id,environment_id,project_id,organization_id,status,reason)
+          VALUES($1,$2,$3,$4,$5,'open','Policy reconciliation deadline expired; external truth is unchanged and human review is required.') ON CONFLICT(action_id) DO NOTHING RETURNING *
+        ), suppression AS (
+          INSERT INTO nyst_reconciliation_suppressions(action_id,environment_id,project_id,organization_id,reason,source)
+          SELECT action_id,environment_id,project_id,organization_id,'Policy reconciliation deadline expired and the action was escalated to human review.','policy_deadline' FROM review
+          ON CONFLICT(action_id) DO NOTHING
+        ), stopped AS (DELETE FROM nyst_reconciliation_jobs WHERE action_id=(SELECT action_id FROM review))
+        SELECT human_review_id FROM review`,[reviewId,row.action_id,row.environment_id,row.project_id,row.organization_id]);
+      if(inserted.rows.length){
+        count++;
+        await this.recordIntervention({ environment_id:String(row.environment_id), project_id:String(row.project_id), organization_id:String(row.organization_id) },
+          { kind:"human_review_opened", action_id:String(row.action_id), agent_id:row.agent_id?String(row.agent_id):null,
+            effect_name:String(row.effect_name), mode:normalizeMode(row.environment_mode),
+            intervention_key:`human_review_opened:${row.action_id}`,
+            summary:"Policy reconciliation deadline reached; Nyst stopped automatic reconciliation and escalated.",
+            detail:{ source:"policy_deadline", resolution_id:String(row.resolution_id) } });
+        await this.queueLifecycleWebhookByAction(String(row.action_id),"human_review.required");
+      }
+    }
     return count;
+  }
+
+  /** Lift a suppression. Explicit, audited, and never automatic. */
+  async liftReconciliationSuppression(scope:TenantScope,userId:string,actionId:string):Promise<boolean>{
+    const result=await this.db.query(`DELETE FROM nyst_reconciliation_suppressions WHERE action_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4 RETURNING action_id`,
+      [actionId,scope.environment_id,scope.project_id,scope.organization_id]);
+    if(result.rows.length) await this.audit(scope,userId,"reconciliation.suppression_lifted","action",actionId,{});
+    return result.rows.length===1;
+  }
+
+  async reconciliationSuppressed(actionId:string):Promise<boolean>{
+    return (await this.db.query(`SELECT 1 FROM nyst_reconciliation_suppressions WHERE action_id=$1`,[actionId])).rows.length>0;
+  }
+
+  /**
+   * Record ONE logical intervention.
+   *
+   * `intervention_key` is the logical identity. Scheduler runs, repeated
+   * observations, webhook retries, and page refreshes all collapse onto the
+   * same key, so a single intervention can never be counted twice. Returns
+   * true only when this call created the record.
+   */
+  async recordIntervention(scope:TenantScope,input:{kind:InterventionKind;action_id?:string|null;shadow_evaluation_id?:string|null;agent_id?:string|null;effect_name:string;mode:EnvironmentMode;intervention_key:string;summary:string;detail?:Record<string,unknown>}):Promise<boolean>{
+    const result=await this.db.query(`INSERT INTO nyst_intervention_events(intervention_id,intervention_key,environment_id,project_id,organization_id,action_id,shadow_evaluation_id,agent_id,effect_name,mode,kind,summary,detail)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(intervention_key) DO NOTHING RETURNING intervention_id`,
+      [randomUUID(),bounded(input.intervention_key,400,"intervention key"),scope.environment_id,scope.project_id,scope.organization_id,
+       input.action_id??null,input.shadow_evaluation_id??null,input.agent_id??null,bounded(input.effect_name,200,"effect"),input.mode,input.kind,
+       bounded(input.summary,400,"intervention summary"),input.detail??{}]);
+    return result.rows.length===1;
   }
 
   async queueLifecycleWebhookByAction(actionId:string,eventType:"continuation.authorized"|"human_review.required"|"recovery.completed"|"compensation.completed"):Promise<void>{
@@ -528,24 +856,181 @@ export class ProductRepository {
       WHERE w.environment_id=$8 AND w.enabled=true ON CONFLICT(webhook_endpoint_id,action_id,resolution_id,event_type) DO NOTHING`,[eventId,actionId,resolutionId,Number(runtime.resolution_sequence??1),Number(runtime.evidence_sequence??0),eventType,{event_id:eventId,event_type:eventType,action_id:actionId,resolution_id:resolutionId,resolution_sequence:Number(runtime.resolution_sequence??1),evidence_sequence:Number(runtime.evidence_sequence??0),environment_id:scope.environment_id},scope.environment_id]);
   }
 
+  /**
+   * Authorize a recovery operation.
+   *
+   * Authority is the intersection of runtime disposition and the IMMUTABLE
+   * ACTION-BOUND policy, checked both in the application and in SQL. The row
+   * starts at dispatch_state `definitely_not_sent`, which is what later makes
+   * a crash safe to reason about.
+   */
   async authorizeRecovery(scope:TenantScope,actionId:string,resolutionId:string,operation:"authorized_continuation"|"supported_compensation"):Promise<Record<string,unknown>>{
-    const id=randomUUID();const operationKey=`recovery:${actionId}:${resolutionId}:${operation}`;const result=await this.db.query(`INSERT INTO nyst_recovery_executions(recovery_execution_id,action_id,resolution_id,policy_version_id,operation,status,resolution_sequence,evidence_sequence,downstream_operation_key)
-      SELECT $1,s.action_id,r.resolution_id,b.policy_version_id,$5,'authorized',r.resolution_sequence,rt.evidence_sequence,$8 FROM nyst_action_scopes s JOIN nyst_action_policy_bindings b USING(action_id) JOIN nyst_policy_versions p USING(policy_version_id) JOIN outcome_resolutions r ON r.action_id=s.action_id AND r.resolution_id=$2 JOIN outcome_runtime rt ON rt.action_id=s.action_id AND rt.resolution_sequence=r.resolution_sequence
-      WHERE s.action_id=$3 AND s.environment_id=$4 AND s.project_id=$6 AND s.organization_id=$7 AND (($5='authorized_continuation' AND p.auto_continuation AND r.continuation_disposition='allowed') OR ($5='supported_compensation' AND p.auto_compensation AND r.primary_directive='compensate'))
-      ON CONFLICT(action_id,resolution_id,operation) DO UPDATE SET action_id=excluded.action_id RETURNING recovery_execution_id,action_id,resolution_id,operation,status,created_at,downstream_operation_key`,[id,resolutionId,actionId,scope.environment_id,operation,scope.project_id,scope.organization_id,operationKey]);
-    if(!result.rows.length)throw new Error("Runtime resolution and bound conservative policy do not authorize this recovery");return result.rows[0]!;
+    const authority=await this.effectiveActionAuthority(scope,actionId,resolutionId);
+    if(!authority)throw new Error("Recovery authorization is unavailable for this action in this tenant scope");
+    const permitted=operation==="authorized_continuation"?authority.automatic_continuation_allowed:authority.automatic_compensation_allowed;
+    if(!permitted)throw new Error(`Runtime resolution and bound conservative policy do not authorize this recovery (${authority.reductions.join(", ")||"runtime disposition does not permit it"})`);
+    const id=randomUUID();const operationKey=`recovery:${actionId}:${resolutionId}:${operation}`;
+    const result=await this.db.query(`INSERT INTO nyst_recovery_executions(recovery_execution_id,action_id,resolution_id,policy_version_id,operation,status,dispatch_state,resolution_sequence,evidence_sequence,downstream_operation_key)
+      SELECT $1,s.action_id,r.resolution_id,b.policy_version_id,$5,'authorized','definitely_not_sent',r.resolution_sequence,rt.evidence_sequence,$8
+      FROM nyst_action_scopes s JOIN nyst_action_policy_bindings b USING(action_id) JOIN nyst_policy_versions p USING(policy_version_id)
+      JOIN outcome_resolutions r ON r.action_id=s.action_id AND r.resolution_id=$2
+      JOIN outcome_runtime rt ON rt.action_id=s.action_id AND rt.resolution_sequence=r.resolution_sequence
+      WHERE s.action_id=$3 AND s.environment_id=$4 AND s.project_id=$6 AND s.organization_id=$7
+        AND (($5='authorized_continuation' AND ${SQL_AUTOMATIC_CONTINUATION_AUTHORITY}) OR ($5='supported_compensation' AND ${SQL_AUTOMATIC_COMPENSATION_AUTHORITY}))
+      ON CONFLICT(action_id,resolution_id,operation) DO UPDATE SET action_id=excluded.action_id
+      RETURNING recovery_execution_id,action_id,resolution_id,operation,status,dispatch_state,recovery_operation_id,created_at,downstream_operation_key`,
+      [id,resolutionId,actionId,scope.environment_id,operation,scope.project_id,scope.organization_id,operationKey]);
+    if(!result.rows.length)throw new Error("Runtime resolution and bound conservative policy do not authorize this recovery");
+    return result.rows[0]!;
   }
 
-  async claimRecovery():Promise<Record<string,unknown>|null>{const token=randomUUID();const result=await this.db.query(`WITH candidate AS (
-      SELECT r.recovery_execution_id FROM nyst_recovery_executions r JOIN outcome_runtime rt ON rt.action_id=r.action_id JOIN outcome_resolutions resolution ON resolution.resolution_id=r.resolution_id AND resolution.action_id=r.action_id JOIN nyst_action_policy_bindings b ON b.action_id=r.action_id JOIN nyst_policy_versions p ON p.policy_version_id=b.policy_version_id
-      WHERE r.status='authorized' AND r.claim_token IS NULL AND rt.resolution_sequence=r.resolution_sequence AND rt.evidence_sequence=r.evidence_sequence AND b.policy_version_id=r.policy_version_id AND b.reconcile_deadline_at>now()
-        AND ((r.operation='authorized_continuation' AND p.auto_continuation AND resolution.continuation_disposition='allowed') OR (r.operation='supported_compensation' AND p.auto_compensation AND resolution.primary_directive='compensate'))
-      ORDER BY r.created_at,r.recovery_execution_id FOR UPDATE SKIP LOCKED LIMIT 1
-    ) UPDATE nyst_recovery_executions r SET status='executing',claim_token=$1,claimed_until=now()+interval '30 seconds',attempted_at=now() FROM candidate c,nyst_action_scopes s,outcome_actions a WHERE r.recovery_execution_id=c.recovery_execution_id AND s.action_id=r.action_id AND a.action_id=r.action_id
-      RETURNING r.recovery_execution_id,r.action_id,r.resolution_id,r.operation,r.claim_token,r.downstream_operation_key,r.resolution_sequence,r.evidence_sequence,s.environment_id,s.project_id,s.organization_id,a.effect_name,a.spec_version`,[token]);return result.rows[0]??null;}
+  /**
+   * Claim a recovery for execution.
+   *
+   * Two distinct eligibility paths, because recovery MAY cause an external
+   * consequence and an expired lease is NOT permission to run again:
+   *
+   *  1. FRESH  — status 'authorized'. Requires full effective authority,
+   *     non-stale resolution/evidence sequences, and a live deadline.
+   *  2. RECLAIM — status 'executing'/'observing' whose lease expired. Always
+   *     eligible so nothing can strand (I12), but the caller is told the
+   *     durable `dispatch_state` and whether authority is still valid, and
+   *     must act accordingly:
+   *
+   *       definitely_not_sent + authority valid  -> may resume the send
+   *       definitely_not_sent + authority stale  -> cancel
+   *       attempted / may_have_been_sent / ambiguous -> OBSERVE ONLY, never resend
+   *       completed                              -> no-op
+   *
+   * Lease expiry is compared using the DATABASE clock (`now()`), not an
+   * application clock, so cross-process ownership survives a node whose wall
+   * clock moves backwards (I13, Phase 3).
+   */
+  async claimRecovery(options:{leaseMs?:number;environment_id?:string}={}):Promise<Record<string,unknown>|null>{
+    const token=randomUUID();const leaseMs=options.leaseMs??30_000;const environmentId=options.environment_id??null;
+    const result=await this.db.query(`WITH eligible AS (
+        SELECT re.recovery_execution_id,
+          (rt.resolution_sequence=re.resolution_sequence AND rt.evidence_sequence=re.evidence_sequence
+            AND b.policy_version_id=re.policy_version_id AND b.reconcile_deadline_at>now()
+            AND ((re.operation='authorized_continuation' AND ${SQL_AUTOMATIC_CONTINUATION_AUTHORITY})
+              OR (re.operation='supported_compensation' AND ${SQL_AUTOMATIC_COMPENSATION_AUTHORITY}))) authority_valid,
+          re.status,re.claim_token,re.claimed_until,re.dispatch_state,re.created_at
+        FROM nyst_recovery_executions re
+        JOIN outcome_runtime rt ON rt.action_id=re.action_id
+        JOIN outcome_resolutions r ON r.resolution_id=re.resolution_id AND r.action_id=re.action_id
+        JOIN nyst_action_policy_bindings b ON b.action_id=re.action_id
+        JOIN nyst_policy_versions p ON p.policy_version_id=b.policy_version_id
+        JOIN nyst_action_scopes sc ON sc.action_id=re.action_id
+        WHERE $3::uuid IS NULL OR sc.environment_id=$3::uuid
+      ), candidate AS (
+        SELECT e.recovery_execution_id,e.authority_valid FROM eligible e
+        WHERE (e.status='authorized' AND e.claim_token IS NULL AND e.authority_valid)
+           OR (e.status IN ('executing','observing') AND e.claimed_until IS NOT NULL AND e.claimed_until<=now())
+        ORDER BY e.created_at,e.recovery_execution_id LIMIT 1
+      ) UPDATE nyst_recovery_executions r
+        SET status=CASE WHEN r.dispatch_state='definitely_not_sent' THEN 'executing' WHEN r.dispatch_state='completed' THEN 'completed' ELSE 'observing' END,
+            claim_token=$1,claimed_until=now()+($2::text||' milliseconds')::interval,attempt=r.attempt+1,attempted_at=now()
+        FROM candidate c,nyst_action_scopes s,outcome_actions a
+        WHERE r.recovery_execution_id=c.recovery_execution_id AND s.action_id=r.action_id AND a.action_id=r.action_id
+          -- Re-read the claim state inside the UPDATE so two concurrent workers
+          -- cannot both win: the second sees the first worker's fresh lease.
+          AND (r.claim_token IS NULL OR (r.claimed_until IS NOT NULL AND r.claimed_until<=now()))
+        RETURNING r.recovery_execution_id,r.action_id,r.resolution_id,r.operation,r.claim_token,r.downstream_operation_key,
+          r.recovery_operation_id,r.dispatch_state,r.status,r.attempt,r.resolution_sequence,r.evidence_sequence,
+          s.environment_id,s.project_id,s.organization_id,s.agent_id,a.effect_name,a.spec_version,c.authority_valid`,[token,leaseMs,environmentId]);
+    return result.rows[0]??null;
+  }
 
-  async completeRecovery(recoveryId:string,claimToken:string,successful:boolean,resultValue:Record<string,unknown>={}):Promise<boolean>{const result=await this.db.query(`UPDATE nyst_recovery_executions SET status=$3,completed_at=CASE WHEN $3='completed' THEN now() ELSE NULL END,claim_token=NULL,claimed_until=NULL,result=$4 WHERE recovery_execution_id=$1 AND claim_token=$2 AND status='executing' RETURNING recovery_execution_id,action_id`,[recoveryId,claimToken,successful?'completed':'failed',resultValue]);if(successful&&result.rows[0]){const actionId=String(result.rows[0].action_id);await this.db.query(`INSERT INTO nyst_control_events(control_event_id,transition_id,action_id,environment_id,project_id,organization_id,event_kind)
-      SELECT $1,t.transition_id,t.action_id,t.environment_id,t.project_id,t.organization_id,'automatic_recovery_completed' FROM nyst_resolution_transitions t WHERE t.action_id=$2 ORDER BY t.resolution_sequence DESC LIMIT 1 ON CONFLICT DO NOTHING`,[randomUUID(),actionId]);await this.queueLifecycleWebhookByAction(actionId,"recovery.completed");}return result.rows.length===1;}
+  /**
+   * Record where an attempt stopped relative to the provider send.
+   *
+   * This is the durable dispatch boundary. It is written BEFORE the send
+   * (`before_send`) and again after, so a process that dies mid-send still
+   * leaves behind the fact that a send may have started.
+   */
+  async recordRecoveryDispatch(recoveryId:string,claimToken:string,attempt:number,phase:"claimed"|"before_send"|"after_send"|"observed"|"failed_before_send"|"failed_after_send"|"cancelled",dispatchState:"definitely_not_sent"|"attempted"|"may_have_been_sent"|"ambiguous"|"completed",detail:Record<string,unknown>={}):Promise<boolean>{
+    const result=await this.db.query(`WITH attempt_record AS (
+        INSERT INTO nyst_recovery_dispatch_attempts(dispatch_attempt_id,recovery_execution_id,attempt,claim_token,phase,detail)
+        SELECT $1,$2,$3,$4,$5,$7 FROM nyst_recovery_executions WHERE recovery_execution_id=$2 AND claim_token=$4
+        ON CONFLICT(recovery_execution_id,attempt,phase) DO NOTHING RETURNING recovery_execution_id
+      ) UPDATE nyst_recovery_executions SET dispatch_state=$6
+        WHERE recovery_execution_id=$2 AND claim_token=$4
+          -- the boundary only ever advances; it can never be walked back to a
+          -- weaker claim such as definitely_not_sent after a send began
+          AND array_position(ARRAY['definitely_not_sent','attempted','may_have_been_sent','ambiguous','completed'],$6)
+            >= array_position(ARRAY['definitely_not_sent','attempted','may_have_been_sent','ambiguous','completed'],dispatch_state)
+        RETURNING recovery_execution_id`,[randomUUID(),recoveryId,attempt,claimToken,phase,dispatchState,detail]);
+    return result.rows.length===1;
+  }
+
+  /**
+   * Complete a recovery.
+   *
+   * ABA protection: completion requires the CURRENT claim token AND the
+   * expected action, recovery operation identity, policy version, resolution
+   * sequence, and evidence sequence. A worker that pauses past its lease and
+   * wakes after another worker legitimately reclaimed and finished cannot
+   * alter anything.
+   */
+  async completeRecovery(recoveryId:string,claimToken:string,successful:boolean,resultValue:Record<string,unknown>={},expected:{action_id?:string;recovery_operation_id?:string;policy_version_id?:string;resolution_sequence?:number;evidence_sequence?:number}={}):Promise<boolean>{
+    const result=await this.db.query(`UPDATE nyst_recovery_executions SET
+        status=$3,dispatch_state=CASE WHEN $3='completed' THEN 'completed' ELSE dispatch_state END,
+        completed_at=CASE WHEN $3='completed' THEN now() ELSE NULL END,
+        claim_token=NULL,claimed_until=NULL,result=$4,
+        needs_review_reason=CASE WHEN $3='needs_review' THEN $5 ELSE needs_review_reason END
+      WHERE recovery_execution_id=$1 AND claim_token=$2 AND status IN ('executing','observing')
+        AND ($6::uuid IS NULL OR action_id=$6::uuid)
+        AND ($7::uuid IS NULL OR recovery_operation_id=$7::uuid)
+        AND ($8::uuid IS NULL OR policy_version_id=$8::uuid)
+        AND ($9::int IS NULL OR resolution_sequence=$9::int)
+        AND ($10::int IS NULL OR evidence_sequence=$10::int)
+      RETURNING recovery_execution_id,action_id,status`,
+      [recoveryId,claimToken,successful?'completed':'needs_review',resultValue,
+       typeof resultValue.reason==="string"?String(resultValue.reason).slice(0,500):"Automatic recovery could not be completed safely.",
+       expected.action_id??null,expected.recovery_operation_id??null,expected.policy_version_id??null,
+       expected.resolution_sequence??null,expected.evidence_sequence??null]);
+    const row=result.rows[0];
+    if(!row)return false;
+    const actionId=String(row.action_id);
+    const scoped=(await this.db.query(`SELECT s.environment_id,s.project_id,s.organization_id,s.agent_id,a.effect_name,b.environment_mode
+      FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id) JOIN nyst_action_policy_bindings b USING(action_id) WHERE s.action_id=$1`,[actionId])).rows[0];
+    if(successful&&scoped){
+      await this.db.query(`INSERT INTO nyst_control_events(control_event_id,transition_id,action_id,environment_id,project_id,organization_id,event_kind)
+        SELECT $1,t.transition_id,t.action_id,t.environment_id,t.project_id,t.organization_id,'automatic_recovery_completed' FROM nyst_resolution_transitions t WHERE t.action_id=$2 ORDER BY t.resolution_sequence DESC LIMIT 1 ON CONFLICT DO NOTHING`,[randomUUID(),actionId]);
+      await this.recordIntervention({environment_id:String(scoped.environment_id),project_id:String(scoped.project_id),organization_id:String(scoped.organization_id)},
+        {kind:"auto_resolved",action_id:actionId,agent_id:scoped.agent_id?String(scoped.agent_id):null,effect_name:String(scoped.effect_name),
+         mode:normalizeMode(scoped.environment_mode),intervention_key:`auto_resolved:${actionId}`,
+         summary:"Nyst resolved the ambiguity automatically through an authorized recovery.",detail:{recovery_execution_id:recoveryId}});
+      await this.queueLifecycleWebhookByAction(actionId,"recovery.completed");
+    } else if(scoped){
+      await this.recordIntervention({environment_id:String(scoped.environment_id),project_id:String(scoped.project_id),organization_id:String(scoped.organization_id)},
+        {kind:"recovery_needs_review",action_id:actionId,agent_id:scoped.agent_id?String(scoped.agent_id):null,effect_name:String(scoped.effect_name),
+         mode:normalizeMode(scoped.environment_mode),intervention_key:`recovery_needs_review:${recoveryId}`,
+         summary:"An automatic recovery could not be completed safely and needs human review.",detail:{recovery_execution_id:recoveryId}});
+      await this.openHumanReviewForRecovery(actionId,"An automatic recovery could not be completed safely; the external recovery consequence is unproven.");
+    }
+    return true;
+  }
+
+  /** Cancel a recovery that never crossed the dispatch boundary and is now stale. */
+  async cancelRecovery(recoveryId:string,claimToken:string,reason:string):Promise<boolean>{
+    const result=await this.db.query(`UPDATE nyst_recovery_executions SET status='cancelled',claim_token=NULL,claimed_until=NULL,
+        needs_review_reason=$3,result=jsonb_build_object('cancelled_reason',$3::text)
+      WHERE recovery_execution_id=$1 AND claim_token=$2 AND status IN ('executing','observing') AND dispatch_state='definitely_not_sent'
+      RETURNING recovery_execution_id`,[recoveryId,claimToken,bounded(reason,500,"cancellation reason")]);
+    return result.rows.length===1;
+  }
+
+  /** Park a recovery for human review without ever resending an ambiguous consequence. */
+  async recoveryNeedsReview(recoveryId:string,claimToken:string,reason:string):Promise<boolean>{
+    return this.completeRecovery(recoveryId,claimToken,false,{reason:bounded(reason,500,"review reason")});
+  }
+
+  private async openHumanReviewForRecovery(actionId:string,reason:string):Promise<void>{
+    await this.db.query(`INSERT INTO nyst_human_reviews(human_review_id,action_id,environment_id,project_id,organization_id,status,reason)
+      SELECT $1,s.action_id,s.environment_id,s.project_id,s.organization_id,'open',$2 FROM nyst_action_scopes s WHERE s.action_id=$3
+      ON CONFLICT(action_id) DO NOTHING`,[randomUUID(),bounded(reason,1000,"review reason"),actionId]);
+  }
 
   async runFailureLab(scope: TenantScope, userId: string, scenario: FailureScenario, effectName: string, seed: number): Promise<Record<string, unknown>> {
     const control=await this.environmentControl(scope); if(!control.is_demo&&control.mode!=="shadow")throw new Error("Failure Lab is isolated to Demo or Shadow environments");
@@ -558,7 +1043,12 @@ export class ProductRepository {
     const result=await this.db.query(`INSERT INTO nyst_human_reviews(human_review_id,action_id,environment_id,project_id,organization_id,status,reason)
       SELECT $1,s.action_id,s.environment_id,s.project_id,s.organization_id,'open',$6 FROM nyst_action_scopes s JOIN LATERAL(SELECT primary_directive FROM outcome_resolutions WHERE action_id=s.action_id ORDER BY resolution_sequence DESC LIMIT 1) r ON true
       WHERE s.action_id=$2 AND s.environment_id=$3 AND s.project_id=$4 AND s.organization_id=$5 AND r.primary_directive IN ('hold','escalate') ON CONFLICT(action_id) DO UPDATE SET reason=excluded.reason RETURNING human_review_id,action_id,status,reason,opened_at`,[randomUUID(),actionId,scope.environment_id,scope.project_id,scope.organization_id,bounded(reason,1000,"review reason")]);
-    if(!result.rows.length)throw new Error("Only held or escalated actions may enter human review");await this.queueLifecycleWebhookByAction(actionId,"human_review.required"); return result.rows[0]!;
+    if(!result.rows.length)throw new Error("Only held or escalated actions may enter human review");
+    const context=(await this.db.query(`SELECT s.agent_id,a.effect_name,b.environment_mode FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id) JOIN nyst_action_policy_bindings b USING(action_id) WHERE s.action_id=$1`,[actionId])).rows[0];
+    if(context)await this.recordIntervention(scope,{kind:"human_review_opened",action_id:actionId,agent_id:context.agent_id?String(context.agent_id):null,
+      effect_name:String(context.effect_name),mode:normalizeMode(context.environment_mode),intervention_key:`human_review_opened:${actionId}`,
+      summary:"Nyst escalated to human review because it could not proceed safely on its own.",detail:{reason:bounded(reason,400,"review reason")}});
+    await this.queueLifecycleWebhookByAction(actionId,"human_review.required"); return result.rows[0]!;
   }
 
   async humanReviews(scope: TenantScope): Promise<Record<string, unknown>[]> { return (await this.db.query(`SELECT h.human_review_id,h.action_id,h.status,h.reason,h.opened_at,h.reviewed_at,a.effect_name,s.display_business_key FROM nyst_human_reviews h JOIN nyst_action_scopes s USING(action_id) JOIN outcome_actions a USING(action_id) WHERE h.environment_id=$1 AND h.project_id=$2 AND h.organization_id=$3 ORDER BY h.opened_at DESC`,[scope.environment_id,scope.project_id,scope.organization_id])).rows; }
@@ -570,9 +1060,46 @@ export class ProductRepository {
       SELECT $7,human_review_id,action_id,environment_id,project_id,organization_id FROM changed WHERE $8='request_reobservation' ON CONFLICT(human_review_id) DO NOTHING
     ) SELECT human_review_id,action_id,status,reviewed_at FROM changed`,[reviewId,scope.environment_id,scope.project_id,scope.organization_id,userId,status,jobId,operation]);if(!result.rows.length)throw new Error("Review is unavailable or already handled");return result.rows[0]!;}
 
-  async claimReobservation():Promise<Record<string,unknown>|null>{const token=randomUUID();const result=await this.db.query(`WITH candidate AS (SELECT reobservation_job_id FROM nyst_reobservation_jobs WHERE status='requested' ORDER BY requested_at,reobservation_job_id FOR UPDATE SKIP LOCKED LIMIT 1)
-    UPDATE nyst_reobservation_jobs j SET status='executing',claim_token=$1,claimed_until=now()+interval '30 seconds' FROM candidate c WHERE j.reobservation_job_id=c.reobservation_job_id RETURNING j.reobservation_job_id,j.action_id,j.claim_token`,[token]);return result.rows[0]??null;}
-  async completeReobservation(jobId:string,claimToken:string,successful:boolean):Promise<boolean>{const result=await this.db.query(`UPDATE nyst_reobservation_jobs SET status=$3,completed_at=CASE WHEN $3='completed' THEN now() ELSE NULL END,claim_token=NULL,claimed_until=NULL WHERE reobservation_job_id=$1 AND claim_token=$2 AND status='executing' RETURNING reobservation_job_id`,[jobId,claimToken,successful?'completed':'failed']);return result.rows.length===1;}
+  /**
+   * Claim a re-observation job.
+   *
+   * Re-observation is READ-ONLY, so unlike recovery an expired claim is always
+   * safe to reclaim — there is no external consequence that could be
+   * duplicated (I19). Attempts are counted and bounded so a permanently
+   * failing observation escalates instead of spinning forever.
+   *
+   * Expiry uses the DATABASE clock so ownership is correct across processes.
+   */
+  async claimReobservation(options:{leaseMs?:number;maxAttempts?:number;environment_id?:string}={}):Promise<Record<string,unknown>|null>{
+    const token=randomUUID();const leaseMs=options.leaseMs??30_000;const maxAttempts=options.maxAttempts??10;const environmentId=options.environment_id??null;
+    const result=await this.db.query(`WITH candidate AS (
+        SELECT reobservation_job_id FROM nyst_reobservation_jobs
+        WHERE (status='requested' OR (status='executing' AND claimed_until IS NOT NULL AND claimed_until<=now()))
+          AND attempt < $3 AND ($4::uuid IS NULL OR environment_id=$4::uuid)
+        ORDER BY requested_at,reobservation_job_id FOR UPDATE SKIP LOCKED LIMIT 1
+      ) UPDATE nyst_reobservation_jobs j
+        SET status='executing',claim_token=$1,claimed_until=now()+($2::text||' milliseconds')::interval,attempt=j.attempt+1
+        FROM candidate c WHERE j.reobservation_job_id=c.reobservation_job_id
+        RETURNING j.reobservation_job_id,j.action_id,j.human_review_id,j.claim_token,j.attempt,j.environment_id,j.project_id,j.organization_id`,
+      [token,leaseMs,maxAttempts,environmentId]);
+    if(result.rows.length)return result.rows[0]!;
+    // Nothing claimable. Anything that exhausted its attempts must not stay
+    // invisible, so park it for a human rather than leaving it 'executing'.
+    await this.db.query(`UPDATE nyst_reobservation_jobs SET status='needs_review',claim_token=NULL,claimed_until=NULL,last_error_code='attempts_exhausted'
+      WHERE status IN ('requested','executing') AND attempt >= $1 AND (claimed_until IS NULL OR claimed_until<=now())
+        AND ($2::uuid IS NULL OR environment_id=$2::uuid)`,[maxAttempts,environmentId]);
+    return null;
+  }
+
+  /** Completion requires the CURRENT claim token; a stale claimant is rejected. */
+  async completeReobservation(jobId:string,claimToken:string,successful:boolean,errorCode:string|null=null):Promise<boolean>{
+    const result=await this.db.query(`UPDATE nyst_reobservation_jobs SET status=$3,
+        completed_at=CASE WHEN $3='completed' THEN now() ELSE NULL END,
+        claim_token=NULL,claimed_until=NULL,last_error_code=$4
+      WHERE reobservation_job_id=$1 AND claim_token=$2 AND status='executing' RETURNING reobservation_job_id`,
+      [jobId,claimToken,successful?'completed':'requested',errorCode?bounded(errorCode,100,"error code"):null]);
+    return result.rows.length===1;
+  }
 
   async onboardingProgress(scope:TenantScope):Promise<Record<string,unknown>>{const result=await this.db.query(`SELECT e.mode,e.is_demo,e.onboarding_stage,
       (e.is_demo OR EXISTS(SELECT 1 FROM nyst_environment_mode_audit m WHERE m.environment_id=e.environment_id)) mode_chosen,
@@ -599,3 +1126,10 @@ function bounded(value: string, max: number, label: string): string { if (typeof
 function slug(value: string): string { const out = bounded(value, 63, "slug").toLowerCase(); if (!/^[a-z][a-z0-9-]{1,62}$/.test(out)) throw new Error("Invalid slug"); return out; }
 function normalizedEmail(value: string): string { const out = bounded(value, 320, "email").trim().toLowerCase(); if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(out)) throw new Error("Invalid email"); return out; }
 function validDate(value: string): string { const date = new Date(value); if (!Number.isFinite(date.getTime())) throw new Error("Invalid date filter"); return date.toISOString(); }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Narrow a persisted mode string to the EnvironmentMode union, failing closed on Shadow. */
+function normalizeMode(value: unknown): EnvironmentMode {
+  return value === "shadow" ? "shadow" : value === "canary" ? "canary" : "enforced";
+}
