@@ -161,6 +161,10 @@ describe("Nyst v0.2.2 Phases 22-23", { skip: databaseUrl ? false : "DATABASE_URL
   /* ============================================================ PHASE 23 */
 
   it("P23: an API that is alive while workers are dead reports UNHEALTHY", async () => {
+    // Worker liveness is deployment-wide, not tenant-scoped, and heartbeats
+    // persist across runs. Establish the precondition explicitly so the test
+    // asserts the behaviour rather than the leftovers of a previous run.
+    await pool.query(`DELETE FROM nyst_worker_heartbeats`);
     const health = await repository.operationalHealth();
     assert.equal(health.api.database_reachable, true);
     assert.equal(health.status, "unhealthy", "no worker has checked in, so the deployment is not healthy");
