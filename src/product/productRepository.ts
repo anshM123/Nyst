@@ -50,7 +50,7 @@ export class ProductRepository {
     const session = randomBytes(32).toString("base64url"); const csrf = randomBytes(24).toString("base64url");
     await this.db.query(`INSERT INTO nyst_sessions(session_hash,csrf_hash,user_id,organization_id,selected_project_id,selected_environment_id,expires_at)
       VALUES($1,$2,$3,$4,$5,$6,now()+($7::text||' hours')::interval)`, [digest(session), digest(csrf), row.user_id, row.organization_id, row.project_id, row.environment_id, SESSION_HOURS]);
-    return { session, csrf, principal: { kind: "session", user_id: String(row.user_id), api_key_id: null,
+    return { session, csrf, principal: { kind: "session", user_id: String(row.user_id), api_key_id: null, agent_id: null,
       organization_id: String(row.organization_id), project_id: String(row.project_id), environment_id: String(row.environment_id), scopes: ["*"], csrf_hash: digest(csrf) } };
   }
 
@@ -61,7 +61,7 @@ export class ProductRepository {
         AND s.expires_at>now() AND u.disabled_at IS NULL
       RETURNING u.user_id,s.organization_id,s.selected_project_id project_id,s.selected_environment_id environment_id,s.csrf_hash`, [digest(session)]);
     const row = result.rows[0]; if (!row) return null;
-    return { kind: "session", user_id: String(row.user_id), api_key_id: null, organization_id: String(row.organization_id), project_id: String(row.project_id), environment_id: String(row.environment_id), scopes: ["*"], csrf_hash: String(row.csrf_hash) };
+    return { kind: "session", user_id: String(row.user_id), api_key_id: null, agent_id: null, organization_id: String(row.organization_id), project_id: String(row.project_id), environment_id: String(row.environment_id), scopes: ["*"], csrf_hash: String(row.csrf_hash) };
   }
 
   async deleteSession(session: string): Promise<void> { if (/^[A-Za-z0-9_-]{40,100}$/.test(session)) await this.db.query(`DELETE FROM nyst_sessions WHERE session_hash=$1`, [digest(session)]); }
@@ -79,7 +79,7 @@ export class ProductRepository {
         project = { project_id: projectId, project_name: String(row.project_name), project_slug: String(row.project_slug), environments: [] };
         projects.set(projectId, project);
       }
-      project.environments.push({ environment_id: String(row.environment_id), environment_name: String(row.environment_name), environment_slug: String(row.environment_slug), mode: row.mode === "shadow" ? "shadow" : "enforced", is_demo: row.is_demo === true });
+      project.environments.push({ environment_id: String(row.environment_id), environment_name: String(row.environment_name), environment_slug: String(row.environment_slug), mode: normalizeMode(row.mode), is_demo: row.is_demo === true });
     }
     return { organization_id: scope.organization_id, selected_project_id: scope.project_id, selected_environment_id: scope.environment_id, projects: [...projects.values()] };
   }
@@ -111,20 +111,28 @@ export class ProductRepository {
     return id;
   }
 
-  async createApiKey(scope: TenantScope, name: string, scopes: readonly string[], expiresAt: string | null = null): Promise<{ api_key_id: string; key: string; prefix: string }> {
+  /**
+   * Create an API key, optionally BOUND to one Agent.
+   *
+   * A bound key can only ever act as its own Agent (see resolveActingAgent).
+   * The composite foreign key makes a cross-tenant Agent id impossible to
+   * store, so the binding cannot be used to escape the tenant scope.
+   */
+  async createApiKey(scope: TenantScope, name: string, scopes: readonly string[], expiresAt: string | null = null, agentId: string | null = null): Promise<{ api_key_id: string; key: string; prefix: string; agent_id: string | null }> {
     if (!scopes.length || scopes.some((value) => !ALLOWED_API_SCOPES.has(value))) throw new Error("Unsupported API key scope");
+    if (agentId !== null && !UUID_PATTERN.test(agentId)) throw new Error("Invalid Agent identifier");
     const id = randomUUID(); const prefix = `nyst_${randomBytes(6).toString("hex")}`; const key = `${prefix}.${randomBytes(32).toString("base64url")}`;
-    await this.db.query(`INSERT INTO nyst_api_keys(api_key_id,organization_id,project_id,environment_id,name,prefix,secret_hash,scopes,expires_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [id, scope.organization_id, scope.project_id, scope.environment_id, bounded(name, 120, "API key name"), prefix, digest(key), [...scopes], expiresAt]);
-    return { api_key_id: id, key, prefix };
+    await this.db.query(`INSERT INTO nyst_api_keys(api_key_id,organization_id,project_id,environment_id,name,prefix,secret_hash,scopes,expires_at,agent_id)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [id, scope.organization_id, scope.project_id, scope.environment_id, bounded(name, 120, "API key name"), prefix, digest(key), [...scopes], expiresAt, agentId]);
+    return { api_key_id: id, key, prefix, agent_id: agentId };
   }
 
   async authenticateApiKey(key: string): Promise<ProductPrincipal | null> {
     if (!/^nyst_[a-z0-9]{8,20}\.[A-Za-z0-9_-]{40,100}$/.test(key)) return null;
     const result = await this.db.query(`UPDATE nyst_api_keys SET last_used_at=now() WHERE secret_hash=$1 AND revoked_at IS NULL
-      AND (expires_at IS NULL OR expires_at>now()) RETURNING api_key_id,organization_id,project_id,environment_id,scopes`, [digest(key)]);
+      AND (expires_at IS NULL OR expires_at>now()) RETURNING api_key_id,organization_id,project_id,environment_id,scopes,agent_id`, [digest(key)]);
     const row = result.rows[0]; if (!row) return null;
-    return { kind: "api_key", user_id: null, api_key_id: String(row.api_key_id), organization_id: String(row.organization_id), project_id: String(row.project_id), environment_id: String(row.environment_id), scopes: Array.isArray(row.scopes) ? row.scopes.map(String) : [], csrf_hash: null };
+    return { kind: "api_key", user_id: null, api_key_id: String(row.api_key_id), agent_id: row.agent_id ? String(row.agent_id) : null, organization_id: String(row.organization_id), project_id: String(row.project_id), environment_id: String(row.environment_id), scopes: Array.isArray(row.scopes) ? row.scopes.map(String) : [], csrf_hash: null };
   }
 
   async revokeApiKey(scope: TenantScope, keyId: string): Promise<boolean> {
@@ -193,7 +201,7 @@ export class ProductRepository {
     return available;
   }
 
-  async apiKeys(scope:TenantScope):Promise<Record<string,unknown>[]>{return (await this.db.query(`SELECT api_key_id,name,prefix,scopes,created_at,last_used_at,expires_at,revoked_at FROM nyst_api_keys WHERE organization_id=$1 AND project_id=$2 AND environment_id=$3 ORDER BY created_at DESC`,[scope.organization_id,scope.project_id,scope.environment_id])).rows;}
+  async apiKeys(scope:TenantScope):Promise<Record<string,unknown>[]>{return (await this.db.query(`SELECT k.api_key_id,k.name,k.prefix,k.scopes,k.created_at,k.last_used_at,k.expires_at,k.revoked_at,k.agent_id,a.name agent_name FROM nyst_api_keys k LEFT JOIN nyst_agents a USING(agent_id) WHERE k.organization_id=$1 AND k.project_id=$2 AND k.environment_id=$3 ORDER BY k.created_at DESC`,[scope.organization_id,scope.project_id,scope.environment_id])).rows;}
 
   async effectSpecStatuses(scope:TenantScope,descriptors:readonly EffectSpecDescriptor[],production:boolean):Promise<Record<string,unknown>[]>{
     await this.requireTenantScope(scope);const result=await this.db.query(`SELECT s.effect_name,s.spec_version,s.enabled,i.configured,i.credential_ref FROM nyst_environment_effect_specs s LEFT JOIN nyst_integrations i ON i.environment_id=s.environment_id AND i.project_id=s.project_id AND i.organization_id=s.organization_id AND i.provider=split_part(s.effect_name,'.',1) WHERE s.organization_id=$1 AND s.project_id=$2 AND s.environment_id=$3`,[scope.organization_id,scope.project_id,scope.environment_id]);const configured=new Map(result.rows.map(row=>[String(row.effect_name),row]));
@@ -390,21 +398,21 @@ export class ProductRepository {
   async environmentControl(scope: TenantScope): Promise<{ mode: EnvironmentMode; is_demo: boolean; onboarding_stage: number }> {
     const result = await this.db.query(`SELECT mode,is_demo,onboarding_stage FROM nyst_environments WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`, [scope.environment_id, scope.project_id, scope.organization_id]);
     const row = result.rows[0]; if (!row) throw new Error("Resource belongs to a different tenant scope");
-    return { mode: row.mode === "shadow" ? "shadow" : "enforced", is_demo: row.is_demo === true, onboarding_stage: Number(row.onboarding_stage ?? 0) };
+    return { mode: normalizeMode(row.mode), is_demo: row.is_demo === true, onboarding_stage: Number(row.onboarding_stage ?? 0) };
   }
 
   async setEnvironmentMode(scope: TenantScope, userId: string, mode: EnvironmentMode, reason: string): Promise<{ mode: EnvironmentMode }> {
-    if (!['shadow','enforced'].includes(mode)) throw new Error("Unsupported environment mode");
+    if (!['shadow','canary','enforced'].includes(mode)) throw new Error("Unsupported environment mode");
     const result = await this.db.query(`WITH changed AS (
       UPDATE nyst_environments SET mode=$4 WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND mode<>$4
       RETURNING mode AS new_mode,(SELECT mode FROM nyst_environments WHERE environment_id=$1) AS previous_mode
     ), audit AS (
       INSERT INTO nyst_environment_mode_audit(audit_id,environment_id,project_id,organization_id,previous_mode,new_mode,changed_by,reason)
-      SELECT $5,$1,$2,$3,CASE WHEN $4='shadow' THEN 'enforced' ELSE 'shadow' END,$4,$6,$7 FROM changed
+      SELECT $5,$1,$2,$3,previous_mode,$4,$6,$7 FROM changed
     ) SELECT mode FROM nyst_environments WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`,
       [scope.environment_id, scope.project_id, scope.organization_id, mode, randomUUID(), userId, bounded(reason, 500, "mode change reason")]);
     if (!result.rows.length) throw new Error("Resource belongs to a different tenant scope");
-    return { mode: result.rows[0]?.mode === "shadow" ? "shadow" : "enforced" };
+    return { mode: normalizeMode(result.rows[0]?.mode) };
   }
 
   async currentPolicy(scope: TenantScope, effectName?: string): Promise<ConservativePolicy> {
@@ -1126,6 +1134,154 @@ export class ProductRepository {
 
   /** Maintenance sweep. Never called on the request hot path. */
   async pruneIdempotencyKeys():Promise<number>{return pruneIdempotencyKeys(this.db);}
+
+
+  /* ==================================================================
+   * AGENT REGISTRY (Phase 6)
+   *
+   * Purpose: every consequential action must be able to answer
+   * WHO OR WHAT CAUSED THIS?
+   *
+   * Deliberately lightweight. Not an agent builder, not a marketplace,
+   * not orchestration.
+   * ================================================================== */
+
+  async createAgent(scope: TenantScope, userId: string, input: { name: string; slug: string; owner: string; description?: string; framework?: string; tags?: readonly string[] }): Promise<Record<string, unknown>> {
+    await this.requireTenantScope(scope);
+    const tags = (input.tags ?? []).slice(0, 12).map((tag) => bounded(tag, 40, "agent tag"));
+    const result = await this.db.query(`INSERT INTO nyst_agents(agent_id,organization_id,project_id,environment_id,slug,name,owner,description,framework,tags,created_by)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      RETURNING agent_id,slug,name,owner,description,framework,status,tags,created_at`,
+      [randomUUID(), scope.organization_id, scope.project_id, scope.environment_id, slug(input.slug),
+       bounded(input.name, 120, "agent name"), bounded(input.owner, 120, "agent owner"),
+       input.description ? bounded(input.description, 1000, "agent description") : "",
+       input.framework ? bounded(input.framework, 80, "agent framework") : "unspecified", JSON.stringify(tags), userId]);
+    await this.audit(scope, userId, "agent.created", "agent", String(result.rows[0]!.agent_id), { slug: input.slug });
+    return result.rows[0]!;
+  }
+
+  async agents(scope: TenantScope): Promise<Record<string, unknown>[]> {
+    return (await this.db.query(`SELECT a.agent_id,a.slug,a.name,a.owner,a.description,a.framework,a.status,a.tags,a.created_at,
+        (SELECT count(*)::int FROM nyst_action_scopes s WHERE s.agent_id=a.agent_id) action_count,
+        (SELECT max(act.created_at) FROM nyst_action_scopes s JOIN outcome_actions act USING(action_id) WHERE s.agent_id=a.agent_id) last_action_at,
+        (SELECT count(*)::int FROM nyst_intervention_events i WHERE i.agent_id=a.agent_id) intervention_count,
+        (SELECT coalesce(array_agg(DISTINCT act.effect_name),ARRAY[]::text[]) FROM nyst_action_scopes s JOIN outcome_actions act USING(action_id) WHERE s.agent_id=a.agent_id) effect_names,
+        (SELECT coalesce(array_agg(c.effect_name ORDER BY c.effect_name),ARRAY[]::text[]) FROM nyst_canary_rules c WHERE c.agent_id=a.agent_id AND c.enabled) canary_effects
+      FROM nyst_agents a WHERE a.environment_id=$1 AND a.project_id=$2 AND a.organization_id=$3 ORDER BY a.created_at`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows;
+  }
+
+  async agentDetail(scope: TenantScope, agentId: string): Promise<Record<string, unknown> | null> {
+    if (!UUID_PATTERN.test(agentId)) return null;
+    return (await this.agents(scope)).find((agent) => String(agent.agent_id) === agentId) ?? null;
+  }
+
+  async setAgentStatus(scope: TenantScope, userId: string, agentId: string, status: "active" | "paused" | "retired"): Promise<Record<string, unknown>> {
+    if (!["active", "paused", "retired"].includes(status)) throw new Error("Unsupported Agent status");
+    const result = await this.db.query(`UPDATE nyst_agents SET status=$5 WHERE agent_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4 RETURNING agent_id,slug,name,status`,
+      [agentId, scope.environment_id, scope.project_id, scope.organization_id, status]);
+    if (!result.rows.length) throw new Error("Agent belongs to a different tenant scope");
+    await this.audit(scope, userId, "agent.status_changed", "agent", agentId, { status });
+    return result.rows[0]!;
+  }
+
+  /**
+   * Resolve the Agent a caller is acting as, FAILING CLOSED.
+   *
+   * - an Agent-bound API key may only ever act as its own Agent;
+   * - an Agent id from another tenant is rejected as if it did not exist,
+   *   so the endpoint cannot be used to probe for valid ids;
+   * - a retired Agent cannot take new consequential actions.
+   */
+  async resolveActingAgent(principal: ProductPrincipal, requestedAgentId: string | null): Promise<string | null> {
+    const boundAgentId = principal.agent_id ?? null;
+    if (boundAgentId && requestedAgentId && requestedAgentId !== boundAgentId) {
+      throw Object.assign(new Error("This API key is bound to a different Agent"), { statusCode: 403 });
+    }
+    const agentId = boundAgentId ?? requestedAgentId;
+    if (!agentId) return null;
+    if (!UUID_PATTERN.test(agentId)) throw Object.assign(new Error("Invalid Agent identifier"), { statusCode: 400 });
+    const result = await this.db.query(`SELECT status FROM nyst_agents WHERE agent_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4`,
+      [agentId, principal.environment_id, principal.project_id, principal.organization_id]);
+    const row = result.rows[0];
+    if (!row) throw Object.assign(new Error("Unknown Agent for this environment"), { statusCode: 404 });
+    if (row.status === "retired") throw Object.assign(new Error("A retired Agent cannot take new consequential actions"), { statusCode: 409 });
+    return agentId;
+  }
+
+  /* ==================================================================
+   * CANARY (Phase 8) — deterministic, explicitly scoped enforcement.
+   * ================================================================== */
+
+  async createCanaryRule(scope: TenantScope, userId: string, agentId: string, effectName: string, reason = ""): Promise<Record<string, unknown>> {
+    await this.requireTenantScope(scope);
+    if (!UUID_PATTERN.test(agentId)) throw new Error("Invalid Agent identifier");
+    const id = randomUUID();
+    const result = await this.db.query(`WITH rule AS (
+        INSERT INTO nyst_canary_rules(canary_rule_id,environment_id,project_id,organization_id,agent_id,effect_name,created_by,reason)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        ON CONFLICT(environment_id,agent_id,effect_name) DO UPDATE SET enabled=true
+        RETURNING canary_rule_id,environment_id,agent_id,effect_name,enabled,created_at
+      ), logged AS (
+        INSERT INTO nyst_canary_rule_audit(audit_id,canary_rule_id,environment_id,agent_id,effect_name,change,reason,changed_by)
+        SELECT $9,canary_rule_id,environment_id,agent_id,effect_name,'created',$8,$7 FROM rule
+      ) SELECT * FROM rule`,
+      [id, scope.environment_id, scope.project_id, scope.organization_id, agentId, bounded(effectName, 200, "effect"), userId, bounded(reason || "Canary scope opened", 500, "reason"), randomUUID()]);
+    if (!result.rows.length) throw new Error("Canary scope belongs to a different tenant scope");
+    return result.rows[0]!;
+  }
+
+  async setCanaryRuleEnabled(scope: TenantScope, userId: string, ruleId: string, enabled: boolean, reason = ""): Promise<Record<string, unknown>> {
+    const result = await this.db.query(`WITH rule AS (
+        UPDATE nyst_canary_rules SET enabled=$5 WHERE canary_rule_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4
+        RETURNING canary_rule_id,environment_id,agent_id,effect_name,enabled
+      ), logged AS (
+        INSERT INTO nyst_canary_rule_audit(audit_id,canary_rule_id,environment_id,agent_id,effect_name,change,reason,changed_by)
+        SELECT $6,canary_rule_id,environment_id,agent_id,effect_name,CASE WHEN $5 THEN 'enabled' ELSE 'disabled' END,$7,$8 FROM rule
+      ) SELECT * FROM rule`,
+      [ruleId, scope.environment_id, scope.project_id, scope.organization_id, enabled, randomUUID(), bounded(reason || "Canary scope changed", 500, "reason"), userId]);
+    if (!result.rows.length) throw new Error("Canary rule belongs to a different tenant scope");
+    return result.rows[0]!;
+  }
+
+  async canaryRules(scope: TenantScope): Promise<Record<string, unknown>[]> {
+    return (await this.db.query(`SELECT c.canary_rule_id,c.agent_id,a.name agent_name,c.effect_name,c.enabled,c.reason,c.created_at
+      FROM nyst_canary_rules c JOIN nyst_agents a USING(agent_id)
+      WHERE c.environment_id=$1 AND c.project_id=$2 AND c.organization_id=$3 ORDER BY a.name,c.effect_name`,
+      [scope.environment_id, scope.project_id, scope.organization_id])).rows;
+  }
+
+  /**
+   * The mode THIS action executes under.
+   *
+   * shadow      -> Nyst never controls the action.
+   * enforced    -> Nyst controls every action in the environment.
+   * canary      -> Nyst controls ONLY the explicitly listed
+   *                (Agent + EffectSpec) slices. Everything else in a Canary
+   *                environment is evaluated as Shadow. Deterministic: the same
+   *                Agent and effect always resolve the same way, with no
+   *                sampling and no randomness.
+   */
+  async resolveExecutionMode(scope: TenantScope, agentId: string | null, effectName: string): Promise<{ mode: EnvironmentMode; environment_mode: EnvironmentMode; canary_rule_id: string | null; reason: string }> {
+    const control = await this.environmentControl(scope);
+    if (control.mode !== "canary") {
+      return { mode: control.mode, environment_mode: control.mode, canary_rule_id: null,
+        reason: control.mode === "enforced" ? "The environment is Enforced; every consequential action routes through Nyst control."
+          : "The environment is in Shadow; Nyst evaluates but does not control this action." };
+    }
+    if (!agentId) {
+      return { mode: "shadow", environment_mode: "canary", canary_rule_id: null,
+        reason: "Canary enforcement is scoped to a specific Agent and EffectSpec. This action declared no Agent, so it is evaluated as Shadow." };
+    }
+    const rule = (await this.db.query(`SELECT canary_rule_id FROM nyst_canary_rules
+      WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND agent_id=$4 AND effect_name=$5 AND enabled`,
+      [scope.environment_id, scope.project_id, scope.organization_id, agentId, effectName])).rows[0];
+    return rule
+      ? { mode: "canary", environment_mode: "canary", canary_rule_id: String(rule.canary_rule_id),
+          reason: "This exact Agent and EffectSpec are inside the Canary enforcement scope." }
+      : { mode: "shadow", environment_mode: "canary", canary_rule_id: null,
+          reason: "This Agent and EffectSpec are outside the Canary enforcement scope, so the action is evaluated as Shadow." };
+  }
 
   private async requireTenantScope(scope: TenantScope): Promise<void> {
     const result = await this.db.query(`SELECT 1 FROM nyst_environments WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`, [scope.environment_id, scope.project_id, scope.organization_id]);

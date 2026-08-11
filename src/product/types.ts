@@ -8,6 +8,11 @@ export interface ProductPrincipal extends TenantScope {
   kind: "session" | "api_key";
   user_id: string | null;
   api_key_id: string | null;
+  /**
+   * Set when the API key is BOUND to one Agent. A bound key may only ever act
+   * as this Agent; attempting another fails closed.
+   */
+  agent_id: string | null;
   scopes: readonly string[];
   csrf_hash: string | null;
 }
@@ -28,7 +33,10 @@ export interface ProductCommitRequest {
   input: unknown;
   credential_ref: string | null;
   policy_version_id: string;
-  environment_mode: "enforced";
+  /** The mode THIS action executes under, resolved before dispatch. */
+  environment_mode: "canary" | "enforced";
+  /** The Agent that caused this action, bound immutably at scope time. */
+  agent_id: string | null;
 }
 
 export interface ProductCommitResult {
@@ -52,7 +60,7 @@ export interface ProductProjectContext {
   project_id: string;
   project_name: string;
   project_slug: string;
-  environments: Array<{ environment_id: string; environment_name: string; environment_slug: string; mode: "shadow" | "enforced"; is_demo: boolean }>;
+  environments: Array<{ environment_id: string; environment_name: string; environment_slug: string; mode: "shadow" | "canary" | "enforced"; is_demo: boolean }>;
 }
 
 export interface ProductContext {

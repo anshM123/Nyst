@@ -89,7 +89,7 @@ export function createProductProviderRuntime(
 
   const commit: ProductCommitter = async (request, principal) => {
     const establish = { establish_dispatch_eligibility: async (action: { action_id: string }) => {
-      await repository.scopeAction(principal, action.action_id, request.displayBusinessKey);
+      await repository.scopeAction(principal, action.action_id, request.displayBusinessKey, request.agent_id);
       await repository.bindActionControl(principal, action.action_id, request.policy_version_id, request.environment_mode);
     } };
     switch (request.effect) {
