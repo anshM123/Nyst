@@ -1,0 +1,16 @@
+# Local PostgreSQL for migrations + integration tests.
+# (Not runnable in network-restricted sandboxes; used in normal dev/CI.)
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: outcome
+      POSTGRES_PASSWORD: outcome
+      POSTGRES_DB: outcome
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U outcome"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
