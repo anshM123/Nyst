@@ -89,7 +89,7 @@ const preflight = async (provider: "github" | "okta" | "stripe", _secret: string
 
 const app = await buildProductServer({
   repository, effect_specs: product.descriptors, runtime: product.runtime, metrics,
-  production: config.production, secrets,
+  production: config.production, secrets, trust_proxy: config.trust_proxy,
   verify_receipt: (value) => verifyResolution(signer, value as never),
   commit: product.commit, integration_preflight: preflight, structured_log: structuredLog,
 });

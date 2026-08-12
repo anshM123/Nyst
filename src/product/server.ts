@@ -93,16 +93,32 @@ export interface ProductServerOptions {
    * must never mutate provider state (I20).
    */
   integration_preflight?: (provider: "github" | "okta" | "stripe", secret: string) => Promise<PreflightProbeResult>;
+  /**
+   * Trust X-Forwarded-* headers.
+   *
+   * Only enable when Nyst genuinely sits behind a proxy you control. Trusting
+   * these headers from an untrusted network lets any client claim any client
+   * IP, which turns the per-IP rate limiter into decoration. Leaving it off
+   * behind a real proxy has the opposite failure: every request appears to
+   * come from the proxy and shares one rate-limit bucket.
+   */
+  trust_proxy?: boolean;
 }
 
 export async function buildProductServer(options: ProductServerOptions): Promise<FastifyInstance> {
-  const app = Fastify({ logger: false, bodyLimit: 64 * 1024, requestIdHeader: false, genReqId: () => randomUUID() });
+  const app = Fastify({
+    logger: false, bodyLimit: 64 * 1024, requestIdHeader: false, genReqId: () => randomUUID(),
+    trustProxy: options.trust_proxy === true,
+  });
   await app.register(cookie);
   const limiter = new Map<string, { count: number; reset: number }>();
   app.addHook("onRequest", async (request, reply) => {
     reply.header("X-Nyst-Request-Id", request.id);
     reply.header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     reply.header("X-Content-Type-Options", "nosniff"); reply.header("Referrer-Policy", "no-referrer"); reply.header("X-Frame-Options", "DENY");
+    // Production is HTTPS-only (config.ts enforces an https public origin), so
+    // a downgrade to plaintext is always an attack rather than a fallback.
+    if (options.production === true) reply.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     const key = request.ip; const now = Date.now(); const current = limiter.get(key);
     if (!current || current.reset <= now) limiter.set(key, { count: 1, reset: now + 60_000 });
     else if (++current.count > 300) { return reply.code(429).send({ error: "rate_limited", request_id: request.id }); }

@@ -1,16 +1,93 @@
-# Local PostgreSQL for migrations + integration tests.
-# (Not runnable in network-restricted sandboxes; used in normal dev/CI.)
+# Nyst — the deployment shape a design partner should actually run.
+#
+#   docker compose run --rm migrate
+#   docker compose up -d
+#
+# Three processes, not one. The web/API host and the workers are separate so
+# the API can restart, or be scaled, without stranding ambiguous actions —
+# and so a worker outage is visible as a stale heartbeat rather than hidden
+# behind an API that still answers.
+#
+# Set the required secrets in a .env file next to this one. There are no
+# defaults for them on purpose: production startup fails closed rather than
+# inventing a signing identity that disappears on the next restart.
+
+x-nyst-service: &nyst-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: nyst:0.2.2
+  restart: unless-stopped
+  environment: &nyst-env
+    NODE_ENV: production
+    DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+    # Receipts signed by a key that vanishes on restart prove nothing, so the
+    # signing identity must be supplied and must persist.
+    OUTCOME_SIGNING_KEY_ID: ${OUTCOME_SIGNING_KEY_ID:?set OUTCOME_SIGNING_KEY_ID}
+    OUTCOME_SIGNING_PRIVATE_KEY_B64: ${OUTCOME_SIGNING_PRIVATE_KEY_B64:?set OUTCOME_SIGNING_PRIVATE_KEY_B64}
+    NYST_PUBLIC_ORIGIN: ${NYST_PUBLIC_ORIGIN:?set NYST_PUBLIC_ORIGIN (https)}
+    # TLS to PostgreSQL. Leave verification on; supply a CA rather than
+    # disabling it, or the encryption is decorative.
+    NYST_DATABASE_SSL: ${NYST_DATABASE_SSL:-false}
+    NYST_WEBHOOK_SECRET: ${NYST_WEBHOOK_SECRET:-}
+    # Provider credentials. Only set the ones you have actually enabled —
+    # Nyst never requires a credential for a provider you are not using.
+    NYST_GITHUB_TOKEN: ${NYST_GITHUB_TOKEN:-}
+    NYST_OKTA_ACCESS_TOKEN: ${NYST_OKTA_ACCESS_TOKEN:-}
+    NYST_STRIPE_API_KEY: ${NYST_STRIPE_API_KEY:-}
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
   postgres:
-    image: postgres:16
+    image: postgres:17
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: outcome
-      POSTGRES_PASSWORD: outcome
-      POSTGRES_DB: outcome
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-nyst}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-nyst}
+    volumes:
+      - nyst-pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U outcome"]
-      interval: 2s
-      timeout: 2s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nyst} -d ${POSTGRES_DB:-nyst}"]
+      interval: 5s
+      timeout: 3s
       retries: 20
+    # Not published by default. Nyst reaches it over the compose network;
+    # exposing 5432 to the host is a decision, not a default.
+
+  # Run to completion before starting web/worker, and again on every upgrade.
+  migrate:
+    <<: *nyst-service
+    restart: "no"
+    command: ["node", "--experimental-strip-types", "scripts/migrate.ts"]
+
+  web:
+    <<: *nyst-service
+    environment:
+      <<: *nyst-env
+      NYST_HOST: 0.0.0.0
+      NYST_PORT: "4080"
+      # The web host does NOT run the workers. Turning this on collapses the
+      # deployment back to one process and hides worker failure.
+      NYST_RUN_EMBEDDED_WORKER: "false"
+      # Only enable behind a proxy you control: trusting X-Forwarded-For from
+      # an untrusted network lets any client claim any IP.
+      NYST_TRUST_PROXY: ${NYST_TRUST_PROXY:-false}
+    ports:
+      - "${NYST_BIND:-127.0.0.1}:4080:4080"
+    command: ["node", "--experimental-strip-types", "scripts/startProduct.ts"]
+
+  worker:
+    <<: *nyst-service
+    environment:
+      <<: *nyst-env
+      NYST_WORKER_INTERVAL_MS: ${NYST_WORKER_INTERVAL_MS:-1000}
+    # Runs the reconciliation, recovery, re-observation and webhook-delivery
+    # loops. Safe to scale: every claim is leased, and a worker killed
+    # mid-claim is handled by the dispatch boundary rather than by luck.
+    command: ["node", "--experimental-strip-types", "scripts/startWorker.ts"]
+
+volumes:
+  nyst-pgdata:

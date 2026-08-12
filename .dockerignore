@@ -1,0 +1,82 @@
+# Everything below is either a secret, a local artefact, or dead weight.
+# A build context is not a place to be relaxed: anything copied in is
+# recoverable from the image layers even if a later step deletes it.
+
+# --- secrets and credentials -------------------------------------------
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+credentials/
+keys/
+.signing/
+nyst-local-keys/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.token
+*.secret
+
+# --- version control and history ---------------------------------------
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- local databases and dumps -----------------------------------------
+postgres-data/
+pgdata/
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.sql.gz
+
+# --- logs and local run state ------------------------------------------
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# --- build output (the image builds its own) ---------------------------
+node_modules
+packages/*/node_modules
+dist
+packages/*/dist
+build/
+out/
+*.tsbuildinfo
+
+# --- test and QA artefacts ---------------------------------------------
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+screenshots/
+artifacts/
+
+# --- release archives ---------------------------------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+Nyst.ai-phase*-frozen/
+nyst-phase*-frozen/
+
+# --- editor and OS noise ------------------------------------------------
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- docs are not needed at runtime -------------------------------------
+docs/
+*.md
+!README.md

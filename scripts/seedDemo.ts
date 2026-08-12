@@ -33,7 +33,13 @@ const tenant = await repository.createBootstrap({
   password: "Nyst design partner demo 2026!",
 });
 
-const signer = Ed25519Signer.ephemeral("local-preview-software-key");
+// Use the configured persistent identity when one is supplied. A receipt
+// signed by a per-process key cannot be verified after a restart, which
+// makes it useless for a backup/restore drill — and, more importantly,
+// useless as proof to anyone who was not present when it was written.
+const signer = process.env.OUTCOME_SIGNING_KEY_ID && process.env.OUTCOME_SIGNING_PRIVATE_KEY_B64
+  ? Ed25519Signer.fromEnv()
+  : Ed25519Signer.ephemeral("local-preview-software-key");
 const product = createProductProviderRuntime(store, repository, signer, new LocalSystemClock(), { production: false, enable_development_fake: true });
 const fake = product.descriptors.find((item) => item.provider === "fake")!;
 await repository.configureEffectSpec(tenant, fake, true);
