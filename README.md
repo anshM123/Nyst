@@ -10,6 +10,9 @@
 INTENT → EXECUTION → OBSERVATION → RECONCILIATION → EFFECT STATE → CONTROL DECISION → SIGNED RECEIPT
 ```
 
+> **Just want to run it?** → **[RUN.md](RUN.md)** (fifteen minutes)
+> **Want to know what was actually verified?** → **[VERIFICATION.md](VERIFICATION.md)**
+
 ---
 
 ## The problem

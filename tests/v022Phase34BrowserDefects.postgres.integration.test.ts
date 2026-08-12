@@ -158,6 +158,44 @@ describe("Nyst v0.2.2 Phase 34 browser-QA regressions", { skip: databaseUrl ? fa
     }
   });
 
+  it("a malformed organization or email is refused as a credential, not as a crash", async () => {
+    // Found by following the product's own RUN.md: typing the organization's
+    // DISPLAY NAME into the login form returned 500, because the slug
+    // validator threw a bare Error. Every one of these must be an ordinary
+    // 401, indistinguishable from a wrong password — otherwise the response
+    // tells an attacker which organization names are even well-formed.
+    const attempts = [
+      "Acme Corporation",     // a display name — the most likely real mistake
+      "acme corp",
+      "9acme",
+      "-acme",
+      "a",
+      "'; DROP TABLE nyst_users;--",
+      "../../etc/passwd",
+    ];
+    for (const value of attempts) {
+      const response = await app.inject({ method: "POST", url: "/v1/auth/login",
+        payload: { organization: value, email: `qa-${suffix}@browser.test`, password } });
+      assert.equal(response.statusCode, 401, `organization ${JSON.stringify(value)} produced ${response.statusCode}`);
+      assert.equal(response.json().error, "invalid_credentials");
+    }
+    for (const value of ["not-an-email", "", " ", "a@b"]) {
+      const response = await app.inject({ method: "POST", url: "/v1/auth/login",
+        payload: { organization: `browser-${suffix}`, email: value, password } });
+      assert.ok(response.statusCode === 401 || response.statusCode === 400,
+        `email ${JSON.stringify(value)} produced ${response.statusCode}`);
+      assert.notEqual(response.statusCode, 500);
+    }
+    // And the real credentials still work, so the guard did not overreach.
+    const good = await app.inject({ method: "POST", url: "/v1/auth/login",
+      payload: { organization: `browser-${suffix}`, email: `qa-${suffix}@browser.test`, password } });
+    assert.equal(good.statusCode, 200, good.body);
+    // The slug is matched case-insensitively, as the login form implies.
+    const upper = await app.inject({ method: "POST", url: "/v1/auth/login",
+      payload: { organization: `BROWSER-${suffix.toUpperCase()}`, email: `qa-${suffix}@browser.test`, password } });
+    assert.equal(upper.statusCode, 200, upper.body);
+  });
+
   it("review-options refuses an action the caller cannot see", async () => {
     const response = await app.inject({ method: "GET", url: `/v1/actions/${randomUUID()}/review-options`, headers: headers() });
     assert.equal(response.statusCode, 404,

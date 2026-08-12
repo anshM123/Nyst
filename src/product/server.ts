@@ -165,7 +165,16 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.get("/login", async (_request, reply) => reply.type("text/html; charset=utf-8").send(loginPage()));
   app.post("/v1/auth/login", async (request, reply) => {
     const body = object(request.body); const organization = string(body.organization, 63); const email = string(body.email, 320); const password = string(body.password, 1024);
-    const result = await options.repository.login(organization, email, password);
+    // A malformed organization or email is not an error — it is simply not a
+    // valid credential, and it must be refused exactly like a wrong password.
+    // Previously the slug validator threw a bare Error, so typing an
+    // organization's DISPLAY NAME ("Acme Corporation") into the login form
+    // produced a 500. That is both a broken first impression and a small
+    // oracle: it distinguished "malformed" from "wrong", which an attacker can
+    // use to learn which organization names are even syntactically plausible.
+    const wellFormed = /^[A-Za-z][A-Za-z0-9-]{1,62}$/.test(organization)
+      && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+    const result = wellFormed ? await options.repository.login(organization, email, password) : null;
     if (!result) return reply.code(401).send({ error: "invalid_credentials", request_id: request.id });
     reply.setCookie(SESSION_COOKIE, result.session, { path: "/", httpOnly: true, sameSite: "strict", secure: options.production === true, maxAge: 12 * 60 * 60 });
     return { csrf: result.csrf, expires_in: 12 * 60 * 60 };
