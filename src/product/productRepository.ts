@@ -7,7 +7,7 @@ import { assertShadowObservationSchema, deriveShadowSemantics } from "./shadowSe
 import { composeReadiness, probeCredentialAvailability, runPreflight, type IntegrationReadiness, type PreflightProbe, type PreflightStatus } from "./readiness.js";
 import type { SecretProvider } from "./secretProvider.js";
 import { pruneIdempotencyKeys, withIdempotency, type IdempotentOperation } from "./idempotency.js";
-import { admitConsequence, linkAdmissionToAction, type AdmissionDecision, type AdmissionRequest } from "./admission.js";
+import { admitConsequence, linkAdmissionToAction, lockEnvironmentAuthority, type AdmissionDecision, type AdmissionRequest } from "./admission.js";
 import { POLICY_TEMPLATES, type PolicyTemplateId } from "./policyTemplates.js";
 import { buildProtectionReport, type HighestRiskIncident, type ProtectionReport } from "./protectionReport.js";
 import { evaluateGoLiveReadiness, type GoLiveReadiness } from "./goLiveReadiness.js";
@@ -29,6 +29,45 @@ const EXPECTED_PROVIDER_REFS: Readonly<Record<string, string>> = { github: "env:
 export class ProductRepository {
   constructor(private readonly db: ProductDb) {}
   async health():Promise<void>{await this.db.query("SELECT 1")}
+
+  /**
+   * Run work inside a transaction that holds the environment authority row.
+   *
+   * This is the shared boundary that gives consequence admission, freeze
+   * activation and freeze release a single total order per environment (see
+   * migration 0018 and `lockEnvironmentAuthority`).
+   *
+   * It needs a real pool, because a lock is only meaningful for the duration of
+   * a transaction on one dedicated connection. A `db` that can only issue
+   * single statements cannot provide the guarantee, so it is refused rather
+   * than silently downgraded — a freeze that quietly stopped serializing would
+   * be the worst possible thing to discover during an incident.
+   */
+  private async withEnvironmentAuthority<T>(
+    scope: TenantScope,
+    work: (client: ProductDb) => Promise<T>,
+  ): Promise<T> {
+    const pool = this.db as ProductDb & { connect?: () => Promise<ProductDb & { release(): void }> };
+    if (typeof pool.connect !== "function") {
+      throw new Error(
+        "Emergency Freeze requires a connection pool that can open a transaction. " +
+        "Freeze and consequence admission must cross one durable authority boundary; " +
+        "that cannot be guaranteed on a single-statement interface.");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await lockEnvironmentAuthority(client, scope);
+      const value = await work(client);
+      await client.query("COMMIT");
+      return value;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 
   async createBootstrap(input: { organization: string; organization_slug: string; project: string; project_slug: string; environment: string; environment_slug: string; email: string; display_name: string; password: string }): Promise<TenantScope & { user_id: string }> {
     const organizationId = randomUUID(); const projectId = randomUUID(); const environmentId = randomUUID(); const userId = randomUUID();
@@ -967,7 +1006,7 @@ export class ProductRepository {
           -- cannot both win: the second sees the first worker's fresh lease.
           AND (r.claim_token IS NULL OR (r.claimed_until IS NOT NULL AND r.claimed_until<=now()))
         RETURNING r.recovery_execution_id,r.action_id,r.resolution_id,r.operation,r.claim_token,r.downstream_operation_key,
-          r.recovery_operation_id,r.dispatch_state,r.status,r.attempt,r.resolution_sequence,r.evidence_sequence,
+          r.recovery_operation_id,r.dispatch_state,r.status,r.attempt,r.resolution_sequence,r.evidence_sequence,r.policy_version_id,
           s.environment_id,s.project_id,s.organization_id,s.agent_id,a.effect_name,a.spec_version,c.authority_valid`,[token,leaseMs,environmentId]);
     return result.rows[0]??null;
   }
@@ -979,6 +1018,67 @@ export class ProductRepository {
    * (`before_send`) and again after, so a process that dies mid-send still
    * leaves behind the fact that a send may have started.
    */
+  /**
+   * THE recovery dispatch gate. Nothing external may run unless this returns true.
+   *
+   * The defect this replaces: the worker called `recordRecoveryDispatch` for
+   * the before-send marker and DISCARDED its boolean, then invoked the external
+   * executor unconditionally. So a worker whose lease had expired, whose claim
+   * another worker had already taken, would still reach the provider — a
+   * duplicate external consequence, which is invariant S1, the first thing Nyst
+   * promises never to do.
+   *
+   * Everything is verified in ONE statement, and the same statement advances the
+   * boundary to may_have_been_sent. There is no window between "I checked that I
+   * still own this" and "I recorded that I am about to send", because those are
+   * the same write. Verified together:
+   *
+   *   - the recovery execution still exists
+   *   - the claim token is still ours (nobody reclaimed)
+   *   - the lease has not expired by DATABASE time, not application time
+   *   - the status is still executing
+   *   - the dispatch state is still definitely_not_sent
+   *   - the action, recovery operation, policy version, resolution sequence and
+   *     evidence sequence are all still the ones we were authorized against
+   *
+   * A false return means: do not send. Ever. The caller must return.
+   */
+  async beginRecoveryDispatch(input: {
+    recovery_execution_id: string; claim_token: string; attempt: number;
+    action_id: string; recovery_operation_id: string; policy_version_id: string;
+    resolution_sequence: number; evidence_sequence: number;
+    detail?: Record<string, unknown>;
+  }): Promise<boolean> {
+    const result = await this.db.query(`WITH eligible AS (
+        SELECT r.recovery_execution_id
+          FROM nyst_recovery_executions r
+          JOIN outcome_runtime rt ON rt.action_id = r.action_id
+         WHERE r.recovery_execution_id = $1
+           AND r.claim_token = $2::uuid
+           AND r.claimed_until > now()          -- database time; a paused worker's clock is irrelevant
+           AND r.status = 'executing'
+           AND r.dispatch_state = 'definitely_not_sent'
+           AND r.action_id = $4::uuid
+           AND r.recovery_operation_id = $5::uuid
+           AND r.policy_version_id = $6::uuid
+           AND rt.resolution_sequence = $7
+           AND rt.evidence_sequence = $8
+           FOR UPDATE OF r
+      ), attempt_record AS (
+        INSERT INTO nyst_recovery_dispatch_attempts(dispatch_attempt_id,recovery_execution_id,attempt,claim_token,phase,detail)
+        SELECT $9,$1,$3,$2,'before_send',$10 FROM eligible
+        ON CONFLICT(recovery_execution_id,attempt,phase) DO NOTHING
+        RETURNING recovery_execution_id
+      )
+      UPDATE nyst_recovery_executions SET dispatch_state='may_have_been_sent'
+       WHERE recovery_execution_id IN (SELECT recovery_execution_id FROM eligible)
+      RETURNING recovery_execution_id`,
+      [input.recovery_execution_id, input.claim_token, input.attempt, input.action_id,
+       input.recovery_operation_id, input.policy_version_id, input.resolution_sequence,
+       input.evidence_sequence, randomUUID(), input.detail ?? {}]);
+    return result.rows.length === 1;
+  }
+
   async recordRecoveryDispatch(recoveryId:string,claimToken:string,attempt:number,phase:"claimed"|"before_send"|"after_send"|"observed"|"failed_before_send"|"failed_after_send"|"cancelled",dispatchState:"definitely_not_sent"|"attempted"|"may_have_been_sent"|"ambiguous"|"completed",detail:Record<string,unknown>={}):Promise<boolean>{
     const result=await this.db.query(`WITH attempt_record AS (
         INSERT INTO nyst_recovery_dispatch_attempts(dispatch_attempt_id,recovery_execution_id,attempt,claim_token,phase,detail)
@@ -1435,15 +1535,30 @@ export class ProductRepository {
    * the same statement that admits a consequence, so nothing can slip past the
    * boundary. Read-only observation and reconciliation are unaffected.
    */
+  /**
+   * Activate an Emergency Freeze.
+   *
+   * Crosses the SAME environment authority boundary that consequence admission
+   * crosses, so the two have one total order. Once this returns, any admission
+   * that has not already crossed the boundary will queue behind it and then
+   * observe the committed freeze. That is the guarantee an operator is relying
+   * on when they hit this control during an incident.
+   */
   async activateFreeze(scope: TenantScope, userId: string, input: { scope_agent_id?: string | null; scope_effect_name?: string | null; reason?: string }): Promise<Record<string, unknown>> {
     await this.requireTenantScope(scope);
     if (input.scope_agent_id && !UUID_PATTERN.test(input.scope_agent_id)) throw new Error("Invalid Agent identifier");
-    const result = await this.db.query(`INSERT INTO nyst_freezes(freeze_id,environment_id,project_id,organization_id,scope_agent_id,scope_effect_name,reason,activated_by)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-      RETURNING freeze_id,scope_agent_id,scope_effect_name,reason,activated_by,activated_at`,
+    const result = await this.withEnvironmentAuthority(scope, async (client) => client.query(
+      `WITH crossed AS (
+         UPDATE nyst_environment_authority SET authority_sequence=authority_sequence+1, updated_at=now()
+         WHERE environment_id=$2 RETURNING authority_sequence
+       )
+       INSERT INTO nyst_freezes(freeze_id,environment_id,project_id,organization_id,scope_agent_id,scope_effect_name,reason,activated_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING freeze_id,scope_agent_id,scope_effect_name,reason,activated_by,activated_at,
+         (SELECT authority_sequence FROM crossed) authority_sequence`,
       [randomUUID(), scope.environment_id, scope.project_id, scope.organization_id,
        input.scope_agent_id ?? null, input.scope_effect_name ? bounded(input.scope_effect_name, 200, "effect") : null,
-       input.reason ? bounded(input.reason, 500, "freeze reason") : "", userId]).catch((error: unknown) => {
+       input.reason ? bounded(input.reason, 500, "freeze reason") : "", userId])).catch((error: unknown) => {
       if (String(error).includes("nyst_freezes_one_active")) throw new Error("An Emergency Freeze is already active for this exact scope");
       throw error;
     });
@@ -1453,10 +1568,19 @@ export class ProductRepository {
 
   /** Release a freeze. Requires an explicit authorized actor; never automatic. */
   async releaseFreeze(scope: TenantScope, userId: string, freezeId: string, reason: string): Promise<Record<string, unknown>> {
-    const result = await this.db.query(`UPDATE nyst_freezes SET released_at=now(),released_by=$5,release_reason=$6
-      WHERE freeze_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4 AND released_at IS NULL
-      RETURNING freeze_id,scope_agent_id,scope_effect_name,activated_at,released_at,released_by`,
-      [freezeId, scope.environment_id, scope.project_id, scope.organization_id, userId, bounded(reason || "Released", 500, "release reason")]);
+    // Release crosses the same boundary as activation and admission. A release
+    // that raced an in-flight admission would otherwise be just as ambiguous
+    // as the activation case, in the more dangerous direction.
+    const result = await this.withEnvironmentAuthority(scope, async (client) => client.query(
+      `WITH crossed AS (
+         UPDATE nyst_environment_authority SET authority_sequence=authority_sequence+1, updated_at=now()
+         WHERE environment_id=$2 RETURNING authority_sequence
+       )
+       UPDATE nyst_freezes SET released_at=now(),released_by=$5,release_reason=$6
+       WHERE freeze_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4 AND released_at IS NULL
+       RETURNING freeze_id,scope_agent_id,scope_effect_name,activated_at,released_at,released_by,
+         (SELECT authority_sequence FROM crossed) authority_sequence`,
+      [freezeId, scope.environment_id, scope.project_id, scope.organization_id, userId, bounded(reason || "Released", 500, "release reason")]));
     if (!result.rows.length) throw new Error("No active freeze with that identity exists in this tenant scope");
     await this.audit(scope, userId, "freeze.released", "freeze", freezeId, {});
     return result.rows[0]!;

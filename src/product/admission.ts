@@ -176,6 +176,41 @@ const ADMISSION_SQL = `
       v.violated_kind,v.violated_observed,v.violated_limit,v.violated_window
     FROM admission a, verdict v`;
 
+/**
+ * Cross the environment authority boundary.
+ *
+ * Every operation that decides whether consequence may begin — admission,
+ * freeze activation, freeze release — calls this FIRST, inside its own
+ * transaction. The lock is released by COMMIT or ROLLBACK.
+ *
+ * The row is normally created by a trigger when the environment is created and
+ * backfilled by migration 0018. The insert here is a belt-and-braces path for
+ * an environment that predates both, so a missing guard row can never silently
+ * mean "no guard".
+ */
+export async function lockEnvironmentAuthority(
+  client: { query(sql: string, params?: readonly unknown[]): Promise<{ rows: Record<string, unknown>[] }> },
+  scope: TenantScope,
+): Promise<void> {
+  const locked = await client.query(
+    `SELECT environment_id FROM nyst_environment_authority WHERE environment_id=$1 FOR UPDATE`,
+    [scope.environment_id]);
+  if (locked.rows.length) return;
+  await client.query(
+    `INSERT INTO nyst_environment_authority(environment_id,project_id,organization_id)
+     VALUES($1,$2,$3) ON CONFLICT (environment_id) DO NOTHING`,
+    [scope.environment_id, scope.project_id, scope.organization_id]);
+  const retried = await client.query(
+    `SELECT environment_id FROM nyst_environment_authority WHERE environment_id=$1 FOR UPDATE`,
+    [scope.environment_id]);
+  if (!retried.rows.length) {
+    // The environment does not exist. Refusing here is correct: without a
+    // durable authority boundary there is nothing to serialize against, and
+    // proceeding would silently drop the guarantee this function exists for.
+    throw new Error("No environment authority boundary exists for this scope; consequence cannot be admitted");
+  }
+}
+
 export async function admitConsequence(db: ProductDb, scope: TenantScope, request: AdmissionRequest): Promise<AdmissionDecision> {
   if (request.amount_minor !== null && (!Number.isInteger(request.amount_minor) || request.amount_minor < 0)) {
     throw new Error("A blast-radius amount must be an integer number of minor units");
@@ -195,8 +230,25 @@ export async function admitConsequence(db: ProductDb, scope: TenantScope, reques
   let result: { rows: Record<string, unknown>[] };
   try {
     await client.query("BEGIN");
-    // STATEMENT 1 — take the row locks. Concurrent admissions against the same
-    // budget queue here.
+    // STATEMENT 0 — cross the environment authority boundary.
+    //
+    // Emergency Freeze activation and release take this same row lock. Before
+    // it existed, admission and freeze shared nothing: admission read
+    // committed freezes on a fresh snapshot, and freeze was a bare INSERT that
+    // waited for no one. That is probably correct for most interleavings, but
+    // "probably, because of snapshot timing" is not a safety property — and it
+    // left a window in which a freeze could report durable success to an
+    // operator while an admission whose snapshot predated it was still about
+    // to commit.
+    //
+    // With the shared guard the three operations have one total order per
+    // environment: whichever crosses first completes first, and the other
+    // waits and then observes the result. It is also now provable with a
+    // barrier test instead of a sleep.
+    await lockEnvironmentAuthority(client, scope);
+
+    // STATEMENT 1 — take the budget row locks. Concurrent admissions against
+    // the same budget queue here.
     await client.query(
       `SELECT budget_id FROM nyst_blast_radius_budgets
        WHERE environment_id=$1 AND enabled

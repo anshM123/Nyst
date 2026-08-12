@@ -45,7 +45,10 @@ const sdkSources = ["src/index.ts", "src/client.ts", "src/types.ts", "src/webhoo
 describe("Phase 25 — package identity", () => {
   it("the SDK is the publishable package and the server is not", () => {
     assert.equal(manifest.name, "@nyst-ai/sdk");
-    assert.equal(manifest.version, "0.2.2");
+    // Version truth is asserted centrally in tests/v030ProductionPackaging.test.ts;
+    // here we only require that the SDK and the server agree.
+    assert.equal(manifest.version, rootManifest.version,
+      "the SDK and the server must ship as the same release");
     assert.equal(manifest.private, false);
     assert.equal(rootManifest.private, true, "the server and dashboard must never be publishable");
     assert.notEqual(rootManifest.name, "@nyst-ai/sdk", "the root must not claim the SDK's published name");

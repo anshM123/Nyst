@@ -31,6 +31,8 @@ export interface RecoveryClaim {
   status: "executing" | "observing" | "completed";
   attempt: number;
   authority_valid: boolean;
+  /** The immutable policy this recovery was authorized under. */
+  policy_version_id: string;
   resolution_sequence: number;
   evidence_sequence: number;
   environment_id: string;
@@ -110,10 +112,36 @@ export class NystRecoveryWorker {
       return true;
     }
 
-    // Durable boundary marker written BEFORE the send. If this process dies on
-    // the next line, the reclaiming worker sees may_have_been_sent.
-    await this.repository.recordRecoveryDispatch(claim.recovery_execution_id, claim.claim_token, claim.attempt, "before_send", "may_have_been_sent",
-      { operation: claim.operation, downstream_operation_key: claim.downstream_operation_key });
+    // THE DISPATCH GATE.
+    //
+    // This both verifies that we may still send and durably advances the
+    // boundary to may_have_been_sent, in one statement. If this process dies on
+    // the very next line, a reclaiming worker sees may_have_been_sent and will
+    // observe rather than re-send.
+    //
+    // The previous version of this code called the marker and threw away its
+    // boolean, so a worker whose claim had already been taken by another worker
+    // still reached the provider. That is a duplicate external effect — the one
+    // thing invariant S1 forbids absolutely. The result is now checked, and a
+    // false return returns immediately without touching the executor.
+    const mayDispatch = await this.repository.beginRecoveryDispatch({
+      recovery_execution_id: claim.recovery_execution_id,
+      claim_token: claim.claim_token,
+      attempt: claim.attempt,
+      action_id: claim.action_id,
+      recovery_operation_id: claim.recovery_operation_id,
+      policy_version_id: claim.policy_version_id,
+      resolution_sequence: claim.resolution_sequence,
+      evidence_sequence: claim.evidence_sequence,
+      detail: { operation: claim.operation, downstream_operation_key: claim.downstream_operation_key },
+    });
+    if (!mayDispatch) {
+      // We no longer own this work, or the world moved under us. Someone else
+      // is responsible for it now. Do nothing at all: not a retry, not an
+      // observation, not a status write. Any write here would be this worker
+      // acting without authority.
+      return true;
+    }
 
     try {
       const result = await executor(Object.freeze({ ...claim }));
