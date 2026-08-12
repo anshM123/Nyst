@@ -10,6 +10,7 @@ import type { PreflightProbeResult } from "./readiness.js";
 import type { SecretProvider } from "./secretProvider.js";
 import { NYST_SAFETY_FLOOR } from "./policyTemplates.js";
 import { healthMetricsText } from "./operationalHealth.js";
+import { LAB_EFFECT } from "./failureLabEngine.js";
 
 /** Single source of the product version string. */
 export const NYST_VERSION = "0.2.2";
@@ -124,7 +125,26 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     else if (++current.count > 300) { return reply.code(429).send({ error: "rate_limited", request_id: request.id }); }
   });
   app.addHook("onResponse", async(request,reply)=>options.structured_log?.({type:"http_request",request_id:request.id,method:request.method,path:request.routeOptions.url,status_code:reply.statusCode}));
-  app.setErrorHandler((error: unknown, request, reply) => { options.metrics?.increment("provider_or_request_errors"); const candidate = error && typeof error === "object" && "statusCode" in error ? Number((error as { statusCode?: unknown }).statusCode) : 500; const status = candidate >= 400 && candidate < 500 ? candidate : 500; reply.code(status).send({ error: status === 500 ? "internal_error" : "invalid_request", request_id: request.id }); });
+  /**
+   * Error shape.
+   *
+   * A 500 says nothing beyond a request id: an unexpected failure may carry a
+   * stack, a query, or a value we have not vetted. A deliberate 4xx is the
+   * opposite — it is a refusal Nyst chose to make, and the operator needs to
+   * know WHY. Before this, "no webhook endpoint is configured" reached the
+   * dashboard as "internal_error", which is both alarming and useless.
+   *
+   * Only messages from errors we threw ourselves with an explicit statusCode
+   * are surfaced, and they are stripped of newlines and truncated.
+   */
+  app.setErrorHandler((error: unknown, request, reply) => {
+    options.metrics?.increment("provider_or_request_errors");
+    const candidate = error && typeof error === "object" && "statusCode" in error ? Number((error as { statusCode?: unknown }).statusCode) : 500;
+    const status = candidate >= 400 && candidate < 500 ? candidate : 500;
+    if (status === 500) return reply.code(500).send({ error: "internal_error", request_id: request.id });
+    const message = error instanceof Error ? error.message.replace(/[\r\n]+/g, " ").slice(0, 200) : "";
+    reply.code(status).send({ error: "invalid_request", ...(message ? { detail: message } : {}), request_id: request.id });
+  });
 
   app.get("/assets/app.css", async (_request, reply) => reply.type("text/css; charset=utf-8").send(APP_CSS+PRODUCT_ENHANCEMENT_CSS));
   app.get("/assets/login.js", async (_request, reply) => reply.type("application/javascript; charset=utf-8").send(LOGIN_JS));
@@ -342,7 +362,17 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.post("/v1/actions/:id/reviews",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const idempotent = await options.repository.idempotent(principal, "review.open", idempotencyKey(request), { action_id: routeId(request), body: object(request.body) }, async () => options.repository.openHumanReview(principal,routeId(request),string(object(request.body).reason,1000))); return idempotent.value;},options.repository));
   app.post("/v1/reviews/:id",api(async(principal,request)=>{requireScope(principal,"actions:write");requireCsrf(request,principal);const body=object(request.body);const operation=string(body.operation,40);if(operation!=="acknowledge"&&operation!=="request_reobservation"&&operation!=="authorize_compensation"&&operation!=="cancel")throw Object.assign(new Error("Human review supports only acknowledge, request_reobservation, authorize_compensation and cancel. There is no force-continue."),{statusCode:400});const idempotent = await options.repository.idempotent(principal, "review.command", idempotencyKey(request), { review_id: routeId(request), body }, async () => options.repository.updateHumanReview(principal,principal.user_id!,routeId(request),operation)); return idempotent.value;},options.repository));
   app.get("/v1/failure-lab/runs",api(async principal=>{requireScope(principal,"actions:read");return options.repository.failureLabRuns(principal)},options.repository));
-  app.post("/v1/failure-lab/runs",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const body=object(request.body);const scenario=string(body.scenario,40);if(!["response_lost","timeout_before_send","delayed_observation","reconcile_rate_limit","duplicate_caller","process_crash","offboarding_demo"].includes(scenario)||!Number.isInteger(body.seed))throw Object.assign(new Error("Invalid deterministic scenario"),{statusCode:400});const idempotent = await options.repository.idempotent(principal, "failure_lab.run", idempotencyKey(request), object(request.body), async () => options.repository.runFailureLab(principal,principal.user_id!,scenario as never,string(body.effect,200),Number(body.seed))); return idempotent.value;},options.repository));
+  /**
+   * Run one deterministic Failure Lab scenario.
+   *
+   * `effect` was a REQUIRED parameter that the engine then ignored — the lab
+   * always runs against the deterministic fake provider, which is what makes
+   * it structurally unable to reach a real system. The dashboard's own form
+   * therefore could never succeed: it did not send a field it had no honest
+   * value for. The field is now optional, and a value other than the lab
+   * effect is refused with a reason rather than silently disregarded.
+   */
+  app.post("/v1/failure-lab/runs",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const body=object(request.body);const scenario=string(body.scenario,40);if(!["response_lost","timeout_before_send","delayed_observation","reconcile_rate_limit","duplicate_caller","process_crash","offboarding_demo"].includes(scenario)||!Number.isInteger(body.seed))throw Object.assign(new Error("A run needs one of the listed deterministic scenarios and an integer seed."),{statusCode:400});if(body.effect!==undefined&&body.effect!==null&&String(body.effect)!==LAB_EFFECT)throw Object.assign(new Error(`The Failure Lab only simulates ${LAB_EFFECT}; it never reaches a real provider.`),{statusCode:400});const idempotent = await options.repository.idempotent(principal, "failure_lab.run", idempotencyKey(request), object(request.body), async () => options.repository.runFailureLab(principal,principal.user_id!,scenario as never,LAB_EFFECT,Number(body.seed))); return idempotent.value;},options.repository));
   app.put("/v1/onboarding",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);if(object(request.body).operation!=="attest_sdk_installed")throw Object.assign(new Error("Unsupported onboarding operation"),{statusCode:400});await options.repository.attestSdkInstalled(principal);return options.repository.onboardingProgress(principal)},options.repository));
   app.get("/v1/api-keys",api(async principal=>{sessionOnly(principal);return options.repository.apiKeys(principal)},options.repository));
   app.post("/v1/api-keys", api(async (principal, request) => { if (principal.kind !== "session") throw Object.assign(new Error("Session required"), { statusCode: 403 }); requireCsrf(request, principal); const body = object(request.body); const scopes=strings(body.scopes,16); if(scopes.some(scope=>!API_SCOPES.has(scope)))throw Object.assign(new Error("Unsupported API key scope"),{statusCode:400}); const idempotent = await options.repository.idempotent(principal, "api_key.create", idempotencyKey(request), body, async () => options.repository.createApiKey(principal, string(body.name, 120), scopes, null, body.agent_id===undefined||body.agent_id===null?null:string(body.agent_id,36))); return idempotent.value;},options.repository));

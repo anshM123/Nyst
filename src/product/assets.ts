@@ -62,7 +62,12 @@ export const APP_JS = `
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) { announce(button, payload.error || "That operation was refused.", true); return null; }
+      // Prefer the server's stated reason. An error CODE tells an operator
+      // nothing they can act on; "no webhook endpoint is configured" does.
+      if (!response.ok) {
+        announce(button, payload.detail || payload.error || "That operation was refused.", true);
+        return null;
+      }
       return payload;
     } catch { announce(button, "Nyst could not be reached.", true); return null; }
     finally { button.dataset.busy = "false"; button.disabled = false; button.textContent = original; }

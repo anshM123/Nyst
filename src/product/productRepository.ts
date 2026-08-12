@@ -416,7 +416,22 @@ export class ProductRepository {
     ), audit AS (
       INSERT INTO nyst_environment_mode_audit(audit_id,environment_id,project_id,organization_id,previous_mode,new_mode,changed_by,reason)
       SELECT $5,$1,$2,$3,previous_mode,$4,$6,$7 FROM changed
-    ) SELECT mode FROM nyst_environments WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`,
+    )
+    -- Read the NEW mode from the CTE, not from the table.
+    --
+    -- Under READ COMMITTED a data-modifying CTE's writes are not visible to
+    -- the rest of the same statement, so "SELECT mode FROM nyst_environments"
+    -- here returns the value from before the UPDATE. This endpoint therefore
+    -- reported the PREVIOUS mode after a successful change, and a client that
+    -- read the response to confirm the switch was told the opposite of the
+    -- truth. Same snapshot trap as the blast-radius admission gate.
+    --
+    -- The left join keeps the no-op case working: setting the mode it is
+    -- already in updates nothing, so "changed" is empty and the current value
+    -- from the table is both correct and unchanged.
+    SELECT COALESCE(c.new_mode, e.mode) AS mode
+      FROM nyst_environments e LEFT JOIN changed c ON true
+     WHERE e.environment_id=$1 AND e.project_id=$2 AND e.organization_id=$3`,
       [scope.environment_id, scope.project_id, scope.organization_id, mode, randomUUID(), userId, bounded(reason, 500, "mode change reason")]);
     if (!result.rows.length) throw new Error("Resource belongs to a different tenant scope");
     return { mode: normalizeMode(result.rows[0]?.mode) };
@@ -861,7 +876,7 @@ export class ProductRepository {
       FROM nyst_action_scopes s JOIN outcome_actions a ON a.action_id=s.action_id JOIN LATERAL(SELECT * FROM outcome_resolutions WHERE action_id=s.action_id ORDER BY resolution_sequence DESC LIMIT 1) r ON true JOIN outcome_runtime rt ON rt.action_id=s.action_id
       WHERE s.environment_id=$1 AND s.project_id=$2 AND s.organization_id=$3 ORDER BY a.created_at DESC LIMIT 1
     ) INSERT INTO nyst_webhook_events(webhook_event_id,webhook_endpoint_id,action_id,resolution_id,resolution_sequence,evidence_sequence,event_type,payload,occurred_at,event_schema_version)
-      SELECT $4::uuid,w.webhook_endpoint_id,c.action_id,c.resolution_id,c.resolution_sequence,c.evidence_sequence,'webhook.test',jsonb_build_object('event_schema_version',1,'event_id',$4::text,'event_type','webhook.test','timestamp',now(),'organization_id',$3,'project_id',$2,'environment_id',$1,'action_id',c.action_id,'effect_name',c.action_effect_name,'spec_version',c.action_spec_version,'resolution_id',c.resolution_id,'resolution_sequence',c.resolution_sequence,'evidence_sequence',c.evidence_sequence,'effect_state',c.effect_state,'control',jsonb_build_object('primary',c.primary_directive,'retry',c.retry_disposition,'continuation',c.continuation_disposition,'recovery',c.recovery_disposition),'receipt_ref','/v1/actions/'||c.action_id||'/receipt'),now(),1 FROM current c JOIN nyst_webhook_endpoints w ON w.environment_id=$1 AND w.project_id=$2 AND w.organization_id=$3 AND w.enabled RETURNING webhook_event_id,event_type,occurred_at`,[scope.environment_id,scope.project_id,scope.organization_id,eventId]);if(!result.rows.length)throw new Error("Webhook test requires an enabled endpoint and at least one resolved action");return result.rows[0]!;}
+      SELECT $4::uuid,w.webhook_endpoint_id,c.action_id,c.resolution_id,c.resolution_sequence,c.evidence_sequence,'webhook.test',jsonb_build_object('event_schema_version',1,'event_id',$4::text,'event_type','webhook.test','timestamp',now(),'organization_id',$3,'project_id',$2,'environment_id',$1,'action_id',c.action_id,'effect_name',c.action_effect_name,'spec_version',c.action_spec_version,'resolution_id',c.resolution_id,'resolution_sequence',c.resolution_sequence,'evidence_sequence',c.evidence_sequence,'effect_state',c.effect_state,'control',jsonb_build_object('primary',c.primary_directive,'retry',c.retry_disposition,'continuation',c.continuation_disposition,'recovery',c.recovery_disposition),'receipt_ref','/v1/actions/'||c.action_id||'/receipt'),now(),1 FROM current c JOIN nyst_webhook_endpoints w ON w.environment_id=$1 AND w.project_id=$2 AND w.organization_id=$3 AND w.enabled RETURNING webhook_event_id,event_type,occurred_at`,[scope.environment_id,scope.project_id,scope.organization_id,eventId]);if(!result.rows.length)throw Object.assign(new Error("A test delivery needs an enabled webhook endpoint and at least one resolved action in this environment."),{statusCode:409});return result.rows[0]!;}
 
   async queueDecisionWebhook(scope: TenantScope, actionId: string, resolution: Record<string, unknown>, eventType: string): Promise<void> {
     const resolutionId=String(resolution.resolution_id??""); const runtime=resolution.runtime&&typeof resolution.runtime==='object'?resolution.runtime as Record<string,unknown>:{};

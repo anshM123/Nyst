@@ -10,7 +10,12 @@ import { EffectRegistry } from "../runtime/registry.js";
 import { createMemoryStore } from "../store/memoryStore.js";
 import type { FailureScenario } from "./controlPlane.js";
 
-const LAB_EFFECT = "fake.repository_permission_change";
+/**
+ * The Failure Lab always runs against the deterministic fake provider. That is
+ * what makes it structurally incapable of touching a real system, so the
+ * effect is a constant rather than a choice.
+ */
+export const LAB_EFFECT = "fake.repository_permission_change";
 
 const scenarioMap: Record<Exclude<FailureScenario, "process_crash" | "offboarding_demo">, RuntimeFakeScenario> = {
   response_lost: "response_lost_after_effect",
