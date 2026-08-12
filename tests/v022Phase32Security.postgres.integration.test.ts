@@ -377,16 +377,22 @@ describe("Nyst v0.2.2 Phase 32 security", { skip: databaseUrl ? false : "DATABAS
     const pg = await import("pg") as unknown as { default: { Pool: new (o: { connectionString: string; application_name: string }) => ProductDb & { end(): Promise<void> } } };
     const isolatedPool = new pg.default.Pool({ connectionString: databaseUrl!, application_name: tag });
     // An idle client whose backend is terminated emits on the pool. Unhandled,
-    // that is an uncaught exception — which is precisely the crash this test
-    // is asserting does NOT have to happen, so it must be observed, not
-    // ignored by omission.
-    let idleErrors = 0;
-    (isolatedPool as unknown as { on(event: "error", handler: () => void): void }).on("error", () => { idleErrors += 1; });
+    // that is an uncaught exception, so the handler is required. Whether the
+    // event fires at all depends on whether a client happened to be idle at
+    // that instant — a `pg` timing detail, not a Nyst property, and asserting
+    // on it made this test flaky. The proof used below is deterministic
+    // instead: the backend PIDs afterwards are different ones.
+    (isolatedPool as unknown as { on(event: "error", handler: () => void): void }).on("error", () => undefined);
+    const backendPids = async (): Promise<number[]> =>
+      (await pool.query(`SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND application_name=$1 ORDER BY pid`, [tag]))
+        .rows.map((row) => Number(row.pid));
     const isolatedApp = await buildProductServer({
       repository: new ProductRepository(isolatedPool), effect_specs: [], production: false, secrets: new TestSecretProvider(),
     });
     try {
       assert.equal((await isolatedApp.inject({ method: "GET", url: "/ready" })).statusCode, 200);
+      const before = await backendPids();
+      assert.ok(before.length > 0, "the isolated pool holds no connection, so nothing can be tested");
 
       // What a database restart looks like from the application's side.
       const killed = await pool.query(
@@ -409,7 +415,14 @@ describe("Nyst v0.2.2 Phase 32 security", { skip: databaseUrl ? false : "DATABAS
       // Responsive is not the same as correct.
       const overview = await isolatedApp.inject({ method: "GET", url: "/v1/overview", headers: session(victimAuth) });
       assert.equal(overview.statusCode, 200, overview.body);
-      assert.ok(idleErrors > 0, "the terminated connections were never noticed, so the recovery proves nothing");
+
+      // The recovery is real only if it is serving over NEW backends. If any
+      // original pid survived, the pool never actually lost its connections
+      // and this test would be proving nothing.
+      const after = await backendPids();
+      assert.ok(after.length > 0, "the pool holds no connection after recovery");
+      assert.deepEqual(after.filter((pid) => before.includes(pid)), [],
+        "a pre-termination backend survived, so the connections were never really lost");
     } finally {
       await isolatedApp.close();
       await isolatedPool.end().catch(() => undefined);

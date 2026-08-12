@@ -22,7 +22,7 @@
   },
   "scripts": {
     "build": "tsc -p packages/sdk/tsconfig.json && tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p packages/sdk/tsconfig.json && tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test \"dist/tests/*.test.js\"",
     "test:github:live": "npm run build && node --experimental-strip-types scripts/verifyGitHubLive.ts",
     "test:github:gate4-live": "npm run build && node --experimental-strip-types scripts/verifyGitHubGate4Live.ts",

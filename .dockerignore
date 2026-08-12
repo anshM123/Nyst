@@ -44,13 +44,13 @@ temp/
 .cache/
 
 # --- build output (the image builds its own) ---------------------------
-node_modules
-packages/*/node_modules
-dist
-packages/*/dist
+# `**/` because a bare pattern matches only at the root: Docker uses Go's
+# filepath.Match, where `*` does not cross a path separator.
+**/node_modules
+**/dist
 build/
 out/
-*.tsbuildinfo
+**/*.tsbuildinfo
 
 # --- test and QA artefacts ---------------------------------------------
 coverage/
@@ -77,6 +77,10 @@ Thumbs.db
 desktop.ini
 
 # --- docs are not needed at runtime -------------------------------------
+# `*.md` matches only root-level markdown; docs/ is excluded wholesale above
+# it. The negation is deliberately LAST and deliberately root-scoped: a bare
+# `README.md` pattern cannot match a nested path, so this re-includes the
+# project README and nothing inside any dependency.
 docs/
 *.md
-!README.md
+!/README.md
