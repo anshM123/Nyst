@@ -191,13 +191,24 @@ structurally incapable of touching a real system.
 
 ## Running the tests
 
+Use a **separate** database for tests:
+
 ```bash
-npm test
+createdb nyst_test
 ```
 
-Requires `DATABASE_URL`. Expect **658 passing, 0 failing, 0 skipped**, in about
-40 seconds. The integration tests use PostgreSQL directly; they create and
-clean up their own tenants.
+```bash
+DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst_test' npm test
+```
+
+Expect **658 passing, 0 failing, 0 skipped**, in about 40 seconds.
+
+The integration tests are real: they run against PostgreSQL and create their
+own tenants. Pointing them at the database you signed in to is harmless to your
+data, but it leaves test organizations behind — and first-boot bootstrap only
+runs on an **empty** Nyst, so a database that has had the tests run against it
+will not create your admin user. If your login is rejected on a database you
+just created, this is almost certainly why.
 
 ```bash
 npm run typecheck
@@ -223,7 +234,11 @@ full resolution history, and the signed receipt.
 ## If something goes wrong
 
 **"Those credentials were not accepted."**
-The Organization field wants the **slug** (`acme`), not the display name.
+Two likely causes. The Organization field wants the **slug** (`acme`), not the
+display name. Or the database was not empty when Nyst first started — the
+bootstrap admin user is created only on a genuinely fresh Nyst, so if you ran
+`npm test` against this database first, drop it, recreate it, migrate, and
+start again.
 
 **Nyst will not start, and prints a list of problems.**
 That is deliberate. Production startup fails closed rather than warning and
