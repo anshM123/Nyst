@@ -58,3 +58,4 @@ Nyst.ai-phase*-frozen/
 nyst-phase*-frozen/
 *.local
 .tools/
+*.tgz

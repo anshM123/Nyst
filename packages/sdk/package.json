@@ -1,0 +1,42 @@
+{
+  "name": "@nyst-ai/sdk",
+  "version": "0.2.2",
+  "private": false,
+  "description": "Client for Nyst — effect-control infrastructure for autonomous software. Know what actually happened after a consequential action, and what is safe to do next.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md"
+  ],
+  "keywords": [
+    "nyst",
+    "effect-control",
+    "agent-safety",
+    "idempotency",
+    "reconciliation"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^5.6.0"
+  }
+}
