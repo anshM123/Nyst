@@ -23,6 +23,12 @@ import { NystReobservationWorker } from "../dist/src/product/reobservationWorker
 import { createPostgresStore } from "../dist/src/store/postgresStore.js";
 import { EnvSecretProvider } from "../dist/src/product/secretProvider.js";
 import { loadConfig, structuredLog } from "../dist/src/product/config.js";
+import { OutcomeRepository } from "../dist/src/product/outcome/outcomeRepository.js";
+import { OutcomeShadow } from "../dist/src/product/outcome/outcomeShadow.js";
+import { EvidenceIngest, RelayCoordinator } from "../dist/src/product/outcome/evidenceIngest.js";
+import { AuthorityRepository } from "../dist/src/product/authority/authorityRepository.js";
+import { registerPublicRoutes } from "../dist/src/public/publicRoutes.js";
+import { homePage } from "../dist/src/public/site.js";
 
 const config = loadConfig();
 
@@ -77,11 +83,16 @@ const evidenceIngest = new EvidenceIngest(pool, outcomeRepository, secrets);
 const preflight = async (provider: "github" | "okta" | "stripe", _secret: string) => {
   try {
     const result = await product.preflight(provider) as Record<string, unknown>;
+    // Optional fields are OMITTED rather than set to undefined: with
+    // exactOptionalPropertyTypes an explicit undefined is a different thing
+    // from an absent key, and the probe contract means "not observed".
+    const identity = identityOf(result);
+    const resource = typeof result.repository === "object" && result.repository
+      ? String((result.repository as Record<string, unknown>).name ?? "") : undefined;
     return {
       ok: true as const,
-      account_identity: identityOf(result),
-      resource: typeof result.repository === "object" && result.repository
-        ? String((result.repository as Record<string, unknown>).name ?? "") : undefined,
+      ...(identity === undefined ? {} : { account_identity: identity }),
+      ...(resource === undefined ? {} : { resource }),
       // Only capabilities the probe actually proved by reading. Never a write.
       verified_capabilities: Array.isArray(result.verified_capabilities)
         ? result.verified_capabilities.filter((item): item is string => typeof item === "string") : [],

@@ -24,7 +24,7 @@
  */
 import { Ed25519Signer } from "../dist/src/core/signing.js";
 import { verifyResolution } from "../dist/src/engine/resolver.js";
-import { ProductRepository } from "../dist/src/product/productRepository.js";
+import { ProductRepository, type ProductDb } from "../dist/src/product/productRepository.js";
 
 const url = process.env.DATABASE_URL;
 if (!url) { console.error("DATABASE_URL is required"); process.exit(1); }
@@ -37,7 +37,11 @@ if (!password) {
   process.exit(1);
 }
 
-const pg = await import("pg");
+// `pg` ships no bundled types, and the driver is loaded dynamically so a
+// deployment without it fails at the entry point rather than at import time.
+const pg = await import("pg") as unknown as {
+  default: { Pool: new (options: { connectionString: string }) => ProductDb & { end(): Promise<void> } };
+};
 const pool = new pg.default.Pool({ connectionString: url });
 const repository = new ProductRepository(pool);
 
@@ -80,12 +84,12 @@ try {
   }
 
   const heartbeats = (await pool.query(
-    `SELECT worker_kind FROM nyst_worker_heartbeats ORDER BY worker_kind`)).rows.map((row) => String(row.worker_kind));
+    `SELECT worker_kind FROM nyst_worker_heartbeats ORDER BY worker_kind`)).rows.map((row: Record<string, unknown>) => String(row.worker_kind));
   const webhooks = (await pool.query(
     `SELECT target_url, signing_secret_ref FROM nyst_webhook_endpoints ORDER BY target_url`)).rows;
 
   // A stored webhook secret would be a leak. Only the REFERENCE is durable.
-  for (const hook of webhooks) {
+  for (const hook of webhooks as Record<string, unknown>[]) {
     const reference = String(hook.signing_secret_ref ?? "");
     if (!/^(?:env|vault|secret-manager):/.test(reference)) {
       failures.push(`webhook ${String(hook.target_url)} stores something that is not an opaque reference`);
@@ -102,8 +106,11 @@ try {
     sample_action: actionId,
     sample_effect_state: target.effect_state ?? null,
     sample_directive: target.primary_directive ?? null,
-    sample_evidence: evidence.length,
-    sample_resolutions: resolutions.length,
+    // Null means the action is not visible in this tenant at all, which is a
+    // different failure from "restored with no evidence" and is reported as
+    // such rather than crashing the drill.
+    sample_evidence: evidence === null ? "action not visible" : evidence.length,
+    sample_resolutions: resolutions === null ? "action not visible" : resolutions.length,
     receipt_present: receipt !== null,
     receipt_signature_valid: signatureValid,
     resolution_transitions: await count("nyst_resolution_transitions"),
@@ -111,7 +118,7 @@ try {
     consequence_admissions: await count("nyst_consequence_admissions"),
     shadow_evaluations: await count("nyst_shadow_evaluations"),
     worker_kinds_with_state: heartbeats,
-    webhook_endpoints: webhooks.map((hook) => String(hook.target_url)),
+    webhook_endpoints: (webhooks as Record<string, unknown>[]).map((hook) => String(hook.target_url)),
     migrations_applied: await count("outcome_migrations"),
   };
 

@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Type-check only. These entry points import from `dist`, so they are
+    // checked AFTER the main build rather than compiled themselves.
+    "noEmit": true,
+    "rootDir": ".",
+    // They are executed directly by `node --experimental-strip-types`, so a
+    // dynamic import of a sibling .ts file is correct at runtime.
+    "allowImportingTsExtensions": true
+  },
+  "include": ["scripts/**/*.ts", "scripts/**/*.d.ts"]
+}

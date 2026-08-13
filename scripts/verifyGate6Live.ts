@@ -133,7 +133,12 @@ try {
     if (current.permission.role_name !== "read" || current.direct_collaborator === null) {
       const member = await githubClient.checkOrganizationMember(owner, principal, githubRef);
       assert(member.status === 204 && member.data === true, "Refusing cleanup because principal is not an active org member");
-      const restore = await githubClient.setPermission(owner, repository, principal, mutationPermission("read"), githubRef);
+      // `mutationPermission` can return "none", which is a REMOVAL and needs a
+      // different GitHub call entirely. It cannot happen for "read"; asserting
+      // it keeps that true if the mapping is ever changed underneath us.
+      const restorePermission = mutationPermission("read");
+      assert(restorePermission !== "none", "read must map to a GitHub mutation permission, not a removal");
+      const restore = await githubClient.setPermission(owner, repository, principal, restorePermission, githubRef);
       assert(restore.status === 204, `GitHub cleanup returned HTTP ${restore.status}`);
     }
     const final = await githubSnapshot();

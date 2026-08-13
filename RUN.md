@@ -1,9 +1,10 @@
-# Running Nyst v0.2.2
+# Running Nyst v0.3.0
 
-Start here. This page gets Nyst running on your machine and signs you in.
-Fifteen minutes, no prior knowledge of the codebase.
+This page gets Nyst running on your machine and signs you in. Fifteen minutes,
+no prior knowledge of the codebase.
 
-For what Nyst *is* and why it exists, read [README.md](README.md).
+For what Nyst *is*, read [README.md](README.md). For what was and was not
+actually verified, read [VERIFICATION.md](VERIFICATION.md).
 
 ---
 
@@ -14,32 +15,31 @@ For what Nyst *is* and why it exists, read [README.md](README.md).
 | **Node** | 22 or newer (`node --version`) |
 | **PostgreSQL** | 14 or newer, running and reachable |
 
-Nothing else. Nyst has three runtime dependencies and no build step you have to
-run by hand.
-
-If you would rather not install PostgreSQL, skip to
-[Option B: Docker](#option-b-docker) — it runs the database, the API and the
-workers for you.
+Nothing else. Four runtime dependencies, and no build step you run by hand.
 
 ---
 
-## Option A: run it locally (recommended for a first look)
-
-### 1. Install
+## 1. Install
 
 ```bash
 npm ci
 ```
 
-### 2. Create a database
+## 2. Create two databases
 
-Any empty PostgreSQL database will do.
+One for running Nyst, one for the tests. **Use separate databases** — the test
+suite creates and destroys a lot of data, and the first start only bootstraps
+your admin account into an *empty* database.
 
 ```bash
 createdb nyst
 ```
 
-### 3. Apply the schema
+```bash
+createdb nyst_test
+```
+
+## 3. Apply the schema
 
 **macOS / Linux**
 
@@ -55,9 +55,9 @@ $env:DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst'
 npm run migrate
 ```
 
-You should see 17 migrations apply and `migrations complete`.
+You should see **24 migrations** apply and `migrations complete`.
 
-### 4. Start Nyst
+## 4. Start Nyst
 
 The first start also creates your organization and admin user.
 
@@ -87,9 +87,17 @@ $env:NYST_BOOTSTRAP_PASSWORD='pick something long'
 npm run start:product
 ```
 
-### 5. Sign in
+Wait for `service_started` in the output. The first start compiles TypeScript,
+so it takes about twenty seconds.
+
+## 5. Look around
 
 Open **<http://127.0.0.1:4080>**.
+
+Signed out, that address is the **public site**. Signed in, it is your
+dashboard. Both live on the same origin.
+
+### Sign in
 
 | Field | Value |
 | --- | --- |
@@ -97,12 +105,91 @@ Open **<http://127.0.0.1:4080>**.
 | Email | `you@acme.test` |
 | Password | whatever you set above |
 
-The organization slug catches most people the first time. It is the third
-field, and it is the short lowercase one.
+> The organization slug catches most people the first time. It is the short
+> lowercase one.
 
-Two of those variables are development-only and Nyst **refuses to start with
+Two of those variables are development-only, and Nyst **refuses to start with
 them under `NODE_ENV=production`**: an ephemeral signing key cannot verify
 yesterday's receipts, and a fake provider must never stand in for a real one.
+
+---
+
+## What to look at, in order
+
+### The public site — no sign-in needed
+
+| Page | What it is |
+| --- | --- |
+| <http://127.0.0.1:4080/> | The opening, and the thirteen-scene causal story. **Scene eight is the one to read.** |
+| `/pricing` | Four plans, and a section on what your plan does *not* change |
+| `/configure` | The deployment configurator. It ends by telling you what Nyst would **not** be covering |
+| `/security` | What Nyst holds, and what it refuses to |
+| `/contact` | Works with no session, no signup and no JavaScript |
+
+### The product — signed in
+
+| Page | What it is |
+| --- | --- |
+| `/outcomes` | **Start here.** What became true in the world |
+| `/shadow` | Outcome Shadow: the gap between what your Agents believe and what is true |
+| `/failure-lab` | Break something on purpose and watch what Nyst concludes |
+| `/autonomy` | The Autonomy Line — an envelope, not a trust score |
+| `/needs-attention` | Everything Nyst stopped on |
+| `/protection` | What is actually protected, and what is only configured |
+
+### Seeing the headline for yourself
+
+The fastest route to the thing this release is about:
+
+1. Go to **`/failure-lab`**.
+2. Under **Outcome failures**, run **"Direct access removed, inherited access
+   remains"**.
+3. Nyst reports the action as fine and the **outcome as UNSATISFIED**, naming
+   the exact invariant that is false and what it actually observed.
+
+That verdict is computed by the same evaluator that runs in production. It is
+not a scripted demo response — a test re-derives it from its own invariant
+results, so a canned answer would fail the build.
+
+---
+
+## Running the tests
+
+Against the **test** database, not the one you just started Nyst on:
+
+**macOS / Linux**
+
+```bash
+DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst_test' npm test
+```
+
+**Windows PowerShell**
+
+```powershell
+$env:DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst_test'; npm test
+```
+
+Expect **851 passing, 0 failing, 0 skipped**, in about 45 seconds.
+
+---
+
+## If something goes wrong
+
+**`DATABASE_URL is required`**
+Nyst will not guess a connection string. Set it in the same shell you run the
+command in.
+
+**Sign-in fails with a correct password**
+Two likely causes. Either you typed the organization *name* instead of the
+*slug*, or the database already had data when Nyst first started — bootstrap
+only runs against an empty database, so if you pointed Nyst at the database you
+ran the tests on, no admin user was created. Use a fresh database.
+
+**`migrations complete (0 applied, 24 already present)`**
+The schema is already there. That is fine.
+
+**Port 4080 is in use**
+Set `NYST_PORT` to something else.
 
 ---
 
@@ -115,7 +202,7 @@ cp .env.example .env
 ```
 
 Fill in `DATABASE_URL`, `POSTGRES_PASSWORD`, `NYST_PUBLIC_ORIGIN`, and a signing
-identity (see below). Then:
+identity. Then:
 
 ```bash
 docker compose run --rm migrate
@@ -125,8 +212,6 @@ docker compose run --rm migrate
 docker compose up -d
 ```
 
-Nyst listens on `127.0.0.1:4080`.
-
 Generate a signing identity with:
 
 ```bash
@@ -134,140 +219,8 @@ node --experimental-strip-types scripts/genkeys.ts
 ```
 
 > **Not verified here.** Docker was not available on the machine this release
-> was built and tested on, so the image itself has never been built. The build
-> *context* was verified — see [VERIFICATION.md](VERIFICATION.md). Option A is
-> the path that has actually been run end to end.
-
----
-
-## Seeing it do something
-
-An empty Nyst is honest but dull: it says "No consequential actions yet",
-because there have not been any.
-
-### Seed a realistic environment
-
-```bash
-node --experimental-strip-types scripts/seedDemo.ts
-```
-
-This creates an organization, two Agents, a policy, Shadow findings, a Canary
-rule, five real controlled actions including genuine ambiguity, an open human
-review, and a consequence budget.
-
-Everything goes through the **real** product surfaces — the runtime, the
-repository, the admission gate. Nothing is inserted into a metrics table, and
-no outcome is hardcoded. Sign in with:
-
-| Field | Value |
-| --- | --- |
-| Organization | `northwind` |
-| Email | `ops@northwind.test` |
-| Password | `Nyst design partner demo 2026!` |
-
-### Watch the whole thesis run
-
-```bash
-node --experimental-strip-types scripts/acceptanceDemo.ts
-```
-
-Set `NYST_DEMO_PASSWORD` first. It drives the complete loop over HTTP — connect
-an Agent, Shadow, Protection Report, policy, Canary, Enforced, an ambiguous
-action, refused retry, authoritative observation, signed receipt, Proof Pack,
-Emergency Freeze, release — and **asserts every claim against what Nyst reports
-back**, exiting non-zero on the first one it cannot substantiate.
-
-### Break things on purpose
-
-**Failure Lab** in the sidebar (available in Shadow or Demo environments) runs
-seeded fault scenarios — response lost after the effect applied, transport
-timeout, eventual consistency — through the real engine, and shows the
-EffectState and ControlDecision each one produces.
-
-It runs with a secret provider that resolves *nothing*, so a simulation is
-structurally incapable of touching a real system.
-
----
-
-## Running the tests
-
-Use a **separate** database for tests:
-
-```bash
-createdb nyst_test
-```
-
-```bash
-DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst_test' npm test
-```
-
-Expect **658 passing, 0 failing, 0 skipped**, in about 40 seconds.
-
-The integration tests are real: they run against PostgreSQL and create their
-own tenants. Pointing them at the database you signed in to is harmless to your
-data, but it leaves test organizations behind — and first-boot bootstrap only
-runs on an **empty** Nyst, so a database that has had the tests run against it
-will not create your admin user. If your login is rejected on a database you
-just created, this is almost certainly why.
-
-```bash
-npm run typecheck
-```
-
----
-
-## Where to look first
-
-| | |
-| --- | --- |
-| **Overview** | Whether Nyst is evaluating, controlling or protecting — and it will not say "protecting" until it has actually prevented something |
-| **Needs Attention** | Everything a person has to decide |
-| **Actions** | Every consequential action, its EffectState, and the evidence behind it |
-| **Protection** | Enforced and Shadow reported in separate columns, never summed |
-| **Failure Lab** | Ambiguity on demand |
-
-Click any action to see the current explanation with the evidence it cites, the
-full resolution history, and the signed receipt.
-
----
-
-## If something goes wrong
-
-**"Those credentials were not accepted."**
-Two likely causes. The Organization field wants the **slug** (`acme`), not the
-display name. Or the database was not empty when Nyst first started — the
-bootstrap admin user is created only on a genuinely fresh Nyst, so if you ran
-`npm test` against this database first, drop it, recreate it, migrate, and
-start again.
-
-**Nyst will not start, and prints a list of problems.**
-That is deliberate. Production startup fails closed rather than warning and
-continuing, because a misconfigured Nyst accepts consequential actions and then
-cannot resolve them. Each line says exactly what to change.
-
-**`DATABASE_URL is required`**
-It is not set in the shell you are actually running in. On Windows, `$env:VAR`
-does not persist across separate terminal windows.
-
-**Port 4080 is in use.**
-Set `NYST_PORT` to something else.
-
-**The Failure Lab shows no form.**
-It is isolated to Shadow and Demo environments so a simulation can never be
-mistaken for production protection. The page states the current mode. Switch
-the environment to Shadow in **Settings**.
-
-**Everything reads zero.**
-There have been no consequential actions yet. Run the demo seed above.
-
----
-
-## Read next
-
-| | |
-| --- | --- |
-| [README.md](README.md) | What Nyst is, and how it differs from retry, idempotency and durable execution |
-| [VERIFICATION.md](VERIFICATION.md) | What was verified for this release, and what was not |
-| [docs/product/known-boundaries.md](docs/product/known-boundaries.md) | What Nyst does not do. Read before relying on it |
-| [docs/product/design-partner-guide.md](docs/product/design-partner-guide.md) | The full path to a protected production workload |
-| [SECURITY.md](SECURITY.md) | The security model, including its weaknesses |
+> was built on, so the image itself has never been built. The build *context*
+> and the production dependency closure were verified — see
+> [VERIFICATION.md](VERIFICATION.md). **Option A is the path that has actually
+> been run end to end**, including a clean-room extract, install, migrate,
+> full test run, start and sign-in.
