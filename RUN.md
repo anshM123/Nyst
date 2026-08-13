@@ -41,11 +41,18 @@ createdb nyst_test
 
 ## 3. Apply the schema
 
+**Both databases need it.** `npm run migrate` only touches the one
+`DATABASE_URL` points at, so run it twice.
+
 **macOS / Linux**
 
 ```bash
 export DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst'
 npm run migrate
+```
+
+```bash
+DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst_test' npm run migrate
 ```
 
 **Windows PowerShell**
@@ -55,7 +62,12 @@ $env:DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst'
 npm run migrate
 ```
 
-You should see **24 migrations** apply and `migrations complete`.
+```powershell
+$env:DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst_test'; npm run migrate
+$env:DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst'
+```
+
+You should see **24 migrations** apply and `migrations complete`, each time.
 
 ## 4. Start Nyst
 
@@ -171,6 +183,9 @@ $env:DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/nyst_test'; npm test
 
 Expect **851 passing, 0 failing, 0 skipped**, in about 45 seconds.
 
+If you see a large number of failures immediately, the test database almost
+certainly has no schema — run `npm run migrate` against it first (step 3).
+
 ---
 
 ## If something goes wrong
@@ -187,6 +202,11 @@ ran the tests on, no admin user was created. Use a fresh database.
 
 **`migrations complete (0 applied, 24 already present)`**
 The schema is already there. That is fine.
+
+**Hundreds of test failures at once**
+The test database has no schema. `npm run migrate` applies it to whichever
+database `DATABASE_URL` names, and the tests use a different one from the
+server — so it needs migrating too.
 
 **Port 4080 is in use**
 Set `NYST_PORT` to something else.
