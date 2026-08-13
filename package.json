@@ -23,7 +23,7 @@
   "scripts": {
     "build": "tsc -p packages/sdk/tsconfig.json && tsc -p tsconfig.json",
     "typecheck": "tsc -p packages/sdk/tsconfig.json && tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test \"dist/tests/*.test.js\"",
+    "test": "npm run build && node --test --test-concurrency=4 \"dist/tests/*.test.js\"",
     "test:github:live": "npm run build && node --experimental-strip-types scripts/verifyGitHubLive.ts",
     "test:github:gate4-live": "npm run build && node --experimental-strip-types scripts/verifyGitHubGate4Live.ts",
     "test:okta:gate5-live": "npm run build && node --experimental-strip-types scripts/verifyOktaGate5Live.ts",

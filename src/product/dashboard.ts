@@ -39,12 +39,17 @@ export interface ShellContext {
 const NAV = [
   ["/", "Overview"],
   ["/needs-attention", "Needs Attention"],
+  // Outcomes sits above Actions on purpose. What became true in the world is
+  // the question the customer actually has; the individual operations are how
+  // Nyst got there.
+  ["/outcomes", "Outcomes"],
   ["/agents", "Agents"],
   ["/actions", "Actions"],
   ["/protection", "Protection"],
 ] as const;
 
 const NAV_CONFIGURE = [
+  ["/autonomy", "Autonomy Line"],
   ["/policies", "Policies"],
   ["/effect-registry", "Effect Registry"],
   ["/failure-lab", "Failure Lab"],
@@ -943,6 +948,17 @@ export function offboardingPage(runs: readonly Record<string, unknown>[], contex
       <td>${escape(String(run.blocking_reason ?? "—"))}</td>
       <td class="small">${escape(String(run.created_at ?? ""))}</td>
     </tr>`).join("")}</tbody></table></div>` : `<div class="panel panel-pad"><p class="empty">No offboarding runs. Nothing is fabricated for this environment — Nyst shows only runs it actually recorded.</p></div>`}`, context);
+}
+
+/**
+ * Render an arbitrary body inside the product shell.
+ *
+ * Exported so surfaces that live in their own modules (the Outcome and
+ * Authority views) get the same navigation, freeze banner and context switcher
+ * as everything else, without dashboard.ts having to know about them.
+ */
+export function shellPage(title: string, current: string, body: string, context: ShellContext = {}): string {
+  return shell(title, current, body, context);
 }
 
 export function genericPage(title: string, message: string): string {

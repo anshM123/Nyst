@@ -286,9 +286,24 @@ describe("Nyst v0.2.2 Phase 1 correctness", { skip: databaseUrl ? false : "DATAB
     const observed: string[] = [];
     const workers = Array.from({ length: 10 }, () => new NystReobservationWorker(repository, {
       async reconcile(actionId) { observed.push(actionId); return runtime.reconcile(actionId); },
-    }, { environment_id: tenant.environment_id }));
+    }, {
+      environment_id: tenant.environment_id,
+      // A lease long enough that it CANNOT expire while these ten workers race.
+      //
+      // This test is about mutual exclusion between concurrent claimants, and
+      // the default 30-second lease made it about something else as well: on a
+      // loaded machine one worker's lease could expire mid-observation, a
+      // second worker would legitimately reclaim, and the job would be observed
+      // twice. That second observation is CORRECT — re-observation is
+      // read-only, so reclaim is always safe, and the worker documents exactly
+      // that. Lease expiry and reclaim are proven separately in "1G: a crashed
+      // read-only re-observation claim is reclaimable"; conflating the two here
+      // produced a test that failed for a reason that was not a defect.
+      leaseMs: 600_000,
+    }));
     await Promise.all(workers.map((worker) => worker.runOne()));
-    assert.equal(observed.filter((id) => id === committed.action_id).length, 1, "this job must be observed exactly once no matter how many workers race");
+    assert.equal(observed.filter((id) => id === committed.action_id).length, 1,
+      "ten workers racing for one claim, with a lease that cannot expire, must yield exactly one observation");
     const job = (await pool.query(`SELECT status,attempt FROM nyst_reobservation_jobs WHERE human_review_id=$1`, [review.human_review_id])).rows[0]!;
     assert.equal(job.status, "completed");
     assert.equal(Number(job.attempt), 1, "ten racing workers must produce exactly one attempt");

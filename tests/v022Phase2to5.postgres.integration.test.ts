@@ -309,8 +309,19 @@ describe("Nyst v0.2.2 Phases 2-5", { skip: databaseUrl ? false : "DATABASE_URL n
     await repository.authorizeRecovery(tenant, actionId, latest.resolution_id, "authorized_continuation");
     const registry = new RecoveryExecutorRegistry();
     registry.register(effect, "authorized_continuation", async () => ({ outcome: "completed" }));
-    assert.equal(await new NystRecoveryWorker(repository, registry, { environment_id: tenant.environment_id }).runOne(), true);
-    assert.equal((await pool.query(`SELECT status FROM nyst_recovery_executions WHERE action_id=$1`, [actionId])).rows[0]!.status, "completed");
+    // The worker claims whatever is claimable in this environment, and earlier
+    // tests in this file leave recoveries here whose leases can lapse while the
+    // suite is under load. Drain until THIS recovery is the one that completed,
+    // rather than assuming the first claim happens to be ours — the property
+    // under test is "the product moves a recovery through its legal
+    // transitions", not "it picks mine first".
+    const worker = new NystRecoveryWorker(repository, registry, { environment_id: tenant.environment_id });
+    let status = "";
+    for (let attempt = 0; attempt < 20 && status !== "completed"; attempt += 1) {
+      if (!(await worker.runOne())) break;
+      status = String((await pool.query(`SELECT status FROM nyst_recovery_executions WHERE action_id=$1`, [actionId])).rows[0]?.status ?? "");
+    }
+    assert.equal(status, "completed", "the recovery never reached completed through the worker");
 
     const reviewAction = await commit(`p5-legal-review-${suffix}`, "transport_timeout");
     const review = await repository.openHumanReview(tenant, reviewAction, "legal transition");

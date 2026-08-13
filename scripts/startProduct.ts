@@ -95,6 +95,12 @@ const app = await buildProductServer({
   production: config.production, secrets, trust_proxy: config.trust_proxy,
   verify_receipt: (value) => verifyResolution(signer, value as never),
   commit: product.commit, integration_preflight: preflight, structured_log: structuredLog,
+  // The OUTCOME and AUTHORITY layers. Both read and write through the same
+  // pool, so a single deployment answers all three questions: what may this
+  // Agent do, what happened to the operation, and what became true.
+  outcomes: new OutcomeRepository(pool),
+  authority: new AuthorityRepository(pool),
+  signer,
 });
 
 // In development a single process runs everything so `npm run start:product`

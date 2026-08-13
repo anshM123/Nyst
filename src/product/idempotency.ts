@@ -44,6 +44,18 @@ export const IDEMPOTENT_OPERATIONS = [
   "integration.configure",
   "effect_spec.configure",
   "blast_radius.configure",
+  // v0.3.0. Every one of these is a mutation a browser can double-submit, and
+  // several of them create durable authority. Backend safety must not depend
+  // on a disabled button.
+  "outcome_contract.create",
+  "outcome.open",
+  "outcome.evaluate",
+  "outcome.receipt",
+  "autonomy_rule.create",
+  "authority_exception.create",
+  "authority_exception.revoke",
+  "continuation_grant.issue",
+  "capability.attest",
 ] as const;
 
 export type IdempotentOperation = (typeof IDEMPOTENT_OPERATIONS)[number];

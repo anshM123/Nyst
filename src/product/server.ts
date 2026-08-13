@@ -18,6 +18,11 @@ import { protectionReportCsv } from "./protectionReport.js";
 import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
 import { authoritativeConsequenceMetadata } from "./effectSemantics.js";
+import { shellPage } from "./dashboard.js";
+import { autonomyPage, outcomePage, outcomesPage } from "./outcomeViews.js";
+import { subjectReferences as subjectReferencesFor } from "./outcome/outcomeRepository.js";
+import type { OutcomeRepository } from "./outcome/outcomeRepository.js";
+import type { AuthorityRepository } from "./authority/authorityRepository.js";
 import { sanitizeForProduct } from "./sanitize.js";
 import type { EffectSpecDescriptor, ProductCommitter, ProductContext, ProductPrincipal } from "./types.js";
 import type { InMemoryOperationalMetrics } from "./scheduler.js";
@@ -88,6 +93,12 @@ export interface ProductServerOptions {
    * come from the proxy and shares one rate-limit bucket.
    */
   trust_proxy?: boolean;
+  /** The OUTCOME layer. Optional so an atomic-only deployment still runs. */
+  outcomes?: OutcomeRepository;
+  /** The AUTHORITY layer. */
+  authority?: AuthorityRepository;
+  /** Signs Outcome Receipts and ContinuationGrants. */
+  signer?: { sign(content: unknown): { key_id: string; signature_b64: string; algorithm: "ed25519"; canonicalization: "ojc-1" }; verify(content: unknown, sig: { key_id: string; signature_b64: string; algorithm: "ed25519"; canonicalization: "ojc-1" }): boolean };
 }
 
 export async function buildProductServer(options: ProductServerOptions): Promise<FastifyInstance> {
@@ -240,6 +251,206 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     const readiness = options.secrets ? await options.repository.integrationsReadiness(principal, options.secrets) : [];
     return integrationsPage(readiness as unknown as Record<string, unknown>[], await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true, options.secrets ?? null), await pageContext(principal));
   }, options.repository));
+  /* ---------------- OUTCOMES (Phases 18-32) ---------------- */
+
+  app.get("/outcomes", pageHandler(async (principal) => {
+    if (!options.outcomes) return genericPage("Outcomes", "The Outcome layer is not enabled in this deployment.");
+    return shellPage("Outcomes", "/outcomes",
+      outcomesPage(
+        await outcomeListView(options.outcomes, principal),
+        (await options.outcomes.contracts(principal)) as unknown as Record<string, unknown>[]),
+      await pageContext(principal));
+  }, options.repository));
+
+  app.get("/outcomes/:id", pageHandler(async (principal, request) => {
+    if (!options.outcomes) return genericPage("Outcome", "The Outcome layer is not enabled in this deployment.");
+    const view = await outcomeDetailView(options, principal, routeId(request));
+    if (!view) return genericPage("Not found", "That outcome does not exist in this environment.");
+    return shellPage("Outcome", "/outcomes", outcomePage(view), await pageContext(principal));
+  }, options.repository));
+
+  app.get("/autonomy", pageHandler(async (principal) => {
+    if (!options.authority) return genericPage("Autonomy Line", "The Authority layer is not enabled in this deployment.");
+    return shellPage("Autonomy Line", "/autonomy",
+      autonomyPage(
+        (await options.authority.autonomyRules(principal)) as unknown as Record<string, unknown>[],
+        await options.authority.decisions(principal, 20)),
+      await pageContext(principal));
+  }, options.repository));
+
+  app.get("/v1/outcomes", api(async (principal) => {
+    requireScope(principal, "actions:read");
+    return requireOutcomes(options).instances(principal);
+  }, options.repository));
+
+  app.get("/v1/outcomes/:id", api(async (principal, request, reply) => {
+    requireScope(principal, "actions:read");
+    const instance = await requireOutcomes(options).instance(principal, routeId(request));
+    return instance === null ? notFound(reply, request) : instance;
+  }, options.repository));
+
+  app.get("/v1/outcomes/:id/evaluations", api(async (principal, request) => {
+    requireScope(principal, "actions:read");
+    return requireOutcomes(options).evaluations(principal, routeId(request));
+  }, options.repository));
+
+  app.get("/v1/outcomes/:id/receipt", api(async (principal, request, reply) => {
+    requireScope(principal, "receipts:read");
+    const receipt = await requireOutcomes(options).receipt(principal, routeId(request));
+    return receipt === null ? notFound(reply, request) : receipt;
+  }, options.repository));
+
+  app.get("/v1/outcome-contracts", api(async (principal) => {
+    requireAnyScope(principal, ["actions:read", "integrations:read"]);
+    return requireOutcomes(options).contracts(principal);
+  }, options.repository));
+
+  app.post("/v1/outcome-contracts", api(async (principal, request) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const body = object(request.body);
+    const idempotent = await options.repository.idempotent(principal, "outcome_contract.create", idempotencyKey(request), body,
+      async () => requireOutcomes(options).createContractFromPack(principal, principal.user_id!, string(body.outcome_spec, 80), {
+        modules: body.modules === undefined ? [] : strings(body.modules, 10),
+        agent_id: body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36),
+      }));
+    return idempotent.value;
+  }, options.repository));
+
+  app.post("/v1/outcome-contracts/:id/activate", api(async (principal, request, reply) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const activated = await requireOutcomes(options).activateContract(principal, routeId(request));
+    return activated ? { activated: true } : notFound(reply, request);
+  }, options.repository));
+
+  app.post("/v1/outcomes", api(async (principal, request) => {
+    requireScope(principal, "actions:write"); requireCsrf(request, principal);
+    const body = object(request.body);
+    const idempotent = await options.repository.idempotent(principal, "outcome.open", idempotencyKey(request), body,
+      async () => requireOutcomes(options).openInstance(principal, {
+        outcome_contract_id: string(body.outcome_contract_id, 36),
+        agent_id: await options.repository.resolveActingAgent(principal, body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36)),
+        subject: object(body.subject),
+        subject_key: string(body.subject_key, 400),
+        mode: (await options.repository.environmentControl(principal)).mode,
+      }));
+    return idempotent.value;
+  }, options.repository));
+
+  app.post("/v1/outcomes/:id/evaluate", api(async (principal, request) => {
+    requireScope(principal, "actions:write"); requireCsrf(request, principal);
+    const capabilities = options.secrets
+      ? (await options.repository.integrationsReadiness(principal, options.secrets))
+          .flatMap((item) => (item.capability_manifest?.capabilities ?? [])
+            .filter((capability) => capability.state === "verified" || capability.state === "authorized")
+            .map((capability) => capability.capability))
+      : [];
+    return requireOutcomes(options).evaluate(principal, routeId(request), { held_capabilities: capabilities });
+  }, options.repository));
+
+  app.post("/v1/outcomes/:id/receipt", api(async (principal, request) => {
+    requireScope(principal, "actions:write"); requireCsrf(request, principal);
+    if (!options.signer) throw Object.assign(new Error("No signing identity is configured"), { statusCode: 503 });
+    return requireOutcomes(options).issueReceipt(principal, routeId(request), options.signer as never);
+  }, options.repository));
+
+  /** Record an observation of the world. Never a consequence, always a read. */
+  app.post("/v1/world-facts", api(async (principal, request) => {
+    requireScope(principal, "actions:write"); requireCsrf(request, principal);
+    const body = object(request.body);
+    return requireOutcomes(options).recordFact(principal, {
+      subject_ref: string(body.subject_ref, 400),
+      provider: string(body.provider, 60),
+      property: string(body.property, 80),
+      value: object(body.value) as never,
+      observed_at: string(body.observed_at, 40),
+      fresh_until: string(body.fresh_until, 40),
+      source_type: string(body.source_type, 40) as never,
+      authoritative: body.authoritative === true,
+      adapter_version: string(body.adapter_version, 80),
+    });
+  }, options.repository));
+
+  /* ---------------- AUTHORITY (Phases 28-31) ---------------- */
+
+  app.get("/v1/autonomy-rules", api(async (principal) => {
+    requireAnyScope(principal, ["actions:read", "integrations:read"]);
+    return requireAuthority(options).autonomyRules(principal);
+  }, options.repository));
+
+  app.post("/v1/autonomy-rules", api(async (principal, request) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const body = object(request.body);
+    const disposition = string(body.disposition, 20);
+    if (disposition !== "autonomous" && disposition !== "human" && disposition !== "disabled") {
+      throw Object.assign(new Error("An Autonomy Line disposition is autonomous, human or disabled. There is no score."), { statusCode: 400 });
+    }
+    const idempotent = await options.repository.idempotent(principal, "autonomy_rule.create", idempotencyKey(request), body,
+      async () => requireAuthority(options).createAutonomyRule(principal, principal.user_id!, {
+        agent_id: body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36),
+        effect_name: body.effect_name === undefined || body.effect_name === null ? null : string(body.effect_name, 200),
+        outcome_spec: body.outcome_spec === undefined || body.outcome_spec === null ? null : string(body.outcome_spec, 80),
+        max_amount_minor: optionalInteger(body.max_amount_minor),
+        currency: body.currency === undefined || body.currency === null ? null : string(body.currency, 3),
+        max_actions_per_window: optionalInteger(body.max_actions_per_window),
+        max_amount_minor_per_window: optionalInteger(body.max_amount_minor_per_window),
+        window_seconds: optionalInteger(body.window_seconds),
+        requires_reversible: body.requires_reversible === true,
+        requires_no_open_incident: body.requires_no_open_incident === true,
+        requires_outcome_satisfied: body.requires_outcome_satisfied === undefined || body.requires_outcome_satisfied === null
+          ? null : string(body.requires_outcome_satisfied, 80),
+        disposition, rationale: string(body.rationale, 1000),
+      }));
+    return idempotent.value;
+  }, options.repository));
+
+  app.get("/v1/authority-exceptions", api(async (principal) => {
+    requireAnyScope(principal, ["actions:read", "integrations:read"]);
+    return requireAuthority(options).exceptionHistory(principal);
+  }, options.repository));
+
+  app.post("/v1/authority-exceptions", api(async (principal, request) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const body = object(request.body);
+    const idempotent = await options.repository.idempotent(principal, "authority_exception.create", idempotencyKey(request), body,
+      async () => requireAuthority(options).createException(principal, principal.user_id!, {
+        kind: string(body.kind, 40) as never,
+        agent_id: body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36),
+        effect_name: body.effect_name === undefined || body.effect_name === null ? null : string(body.effect_name, 200),
+        outcome_instance_id: body.outcome_instance_id === undefined || body.outcome_instance_id === null ? null : string(body.outcome_instance_id, 36),
+        authorizes: string(body.authorizes, 60) as never,
+        max_amount_minor: optionalInteger(body.max_amount_minor),
+        currency: body.currency === undefined || body.currency === null ? null : string(body.currency, 3),
+        actor_role: string(body.actor_role, 120),
+        reason: string(body.reason, 1000),
+        reference: body.reference === undefined || body.reference === null ? null : string(body.reference, 200),
+        expires_in_seconds: Number(body.expires_in_seconds ?? 0),
+      }));
+    return idempotent.value;
+  }, options.repository));
+
+  app.post("/v1/authority-exceptions/:id/revoke", api(async (principal, request, reply) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const revoked = await requireAuthority(options).revokeException(principal, principal.user_id!, routeId(request),
+      string(object(request.body).reason, 500));
+    return revoked ? { revoked: true } : notFound(reply, request);
+  }, options.repository));
+
+  app.post("/v1/continuation-grants", api(async (principal, request) => {
+    requireScope(principal, "actions:write"); requireCsrf(request, principal);
+    if (!options.signer) throw Object.assign(new Error("No signing identity is configured"), { statusCode: 503 });
+    const body = object(request.body);
+    const idempotent = await options.repository.idempotent(principal, "continuation_grant.issue", idempotencyKey(request), body,
+      async () => requireAuthority(options).issueGrant(principal, {
+        agent_id: body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36),
+        outcome_instance_id: string(body.outcome_instance_id, 36),
+        permitted_effects: strings(body.permitted_effects, 20),
+        resource_scope: strings(body.resource_scope, 50),
+        expires_in_seconds: Number(body.expires_in_seconds ?? 600),
+        exception_id: body.exception_id === undefined || body.exception_id === null ? null : string(body.exception_id, 36),
+      }, options.signer as never));
+    return idempotent.value;
+  }, options.repository));
+
   app.get("/demo", pageHandler(async (principal) => failureLabPage(await options.repository.failureLabRuns(principal), await options.repository.environmentControl(principal), await pageContext(principal)), options.repository));
   app.get("/evidence", pageHandler(async (principal) => actionsPage(await options.repository.listActions(principal), "Evidence", {}, await pageContext(principal)), options.repository));
   app.get("/offboarding", pageHandler(async (principal) => offboardingPage(await options.repository.offboardingRuns(principal), await pageContext(principal)), options.repository));
@@ -427,6 +638,62 @@ function integrationProvider(request:{params:unknown}):"github"|"okta"|"stripe"{
   if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});
   return provider;
 }
+function requireOutcomes(options: ProductServerOptions): OutcomeRepository {
+  if (!options.outcomes) throw Object.assign(new Error("The Outcome layer is not enabled in this deployment"), { statusCode: 503 });
+  return options.outcomes;
+}
+function requireAuthority(options: ProductServerOptions): AuthorityRepository {
+  if (!options.authority) throw Object.assign(new Error("The Authority layer is not enabled in this deployment"), { statusCode: 503 });
+  return options.authority;
+}
+
+/** The outcome list, joined with the spec each instance's contract names. */
+async function outcomeListView(outcomes: OutcomeRepository, principal: ProductPrincipal): Promise<Record<string, unknown>[]> {
+  const [instances, contracts] = await Promise.all([outcomes.instances(principal), outcomes.contracts(principal)]);
+  const byId = new Map(contracts.map((contract) => [contract.outcome_contract_id, contract]));
+  return instances.map((instance) => ({
+    ...instance,
+    outcome_spec: byId.get(instance.outcome_contract_id)?.outcome_spec ?? "",
+  })) as unknown as Record<string, unknown>[];
+}
+
+/** Everything one outcome page needs, gathered once. */
+async function outcomeDetailView(
+  options: ProductServerOptions, principal: ProductPrincipal, instanceId: string,
+): Promise<Parameters<typeof outcomePage>[0] | null> {
+  const outcomes = options.outcomes!;
+  const instance = await outcomes.instance(principal, instanceId);
+  if (!instance) return null;
+  const contract = await outcomes.contract(principal, instance.outcome_contract_id);
+  if (!contract) return null;
+  const [evaluations, linked, receipt] = await Promise.all([
+    outcomes.evaluations(principal, instanceId),
+    outcomes.linkedActions(instanceId),
+    outcomes.receipt(principal, instanceId),
+  ]);
+  const actions = await Promise.all(linked.map(async (link) => {
+    const detail = await options.repository.actionDetail(principal, link.action_id);
+    const resolutions = await options.repository.resolutions(principal, link.action_id);
+    const latest = (resolutions ?? [])[0] as { effect_state?: unknown } | undefined;
+    return { ...link, effect_state: latest?.effect_state ?? detail?.lifecycle_state ?? "unknown" };
+  }));
+  const subjectRefs = Object.values(subjectReferencesFor(instance.subject));
+  const facts = subjectRefs.length ? await outcomes.currentFacts(principal, subjectRefs) : [];
+  const exceptions = options.authority
+    ? await options.authority.liveExceptions(principal, { outcome_instance_id: instanceId })
+    : [];
+  return {
+    instance: instance as unknown as Record<string, unknown>,
+    contract: contract as unknown as Record<string, unknown>,
+    evaluation: (evaluations[0] ?? null) as Record<string, unknown> | null,
+    actions: actions as unknown as Record<string, unknown>[],
+    facts: facts as unknown as Record<string, unknown>[],
+    receipt,
+    exceptions: exceptions as unknown as Record<string, unknown>[],
+    grants: [],
+  };
+}
+
 function withCredentialReference(value: unknown, credentialRef: string | null): unknown { if (credentialRef===null) return value; const input=object(value); return { ...input, credential_ref: credentialRef }; }
 function contextSwitcher(context:ProductContext):string{if(context.projects.length===1&&context.projects[0]?.environments.length===1)return "";const esc=(value:string)=>value.replace(/[&<>\"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'\"':"&quot;","'":"&#39;"})[c]!);const projects=context.projects.map(project=>`<option value="${esc(project.project_id)}"${project.project_id===context.selected_project_id?" selected":""}>${esc(project.project_name)}</option>`).join("");const safeJson=JSON.stringify(context).replace(/</g,"\\u003c");return `<section class="context-switcher" aria-label="Project and environment context"><label>Project<select id="nyst-project-context">${projects}</select></label><label>Environment<select id="nyst-environment-context"></select></label><script type="application/json" id="nyst-context-data">${safeJson}</script></section>`;}
 async function registryView(repository:ProductRepository,principal:ProductPrincipal,descriptors:readonly EffectSpecDescriptor[],production:boolean,secrets:SecretProvider|null):Promise<Record<string,unknown>[]>{return repository.effectSpecStatuses(principal,descriptors,production,secrets)}

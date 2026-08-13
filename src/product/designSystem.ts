@@ -232,6 +232,21 @@ small, .small { font-size: .8rem; color: var(--ink-muted); }
 .incident.is-deep-linked { box-shadow: 0 0 0 3px var(--focus-soft, rgba(52,101,164,0.25)); }
 .incident:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 
+/* ============================================================ claims */
+/*
+ * The two-claim layout. "Every action succeeded" and "the outcome is not
+ * established" must be readable in one glance, side by side, in words — not as
+ * two colours a reader has to interpret.
+ */
+.split-claim { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.split-claim .claim h2 { font-size: 1.35rem; margin: 4px 0 8px; }
+.claim-ok { border-left: 4px solid var(--resolved); }
+.claim-alarm { border-left: 4px solid var(--blocked); }
+.claim-neutral { border-left: 4px solid var(--rule-strong); }
+.note-strong { border-left: 4px solid var(--uncertain); background: var(--uncertain-bg); }
+.state.unknown { color: var(--uncertain); background: var(--uncertain-bg); }
+@media (max-width: 800px) { .split-claim { grid-template-columns: 1fr; } }
+
 /* ============================================================ disclosure */
 /* Progressive disclosure for detail that would otherwise bury the summary. */
 details { border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; background: var(--cream-deep); }
