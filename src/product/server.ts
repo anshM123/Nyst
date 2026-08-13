@@ -19,7 +19,9 @@ import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
 import { authoritativeConsequenceMetadata } from "./effectSemantics.js";
 import { shellPage } from "./dashboard.js";
-import { autonomyPage, outcomePage, outcomesPage } from "./outcomeViews.js";
+import { autonomyPage, failureLab2Page, outcomePage, outcomesPage, shadowReportPage } from "./outcomeViews.js";
+import { OUTCOME_FAULTS, runNystBench, runOutcomeFault, type OutcomeFault } from "./outcome/failureLab2.js";
+import type { OutcomeShadow } from "./outcome/outcomeShadow.js";
 import { subjectReferences as subjectReferencesFor } from "./outcome/outcomeRepository.js";
 import type { OutcomeRepository } from "./outcome/outcomeRepository.js";
 import type { AuthorityRepository } from "./authority/authorityRepository.js";
@@ -97,6 +99,8 @@ export interface ProductServerOptions {
   outcomes?: OutcomeRepository;
   /** The AUTHORITY layer. */
   authority?: AuthorityRepository;
+  /** Outcome Shadow: independent evaluation of a customer's existing Agents. */
+  shadow?: OutcomeShadow;
   /** Signs Outcome Receipts and ContinuationGrants. */
   signer?: { sign(content: unknown): { key_id: string; signature_b64: string; algorithm: "ed25519"; canonicalization: "ojc-1" }; verify(content: unknown, sig: { key_id: string; signature_b64: string; algorithm: "ed25519"; canonicalization: "ojc-1" }): boolean };
 }
@@ -237,7 +241,6 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.get("/effect-specs", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository, principal, options.effect_specs, options.production === true, options.secrets ?? null), await pageContext(principal)), options.repository));
   app.get("/effect-registry", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository, principal, options.effect_specs, options.production === true, options.secrets ?? null), await pageContext(principal)), options.repository));
   app.get("/policies", pageHandler(async (principal) => policiesPage(await options.repository.policyHistory(principal), await pageContext(principal)), options.repository));
-  app.get("/failure-lab", pageHandler(async (principal) => failureLabPage(await options.repository.failureLabRuns(principal), await options.repository.environmentControl(principal), await pageContext(principal)), options.repository));
   app.get("/receipts", pageHandler(async (principal) => receiptsPage(await options.repository.listActions(principal), await pageContext(principal)), options.repository));
   app.get("/receipts/:id", pageHandler(async (principal, request, reply) => {
     const id = routeId(request);
@@ -449,6 +452,81 @@ export async function buildProductServer(options: ProductServerOptions): Promise
         exception_id: body.exception_id === undefined || body.exception_id === null ? null : string(body.exception_id, 36),
       }, options.signer as never));
     return idempotent.value;
+  }, options.repository));
+
+  /* ---------------- OUTCOME SHADOW (Phase 27) ---------------- */
+
+  app.get("/shadow", pageHandler(async (principal) => {
+    if (!options.shadow) return genericPage("Outcome Shadow", "Outcome Shadow is not enabled in this deployment.");
+    const [metrics, findings, headline] = await Promise.all([
+      options.shadow.metrics(principal), options.shadow.findings(principal), options.shadow.headline(principal),
+    ]);
+    return shellPage("Outcome Shadow", "/shadow", shadowReportPage(metrics, findings, headline), await pageContext(principal));
+  }, options.repository));
+
+  app.get("/v1/shadow/metrics", api(async (principal) => {
+    requireScope(principal, "actions:read");
+    if (!options.shadow) throw Object.assign(new Error("Outcome Shadow is not enabled"), { statusCode: 503 });
+    return options.shadow.metrics(principal);
+  }, options.repository));
+
+  app.get("/v1/shadow/findings", api(async (principal) => {
+    requireScope(principal, "actions:read");
+    if (!options.shadow) throw Object.assign(new Error("Outcome Shadow is not enabled"), { statusCode: 503 });
+    return options.shadow.findings(principal);
+  }, options.repository));
+
+  /**
+   * An Agent telling Nyst it considers a workflow finished.
+   *
+   * Recorded as the Agent's CLAIM. It never moves a verdict — the value of the
+   * feature is precisely the distance between this and what Nyst observed.
+   */
+  app.post("/v1/shadow/completion-signals", api(async (principal, request) => {
+    requireScope(principal, "actions:write"); requireCsrf(request, principal);
+    if (!options.shadow) throw Object.assign(new Error("Outcome Shadow is not enabled"), { statusCode: 503 });
+    const body = object(request.body);
+    const status = string(body.declared_status, 20);
+    if (status !== "complete" && status !== "failed" && status !== "abandoned") {
+      throw Object.assign(new Error("declared_status must be complete, failed or abandoned"), { statusCode: 400 });
+    }
+    return options.shadow.recordCompletionSignal(principal, {
+      outcome_instance_id: string(body.outcome_instance_id, 36),
+      agent_id: await options.repository.resolveActingAgent(principal, body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36)),
+      declared_status: status,
+    });
+  }, options.repository));
+
+  /* ---------------- FAILURE LAB 2.0 / NYSTBENCH (Phases 33-34) ---------------- */
+
+  /**
+   * Failure Lab, both modes on one page.
+   *
+   * ATOMIC failures ask "what happened to this operation?"; OUTCOME failures
+   * ask "what became true?". The flagship case is the one where every atomic
+   * answer is correct and the outcome is still false, and a customer only sees
+   * that if both modes are in front of them together.
+   */
+  app.get("/failure-lab", pageHandler(async (principal) => shellPage("Failure Lab", "/failure-lab",
+    failureLab2Page(OUTCOME_FAULTS, null, runNystBench(),
+      await options.repository.failureLabRuns(principal),
+      await options.repository.environmentControl(principal)),
+    await pageContext(principal)), options.repository));
+
+  app.post("/v1/failure-lab/outcome-runs", api(async (principal, request) => {
+    requireScope(principal, "actions:write"); requireCsrf(request, principal);
+    const fault = string(object(request.body).fault, 60);
+    if (!(OUTCOME_FAULTS as readonly string[]).includes(fault)) {
+      throw Object.assign(new Error("Unknown outcome fault"), { statusCode: 400 });
+    }
+    // Computed by the production evaluator. Nothing here is scripted, and
+    // nothing here contacts a provider.
+    return runOutcomeFault(fault as OutcomeFault, { seed: Number(object(request.body).seed ?? 1) });
+  }, options.repository));
+
+  app.get("/v1/nystbench", api(async (principal) => {
+    requireAnyScope(principal, ["actions:read", "integrations:read"]);
+    return runNystBench();
   }, options.repository));
 
   app.get("/demo", pageHandler(async (principal) => failureLabPage(await options.repository.failureLabRuns(principal), await options.repository.environmentControl(principal), await pageContext(principal)), options.repository));

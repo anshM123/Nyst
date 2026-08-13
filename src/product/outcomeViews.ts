@@ -18,6 +18,8 @@ import { escape } from "./dashboard.js";
 import { OUTCOME_VERDICT_DEFINITIONS, type OutcomeVerdict } from "./outcome/invariantEngine.js";
 import { AUTHORITY_DISPOSITION_DEFINITIONS } from "./authority/canonicalAuthority.js";
 import { AUTONOMY_DISPOSITION_DEFINITIONS } from "./authority/autonomyLine.js";
+import { SHADOW_FINDING_DEFINITIONS, humanDuration, type ShadowFinding, type ShadowMetrics } from "./outcome/outcomeShadow.js";
+import { NYSTBENCH_LABEL, OUTCOME_FAULT_CATALOGUE, type BenchmarkResult, type LabRunResult, type OutcomeFault } from "./outcome/failureLab2.js";
 
 interface InvariantView {
   invariant_id: string;
@@ -301,4 +303,167 @@ function describeBounds(rule: Record<string, unknown>): string {
   if (rule.requires_no_open_incident) parts.push("suspended while an incident is open");
   if (rule.requires_outcome_satisfied) parts.push(`requires ${String(rule.requires_outcome_satisfied)} satisfied`);
   return parts.length ? parts.join(" · ") : "no additional bounds";
+}
+
+
+/**
+ * THE OUTCOME SHADOW REPORT.
+ *
+ * The screen a prospect is shown after a week of Shadow. Every number on it is
+ * counterfactual, and the page says so at the top rather than in a footnote —
+ * because a customer who later discovers Nyst was never in the path will stop
+ * believing the rest of the product too.
+ */
+export function shadowReportPage(metrics: ShadowMetrics, findings: readonly ShadowFinding[], headline: string | null): string {
+  return `<div class="page-head">
+    <p class="eyebrow">Observation only</p>
+    <h1>Outcome Shadow</h1>
+    <p class="lede">Nyst is watching your existing Agents and evaluating outcomes independently. It is not in the path: it has controlled nothing, held nothing and prevented nothing. Everything below is what Nyst <strong>observed</strong>, and what it <strong>would have done</strong> in Enforced.</p>
+  </div>
+
+  ${headline ? `<div class="panel panel-pad note-strong gap-below-l">
+    <p class="eyebrow">The finding</p>
+    <h2>${escape(headline)}</h2>
+  </div>` : ""}
+
+  <section class="section">
+    <div class="section-head"><div><p class="eyebrow">What Nyst observed</p><h2>Counterfactual measurements</h2></div></div>
+    <div class="metrics">
+      ${metric("Outcomes observed", metrics.outcomes_observed, "Every outcome Nyst evaluated while shadowing.")}
+      ${metric("Declared complete too early", metrics.outcomes_agent_declared_complete_too_early,
+        "Times an Agent reported a workflow finished while a required condition was still false.")}
+      ${metric("Unsafe continuation opportunities", metrics.unsafe_continuation_opportunities,
+        "Points where a dependent consequence could have proceeded on an outcome Nyst observed to be false. In Enforced, Nyst would have held these.")}
+      ${metric("Longest exposure", humanDuration(metrics.longest_exposure_seconds),
+        "The longest measured window between an Agent declaring completion and the outcome actually becoming true.")}
+      ${metric("Total exposure", humanDuration(metrics.total_exposure_seconds),
+        "Every such window added together.")}
+      ${metric("Temporarily indeterminate", metrics.outcomes_temporarily_indeterminate,
+        "Outcomes Nyst could not establish for a period. It does not know what was true during those windows.")}
+      ${metric("Established later", metrics.automatically_established_later,
+        "Outcomes that became true on their own afterwards. Nothing Nyst did caused that.")}
+      ${metric("Human review opportunities", metrics.human_review_opportunities,
+        "Points where Enforced would have asked a person.")}
+    </div>
+    <p class="note gap-m">${escape(metrics.disclaimer)}</p>
+  </section>
+
+  <section class="section">
+    <div class="section-head"><div><p class="eyebrow">Every gap, individually</p><h2>Findings</h2></div></div>
+    ${findings.length ? findings.map((finding) => `<div class="panel panel-pad gap-below-m">
+      <header class="split-top">
+        <div><h3>${escape(finding.kind.replace(/_/g, " "))}</h3>
+          ${finding.invariant_id ? `<p class="small mono">${escape(finding.invariant_id)}</p>` : ""}</div>
+        ${finding.exposure_seconds !== null
+          ? `<span class="badge uncertain">${escape(humanDuration(finding.exposure_seconds))}</span>`
+          : `<span class="badge neutral">open</span>`}
+      </header>
+      <p class="lede gap-s">${escape(finding.finding)}</p>
+      <p class="small">${escape(SHADOW_FINDING_DEFINITIONS[finding.kind])}</p>
+      <p class="small">Observed from ${escape(finding.observed_from)}${finding.observed_until ? ` until ${escape(finding.observed_until)}` : " — still open"}.</p>
+    </div>`).join("")
+      : `<div class="panel panel-pad"><p class="empty">Nyst has observed no gaps yet. Your Agents and Nyst agree on every outcome so far.</p></div>`}
+  </section>`;
+}
+
+function metric(label: string, value: string | number, definition: string): string {
+  return `<div class="metric"><dt>${escape(label)}</dt><dd>${escape(String(value))}</dd>
+    <p class="small">${escape(definition)}</p></div>`;
+}
+
+/**
+ * FAILURE LAB 2.0.
+ *
+ * A customer injects the failure themselves and watches what Nyst concludes.
+ * The verdict shown is computed by the production evaluator, not scripted —
+ * and the word SIMULATION appears before anything else on the page.
+ */
+export function failureLab2Page(
+  faults: readonly OutcomeFault[],
+  run: LabRunResult | null,
+  benchmark: BenchmarkResult | null,
+  atomicRuns: readonly Record<string, unknown>[] = [],
+  control: { mode?: unknown; is_demo?: unknown } = {},
+): string {
+  return `<div class="page-head">
+    <p class="eyebrow">Simulation</p>
+    <h1>Failure Lab</h1>
+    <p class="lede">Inject a real failure and watch what Nyst concludes. Every verdict below is computed by the same evaluator that runs in production. No provider is contacted, no credential is used, and nothing is mutated anywhere.</p>
+  </div>
+
+  <div class="panel panel-pad note-strong gap-below-l">
+    <p><strong>SIMULATION.</strong> Synthetic observations, evaluated by the real engine. Nothing on this page touched a live system.</p>
+  </div>
+
+  <section class="section">
+    <div class="section-head"><div><p class="eyebrow">Atomic failures</p><h2>What happened to the operation?</h2></div>
+      <p class="small">Environment mode: ${escape(String(control.mode ?? "unknown"))}${control.is_demo ? " (demo)" : ""}</p></div>
+    ${atomicRuns.length ? `<div class="table-scroll"><table>
+      <thead><tr><th scope="col">Scenario</th><th scope="col">Effect state</th><th scope="col">Nyst decision</th><th scope="col">Run at</th></tr></thead>
+      <tbody>${atomicRuns.map((atomic) => `<tr>
+        <td class="small">${escape(String(atomic.scenario ?? ""))}</td>
+        <td><span class="badge ${String(atomic.effect_state) === "verified" ? "resolved" : "uncertain"}">${escape(String(atomic.effect_state ?? ""))}</span></td>
+        <td class="small">${escape(String(atomic.primary_directive ?? atomic.control_decision ?? ""))}</td>
+        <td class="small">${escape(String(atomic.created_at ?? ""))}</td>
+      </tr>`).join("")}</tbody></table></div>`
+      : `<div class="panel panel-pad"><p class="empty">No atomic Failure Lab runs yet.</p></div>`}
+  </section>
+
+  <section class="section">
+    <div class="section-head"><div><p class="eyebrow">Outcome failures</p><h2>What became true?</h2></div></div>
+    <div class="table-scroll"><table>
+      <thead><tr><th scope="col">Fault</th><th scope="col">What happens</th>
+        <th scope="col">What most systems conclude</th><th scope="col">What Nyst concludes</th></tr></thead>
+      <tbody>${faults.map((fault) => {
+        const description = OUTCOME_FAULT_CATALOGUE[fault];
+        return `<tr>
+          <td><form method="post" action="/v1/failure-lab/outcome-runs" data-lab-outcome="${escape(fault)}">
+            <button type="submit" name="fault" value="${escape(fault)}">${escape(description.title)}</button></form></td>
+          <td class="small">${escape(description.what_happens)}</td>
+          <td class="small">${escape(description.naive_conclusion)}</td>
+          <td class="small">${escape(description.nyst_conclusion)}</td>
+        </tr>`;
+      }).join("")}</tbody></table></div>
+  </section>
+
+  ${run ? `<section class="section">
+    <div class="section-head"><div><p class="eyebrow">${escape(run.label)}</p><h2>${escape(run.description.title)}</h2></div>
+      <span class="badge ${run.evaluation.verdict === "satisfied" ? "resolved" : run.evaluation.verdict === "unsatisfied" ? "blocked" : "uncertain"}">${escape(run.evaluation.verdict)}</span></div>
+    <div class="panel panel-pad">
+      <ul class="checks">
+        ${run.evaluation.required.map((invariant) => `<li>
+          <span class="state ${invariant.result === "true" ? "pass" : invariant.result === "false" ? "fail" : "unknown"}">${invariant.result === "true" ? "Holds" : invariant.result === "false" ? "FALSE" : "Unknown"}</span>
+          <span class="body"><strong>${escape(invariant.statement)}</strong><span>${escape(invariant.reason)}</span></span></li>`).join("")}
+      </ul>
+      <p class="small gap-m">Coverage ${run.evaluation.coverage.numerator}/${run.evaluation.coverage.denominator}. Seed ${run.seed}, so this run is reproducible exactly.</p>
+    </div>
+  </section>` : ""}
+
+  ${benchmark ? `<section class="section">
+    <div class="section-head"><div><p class="eyebrow">${escape(benchmark.label)}</p><h2>NystBench</h2></div></div>
+    <div class="panel panel-pad">
+      <p class="small">${escape(benchmark.method.note)}</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th scope="col">Measurement</th><th scope="col">${escape(benchmark.method.baseline.name)}</th><th scope="col">${escape(benchmark.method.nyst.name)}</th></tr></thead>
+        <tbody>
+          ${benchRow("False success rate", benchmark.baseline.false_success_rate, benchmark.nyst.false_success_rate)}
+          ${benchRow("Unsafe continuation rate", benchmark.baseline.unsafe_continuation_rate, benchmark.nyst.unsafe_continuation_rate)}
+          ${benchRow("Duplicate effect rate", benchmark.baseline.duplicate_effect_rate, benchmark.nyst.duplicate_effect_rate)}
+          ${benchRow("False certainty rate", benchmark.baseline.false_certainty_rate, benchmark.nyst.false_certainty_rate)}
+          ${benchRow("Automatic resolution rate", benchmark.baseline.automatic_resolution_rate, benchmark.nyst.automatic_resolution_rate)}
+          ${benchRow("Human review rate", benchmark.baseline.human_review_rate, benchmark.nyst.human_review_rate)}
+        </tbody></table></div>
+      <dl class="facts gap-l">
+        <div><dt>How the baseline was modelled</dt><dd>${escape(benchmark.method.baseline.decision_rule)}</dd></div>
+        <div><dt>How Nyst decides</dt><dd>${escape(benchmark.method.nyst.decision_rule)}</dd></div>
+      </dl>
+      <p class="note">${escape(NYSTBENCH_LABEL)}. These numbers describe behaviour under ${benchmark.faults_run} injected failures and nothing else.</p>
+    </div>
+  </section>` : ""}`;
+}
+
+function benchRow(label: string, baseline: number, nyst: number): string {
+  return `<tr><td>${escape(label)}</td>
+    <td class="mono">${(baseline * 100).toFixed(1)}%</td>
+    <td class="mono">${(nyst * 100).toFixed(1)}%</td></tr>`;
 }

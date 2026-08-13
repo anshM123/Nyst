@@ -63,6 +63,7 @@ if (bootstrapScope && config.enable_development_fake) {
 }
 
 const metrics = new InMemoryOperationalMetrics();
+const outcomeRepository = new OutcomeRepository(pool);
 
 /**
  * Adapt the provider read-only preflight to the readiness probe contract.
@@ -98,8 +99,9 @@ const app = await buildProductServer({
   // The OUTCOME and AUTHORITY layers. Both read and write through the same
   // pool, so a single deployment answers all three questions: what may this
   // Agent do, what happened to the operation, and what became true.
-  outcomes: new OutcomeRepository(pool),
+  outcomes: outcomeRepository,
   authority: new AuthorityRepository(pool),
+  shadow: new OutcomeShadow(pool, outcomeRepository),
   signer,
 });
 

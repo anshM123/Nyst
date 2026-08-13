@@ -43,6 +43,7 @@ const NAV = [
   // the question the customer actually has; the individual operations are how
   // Nyst got there.
   ["/outcomes", "Outcomes"],
+  ["/shadow", "Outcome Shadow"],
   ["/agents", "Agents"],
   ["/actions", "Actions"],
   ["/protection", "Protection"],
