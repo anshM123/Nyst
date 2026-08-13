@@ -86,18 +86,6 @@ registerPublicRoutes(app, {
   },
 });
 
-/** Serve the brand assets the pages reference. */
-app.get("/brand/:asset", async (request, reply) => {
-  const asset = String((request.params as { asset?: unknown }).asset ?? "");
-  if (!["nyst-mark.png", "nyst-wordmark.png", "nyst-domain-wordmark.png", "favicon.png"].includes(asset)) {
-    return reply.code(404).send("not found");
-  }
-  const { readFileSync } = await import("node:fs");
-  const { join } = await import("node:path");
-  return reply.type("image/png").header("Cache-Control", "public, max-age=86400")
-    .send(readFileSync(join(process.cwd(), "public", "brand", asset)));
-});
-
 /**
  * Anything that is not part of the public site.
  *

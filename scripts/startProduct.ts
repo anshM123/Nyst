@@ -124,7 +124,46 @@ const app = await buildProductServer({
 
 // The public site shares the origin. It owns everything except "/", which the
 // product server handles so a signed-in operator lands on their dashboard.
-registerPublicRoutes(app, { mount_root: false });
+registerPublicRoutes(app, {
+  mount_root: false,
+  /**
+   * A real Shadow trial.
+   *
+   * The environment starts in SHADOW, which is what the plan says it is:
+   * Nyst observes and evaluates, and controls nothing. Moving to Canary or
+   * Enforced stays a deliberate, separate decision.
+   *
+   * A duplicate short name is reported as a duplicate short name. It is a
+   * public identifier — you type it to sign in — so saying it is taken leaks
+   * nothing, and pretending otherwise would just make people guess.
+   */
+  create_account: async (input) => {
+    try {
+      await repository.createBootstrap({
+        organization: input.organization,
+        organization_slug: input.organization_slug,
+        project: "Platform",
+        project_slug: "platform",
+        environment: "Shadow",
+        environment_slug: "shadow",
+        email: input.email,
+        display_name: input.display_name,
+        password: input.password,
+      });
+      structuredLog({ type: "signup_created", organization_slug: input.organization_slug });
+      return { ok: true as const };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      if (/duplicate key|unique/i.test(message)) {
+        return { ok: false as const, reason: `The short name "${input.organization_slug}" is already taken. Pick another.` };
+      }
+      // Anything else is ours, not theirs. Log it with detail; tell them
+      // something true and useful without a stack trace.
+      structuredLog({ type: "signup_failed", organization_slug: input.organization_slug, error: message.slice(0, 200) });
+      return { ok: false as const, reason: "Something went wrong creating the account. Nothing was created; please try again." };
+    }
+  },
+});
 
 // In development a single process runs everything so `npm run start:product`
 // is genuinely all you need. In production the workers are separate processes

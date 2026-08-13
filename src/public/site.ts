@@ -67,6 +67,7 @@ export function publicShell(title: string, current: string, body: string, option
       `<a href="${href}"${href === current ? ' aria-current="page"' : ""}>${escape(label)}</a>`).join("")}
   </nav>
   <div class="site-cta">
+    <a class="site-signin" href="/login">Sign in</a>
     <a class="button subtle" href="/contact">Talk to us</a>
     <a class="button primary" href="/signup?plan=shadow_trial">Start in Shadow</a>
   </div>
@@ -353,4 +354,88 @@ export function securityPage(): string {
       the capability is shown as claimed-not-observed, with the name of the person who claimed it.</p>
     <a class="button subtle" href="/contact?topic=security">Request a security review</a>
   </section>`);
+}
+
+
+/* =============================================================== SIGN UP */
+
+/**
+ * Start in Shadow.
+ *
+ * Every "Start in Shadow" button on this site points here, and until now this
+ * page did not exist — six dead links on the primary call to action. The site
+ * test asserted the LINK was present without ever checking it RESOLVED, which
+ * is the same mistake as a button labelled "Request re-observation" that
+ * requests nothing.
+ *
+ * What signing up actually gets you, stated on the page rather than discovered
+ * later: a Shadow environment. Nyst observes and evaluates outcomes; it does
+ * not control anything until you deliberately move an environment to Canary or
+ * Enforced, and the trial entitlement cannot enable that on its own.
+ */
+export function signupPage(input: {
+  plan: string | null;
+  /** Null when this deployment can create accounts. A sentence when it cannot. */
+  unavailable_reason: string | null;
+  error: string | null;
+  submitted?: { organization?: string; organization_slug?: string; email?: string; display_name?: string };
+}): string {
+  const value = (field: keyof NonNullable<typeof input.submitted>) => escape(String(input.submitted?.[field] ?? ""));
+  return publicShell("Start in Shadow", "/signup", `
+  <section class="page-head-public">
+    <p class="eyebrow">Shadow trial</p>
+    <h1>Start in Shadow</h1>
+    <p class="lede">Nyst watches your existing agents and evaluates outcomes independently.
+      It is not in the path of anything, and it will tell you so on every number it shows you.</p>
+  </section>
+
+  ${input.unavailable_reason ? `<section class="band band-quiet">
+    <h2>Not on this deployment</h2>
+    <p class="lede">${escape(input.unavailable_reason)}</p>
+    <div class="hero-cta">
+      <a class="button primary" href="/contact?topic=general">Talk to us</a>
+      <a class="button subtle" href="/pricing">See what is included</a>
+    </div>
+  </section>` : `
+  <section class="configure">
+    ${input.error ? `<div class="panel panel-pad note-strong gap-below-l"><p>${escape(input.error)}</p></div>` : ""}
+    <form method="post" action="/signup" class="steps">
+      <fieldset class="step">
+        <legend>Your organization</legend>
+        <label>Organization name
+          <input type="text" name="organization" maxlength="120" value="${value("organization")}" required></label>
+        <label>Short name
+          <input type="text" name="organization_slug" maxlength="63" pattern="[a-z][a-z0-9-]{1,62}"
+                 value="${value("organization_slug")}" required>
+          <span class="small">Lowercase letters, digits and hyphens. This is what you type when you sign in — not the display name.</span>
+        </label>
+      </fieldset>
+
+      <fieldset class="step">
+        <legend>You</legend>
+        <label>Your name <input type="text" name="display_name" maxlength="120" value="${value("display_name")}" required></label>
+        <label>Work email <input type="email" name="email" maxlength="320" value="${value("email")}" required></label>
+        <label>Password
+          <input type="password" name="password" minlength="8" maxlength="1024" required autocomplete="new-password">
+          <span class="small">At least 8 characters. Nyst stores a bcrypt hash and never the password itself.</span>
+        </label>
+      </fieldset>
+
+      <input type="hidden" name="plan" value="${escape(input.plan ?? "shadow_trial")}">
+      <div class="step-actions">
+        <button type="submit" class="button primary">Create my Shadow environment</button>
+        <a class="button subtle" href="/login">I already have an account</a>
+      </div>
+    </form>
+
+    <div class="panel panel-pad gap-l">
+      <h3>What this creates</h3>
+      <ul>
+        <li>One organization, one project, one environment — in <strong>Shadow</strong>.</li>
+        <li>Shadow observes and evaluates. It controls nothing, holds nothing and prevents nothing.</li>
+        <li>Moving to Canary or Enforced is a deliberate, separate decision, and the trial entitlement does not include it.</li>
+        <li>No credit card, and nothing here charges anything.</li>
+      </ul>
+    </div>
+  </section>`}`, { description: "Start a Nyst Shadow trial. Observation only — Nyst is not in the path of anything." });
 }

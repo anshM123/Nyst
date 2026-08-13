@@ -17,6 +17,7 @@ import {
   homePage, pricingPage, productPage, outcomesExplainedPage, integrationsPublicPage, securityPage, publicShell,
 } from "./site.js";
 import { configuratorPage, contactPage, recommendPlan, type QuoteInput } from "./configurator.js";
+import { signupPage } from "./site.js";
 import { escape } from "../product/dashboard.js";
 
 export interface PublicRouteOptions {
@@ -34,6 +35,17 @@ export interface PublicRouteOptions {
   }) => Promise<void>;
   /** Where a configuration submission goes. */
   record_quote?: (quote: { input: QuoteInput; recommended_plan: string; received_at: string }) => Promise<void>;
+  /**
+   * Create a real Shadow trial account.
+   *
+   * Omit it and /signup still RENDERS — it simply says this deployment cannot
+   * create accounts and offers contact instead. That matters: the marketing
+   * site can be deployed without a database, and "Start in Shadow" must not be
+   * a dead link there any more than it should be anywhere else.
+   */
+  create_account?: (input: {
+    organization: string; organization_slug: string; display_name: string; email: string; password: string;
+  }) => Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
 export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteOptions = {}): void {
@@ -57,6 +69,48 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
   } catch {
     // Already registered by the host application. Its parser is fine.
   }
+
+  /**
+   * Brand assets, and a sign-in fallback.
+   *
+   * Both are registered defensively: inside the product server these routes
+   * already exist, and Fastify refuses a duplicate. The marketing site must be
+   * self-contained when deployed alone, and must not fight the product when
+   * mounted alongside it.
+   *
+   * The sign-in fallback matters more than it looks. The header has a "Sign in"
+   * link on every page; on a marketing-only deployment there is no product to
+   * sign in to, and a dead Sign in button is exactly the defect this module
+   * was just fixed for.
+   */
+  try {
+    app.get("/brand/:asset", async (request, reply) => {
+      const asset = String((request.params as { asset?: unknown }).asset ?? "");
+      if (!BRAND_ASSETS.includes(asset)) return reply.code(404).send("not found");
+      const { readFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      return reply.type("image/png").header("Cache-Control", "public, max-age=86400")
+        .send(readFileSync(join(process.cwd(), "public", "brand", asset)));
+    });
+  } catch { /* The host already serves them. */ }
+
+  try {
+    app.get("/login", async (_request, reply) => html(reply, publicShell("Sign in", "/login", `
+    <section class="page-head-public">
+      <p class="eyebrow">Sign in</p>
+      <h1>Not on this deployment</h1>
+      <p class="lede">This deployment serves the public site. The Nyst dashboard needs a
+        long-lived Node process and a PostgreSQL database, so it runs elsewhere.</p>
+    </section>
+    <section class="band">
+      <p>If your organization already uses Nyst, sign in at your own Nyst address — the one your
+        team deployed, not this one.</p>
+      <div class="hero-cta">
+        <a class="button primary" href="/contact?topic=general">Ask us where yours is</a>
+        <a class="button subtle" href="/signup?plan=shadow_trial">Start in Shadow instead</a>
+      </div>
+    </section>`, { description: "Sign in to Nyst." })));
+  } catch { /* The product owns /login. */ }
 
   app.get("/assets/site.css", async (_request, reply) =>
     reply.type("text/css; charset=utf-8").send(SITE_CSS));
@@ -82,6 +136,51 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
       await options.record_quote({ input, recommended_plan: result.recommended_plan, received_at: new Date().toISOString() });
     }
     return html(reply, configuratorPage(null, result, input));
+  });
+
+  /* --------------------------------------------------------------- signup */
+
+  app.get("/signup", async (request, reply) => {
+    const query = request.query as { plan?: unknown };
+    return html(reply, signupPage({
+      plan: query.plan === undefined ? null : String(query.plan),
+      unavailable_reason: options.create_account ? null : SIGNUP_UNAVAILABLE,
+      error: null,
+    }));
+  });
+
+  app.post("/signup", async (request, reply) => {
+    if (!options.create_account) {
+      return reply.code(503).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: SIGNUP_UNAVAILABLE, error: null,
+      }));
+    }
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const submitted = {
+      organization: bounded(body.organization, 120),
+      organization_slug: bounded(body.organization_slug, 63).toLowerCase(),
+      display_name: bounded(body.display_name, 120),
+      email: bounded(body.email, 320),
+    };
+    const password = typeof body.password === "string" ? body.password : "";
+
+    // Validated here as well as in the browser, because `required` and
+    // `pattern` attributes are a convenience for people, not a control.
+    const problem = validateSignup({ ...submitted, password });
+    if (problem) {
+      return reply.code(400).type("text/html; charset=utf-8")
+        .send(signupPage({ plan: null, unavailable_reason: null, error: problem, submitted }));
+    }
+
+    const created = await options.create_account({ ...submitted, password });
+    if (!created.ok) {
+      return reply.code(409).type("text/html; charset=utf-8")
+        .send(signupPage({ plan: null, unavailable_reason: null, error: created.reason, submitted }));
+    }
+    // Straight to sign-in. Nyst does not silently create a session from a
+    // signup form: signing in is where a session is established, and doing it
+    // in two places is two places to get it wrong.
+    return reply.redirect("/login?created=1");
   });
 
   app.get("/contact", async (request, reply) => {
@@ -197,6 +296,37 @@ export function parseForm(body: string): Record<string, unknown> {
 function decodeComponent(value: string): string {
   try { return decodeURIComponent(value.replace(/\+/g, " ")); }
   catch { return value.replace(/\+/g, " "); }
+}
+
+/**
+ * Why /signup cannot create an account on a given deployment.
+ *
+ * Stated as a sentence rather than a 404, because the button that brought them
+ * here is a real button and the trial is a real thing — it just needs a
+ * deployment with a database behind it.
+ */
+const BRAND_ASSETS = ["nyst-mark.png", "nyst-wordmark.png", "nyst-domain-wordmark.png", "favicon.png"];
+
+const SIGNUP_UNAVAILABLE =
+  "This deployment serves the public site only, so it has no database to create an account in. " +
+  "Nyst runs as a normal Node service next to PostgreSQL — talk to us and we will point you at one, " +
+  "or run it yourself from the repository in about fifteen minutes.";
+
+/** The first problem with a signup, or null. Returns one at a time, in order. */
+function validateSignup(input: {
+  organization: string; organization_slug: string; display_name: string; email: string; password: string;
+}): string | null {
+  if (!input.organization) return "An organization name is required.";
+  if (!/^[a-z][a-z0-9-]{1,62}$/.test(input.organization_slug)) {
+    return "The short name must start with a letter and contain only lowercase letters, digits and hyphens.";
+  }
+  if (!input.display_name) return "Your name is required.";
+  // Deliberately permissive: an address either delivers or it does not, and a
+  // clever pattern mostly rejects people with unusual but valid addresses.
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.email)) return "That does not look like an email address.";
+  if (input.password.length < 8) return "The password must be at least 8 characters.";
+  if (input.password.length > 1024) return "That password is too long.";
+  return null;
 }
 
 function bounded(value: unknown, max: number): string {

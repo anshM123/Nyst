@@ -63,7 +63,12 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 .site-nav nav { display: flex; gap: 18px; flex: 1 1 auto; flex-wrap: wrap; }
 .site-nav nav a { text-decoration: none; color: var(--ink-muted); font-size: 0.95rem; }
 .site-nav nav a:hover, .site-nav nav a[aria-current="page"] { color: var(--ink); }
-.site-cta { display: flex; gap: 10px; }
+.site-cta { display: flex; gap: 10px; align-items: center; }
+/* Someone who already uses Nyst should reach their work from the header,
+   not by scrolling a marketing page to find a footer link. */
+.site-signin { color: var(--ink-muted); text-decoration: none; font-size: 0.95rem;
+  font-family: ui-sans-serif, system-ui, sans-serif; padding: 9px 4px; }
+.site-signin:hover { color: var(--ink); }
 .button {
   display: inline-block; padding: 9px 16px; border-radius: 8px; text-decoration: none;
   border: 1px solid var(--rule-strong); background: var(--cream-deep); color: var(--ink);

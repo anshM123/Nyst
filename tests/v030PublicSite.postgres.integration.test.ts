@@ -180,6 +180,139 @@ describe("Nyst v0.3.0 Phases 37-45 — the public site", () => {
     }
   });
 
+  it("THE ONE THAT WAS MISSING: every internal link on every page actually resolves", async () => {
+    // This is how six dead "Start in Shadow" buttons shipped. The old test
+    // asserted the link was PRESENT and never that it RESOLVED — the same
+    // mistake as a Slack button labelled "Request re-observation" that
+    // requests nothing.
+    const pages = ["/", "/product", "/outcomes-explained", "/integrations-public",
+      "/security", "/pricing", "/configure", "/contact", "/privacy", "/terms", "/signup"];
+    const broken: string[] = [];
+    const checked = new Set<string>();
+
+    for (const path of pages) {
+      const html = await page(path);
+      for (const match of html.matchAll(/href="([^"]+)"/g)) {
+        const href = match[1]!;
+        // Only internal links. External URLs, mailto and fragments are not ours.
+        if (!href.startsWith("/")) continue;
+        const target = href.split("#")[0]!.split("?")[0]!;
+        if (!target || checked.has(target)) continue;
+        checked.add(target);
+        const response = await app.inject({ method: "GET", url: target });
+        // A redirect is a resolution. A 404 or a 500 is not.
+        if (response.statusCode >= 400) broken.push(`${target} → ${response.statusCode} (linked from ${path})`);
+      }
+    }
+    assert.deepEqual(broken, [], `dead internal links: ${broken.join(" | ")}`);
+    assert.ok(checked.size >= 10, `only ${checked.size} internal links were checked, which proves very little`);
+    // The specific one that was broken, named so it cannot regress quietly.
+    assert.ok(checked.has("/signup"), "the primary call to action was not among the links checked");
+  });
+
+  it("signup exists, is honest about what it creates, and validates on the server", async () => {
+    // This app has no account-creation capability wired, so the page must say
+    // so rather than showing a form that cannot possibly work.
+    const withoutCreation = await page("/signup");
+    assert.match(withoutCreation, /Start in Shadow/);
+    assert.match(withoutCreation, /public site only|no database to create an account in/);
+    assert.doesNotMatch(withoutCreation, /<form[^>]*action="\/signup"/,
+      "a signup form was shown on a deployment that cannot create accounts");
+
+    // With one wired, the real form appears — and says what it creates, on the
+    // page, rather than leaving it to be discovered afterwards.
+    const capable = Fastify({ logger: false });
+    registerPublicRoutes(capable, { create_account: async () => ({ ok: true as const }) });
+    await capable.ready();
+    const html = (await capable.inject({ method: "GET", url: "/signup" })).body;
+    await capable.close();
+    assert.match(html, /Shadow observes and evaluates. It controls nothing/);
+    assert.match(html, /deliberate, separate decision/);
+    assert.match(html, /No credit card/);
+    // The short name is what people get wrong at sign-in, so the form says so.
+    assert.match(html, /This is what you type when you sign in/);
+    assert.match(html, /<form[^>]*method="post"[^>]*action="\/signup"/);
+
+    // Server-side validation, because `required` and `pattern` are a
+    // convenience for people and not a control.
+    const withCreation = Fastify({ logger: false });
+    const attempts: unknown[] = [];
+    registerPublicRoutes(withCreation, {
+      create_account: async (input) => { attempts.push(input); return { ok: true as const }; },
+    });
+    await withCreation.ready();
+    try {
+      for (const [payload, expected] of [
+        ["organization=&organization_slug=acme&display_name=A&email=a%40b.test&password=longenough", /organization name is required/i],
+        // Genuinely invalid: spaces, symbols and a leading digit. A typed
+        // uppercase name is NOT invalid — it is normalized, which is checked
+        // separately below.
+        ["organization=Acme&organization_slug=has%20spaces&display_name=A&email=a%40b.test&password=longenough", /lowercase/i],
+        ["organization=Acme&organization_slug=9leading&display_name=A&email=a%40b.test&password=longenough", /start with a letter/i],
+        ["organization=Acme&organization_slug=acme&display_name=A&email=notanemail&password=longenough", /email address/i],
+        ["organization=Acme&organization_slug=acme&display_name=A&email=a%40b.test&password=short", /at least 8 characters/i],
+      ] as const) {
+        const response = await withCreation.inject({
+          method: "POST", url: "/signup",
+          headers: { "content-type": "application/x-www-form-urlencoded" }, payload,
+        });
+        assert.equal(response.statusCode, 400, `invalid signup was accepted: ${payload}`);
+        assert.match(response.body, expected);
+      }
+      assert.equal(attempts.length, 0, "an invalid signup reached account creation");
+
+      // And a valid one goes through, then hands off to sign-in rather than
+      // minting a session in a second place.
+      const good = await withCreation.inject({
+        method: "POST", url: "/signup",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: "organization=Acme&organization_slug=acme&display_name=Ansh&email=a%40b.test&password=longenough",
+      });
+      assert.equal(good.statusCode, 302);
+      assert.equal(good.headers.location, "/login?created=1");
+      assert.equal(attempts.length, 1);
+
+      // A short name typed in capitals is normalized rather than rejected.
+      // Someone typing "Acme" meant "acme", and refusing them over a shift key
+      // is friction for nothing.
+      const capitals = await withCreation.inject({
+        method: "POST", url: "/signup",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: "organization=Acme&organization_slug=ACME-Two&display_name=Ansh&email=a%40b.test&password=longenough",
+      });
+      assert.equal(capitals.statusCode, 302);
+      assert.equal((attempts[1] as { organization_slug: string }).organization_slug, "acme-two",
+        "a capitalised short name was not normalized to lowercase");
+    } finally { await withCreation.close(); }
+  });
+
+  it("a taken short name says so, and a real failure does not blame the visitor", async () => {
+    const app2 = Fastify({ logger: false });
+    registerPublicRoutes(app2, {
+      create_account: async () => ({ ok: false as const, reason: 'The short name "acme" is already taken. Pick another.' }),
+    });
+    await app2.ready();
+    try {
+      const response = await app2.inject({
+        method: "POST", url: "/signup",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: "organization=Acme&organization_slug=acme&display_name=Ansh&email=a%40b.test&password=longenough",
+      });
+      assert.equal(response.statusCode, 409);
+      assert.match(response.body, /already taken/);
+      // The values they typed come back, so they are not retyping the form.
+      assert.match(response.body, /value="Acme"/);
+    } finally { await app2.close(); }
+  });
+
+  it("Sign in is reachable from the header of every page, not only the footer", async () => {
+    for (const path of ["/", "/pricing", "/product", "/security", "/contact", "/signup"]) {
+      const html = await page(path);
+      const header = html.slice(html.indexOf("<header"), html.indexOf("</header>"));
+      assert.match(header, /href="\/login"/, `${path} has no Sign in link in the header`);
+    }
+  });
+
   it("SEO basics are served, and the private product is disallowed", async () => {
     const robots = await app.inject({ method: "GET", url: "/robots.txt" });
     assert.equal(robots.statusCode, 200);
