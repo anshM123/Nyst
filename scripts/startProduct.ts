@@ -105,8 +105,15 @@ const app = await buildProductServer({
   shadow: new OutcomeShadow(pool, outcomeRepository),
   evidence: evidenceIngest,
   relay: new RelayCoordinator(pool, evidenceIngest),
+  // Anonymous visitors get the marketing site at "/" rather than a redirect to
+  // a sign-in page they have no account for.
+  public_home: homePage,
   signer,
 });
+
+// The public site shares the origin. It owns everything except "/", which the
+// product server handles so a signed-in operator lands on their dashboard.
+registerPublicRoutes(app, { mount_root: false });
 
 // In development a single process runs everything so `npm run start:product`
 // is genuinely all you need. In production the workers are separate processes

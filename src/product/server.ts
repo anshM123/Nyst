@@ -103,6 +103,8 @@ export interface ProductServerOptions {
   authority?: AuthorityRepository;
   /** Outcome Shadow: independent evaluation of a customer's existing Agents. */
   shadow?: OutcomeShadow;
+  /** Renders the public marketing home for an anonymous visitor at "/". */
+  public_home?: () => string;
   /** Customer-pushed observations, for systems Nyst has no integration with. */
   evidence?: EvidenceIngest;
   /** Scoped signed reads performed inside the customer's own network. */
@@ -222,7 +224,35 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     };
   }
 
-  app.get("/", pageHandler(async (principal) => overviewPage(await options.repository.overview(principal), await pageContext(principal)), options.repository));
+  /**
+   * The root.
+   *
+   * A signed-in operator gets their dashboard. Everyone else gets the public
+   * site — not a redirect to /login, which is a hostile thing to do to someone
+   * who arrived from a search result and wants to read about the product.
+   *
+   * The public home is rendered by the marketing module when it is mounted; a
+   * product-only deployment falls back to the sign-in page.
+   */
+  app.get("/", async (request, reply) => {
+    const principal = await authenticate(request, options.repository);
+    if (principal?.kind === "session") {
+      const context = await options.repository.context(principal);
+      const page = overviewPage(await options.repository.overview(principal), await pageContext(principal));
+      return reply.type("text/html; charset=utf-8").send(page.replace("<!--NYST_CONTEXT-->", contextSwitcher(context)));
+    }
+    // An API key presenting itself at a dashboard page is a client doing
+    // something it should not; it gets a clear refusal rather than a redirect
+    // to a login form it cannot complete.
+    if (principal) {
+      return reply.code(403).type("text/html; charset=utf-8").send(genericPage("Session required",
+        "Dashboard pages require a browser session; API keys are limited to versioned API endpoints."));
+    }
+    if (options.public_home) return reply.type("text/html; charset=utf-8").send(options.public_home());
+    return reply.redirect("/login");
+  });
+  /** The dashboard's own address, for an unambiguous link from anywhere. */
+  app.get("/overview", pageHandler(async (principal) => overviewPage(await options.repository.overview(principal), await pageContext(principal)), options.repository));
   app.get("/needs-attention", pageHandler(async (principal) => needsAttentionPage(await options.repository.needsAttention(principal), await pageContext(principal)), options.repository));
   app.get("/agents", pageHandler(async (principal) => agentsPage(await options.repository.agents(principal), await pageContext(principal)), options.repository));
   app.get("/actions", pageHandler(async (principal, request) => { const selected = filters(request.query); return actionsPage(await options.repository.listActions(principal, selected), "Actions", selected, await pageContext(principal)); }, options.repository));
