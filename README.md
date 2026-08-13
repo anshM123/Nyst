@@ -10,8 +10,35 @@
 INTENT → EXECUTION → OBSERVATION → RECONCILIATION → EFFECT STATE → CONTROL DECISION → SIGNED RECEIPT
 ```
 
+**Version 0.3.0.**
+
 > **Just want to run it?** → **[RUN.md](RUN.md)** (fifteen minutes)
 > **Want to know what was actually verified?** → **[VERIFICATION.md](VERIFICATION.md)**
+> **Want to know where Nyst stops?** → **[Known boundaries](docs/product/known-boundaries.md)**
+
+## What is new in 0.3.0
+
+Three layers, kept deliberately separate, because collapsing them is where the
+failure lives:
+
+| Layer | Question | Values |
+|---|---|---|
+| **Authority** | What may this Agent do? | autonomous · human · disabled |
+| **Effect** | What happened to this operation? | six EffectStates |
+| **Outcome** | What became true in the world? | satisfied · unsatisfied · indeterminate |
+
+The headline case, and the reason the outcome layer exists:
+
+> The offboarding agent removed Alice's direct repository access. The action
+> was **VERIFIED**. Alice is in a team that grants WRITE to the same
+> repository.
+>
+> **ACTION VERIFIED. OUTCOME UNSATISFIED.**
+
+Also new: a deterministic invariant engine with no LLM in the safety path, the
+Autonomy Line (an envelope, never a trust score), signed Outcome Receipts and
+ContinuationGrants, Outcome Shadow, Evidence Ingest, the customer-side Relay,
+Failure Lab 2.0 and NystBench.
 
 ---
 

@@ -132,3 +132,82 @@ export function mayRetry(control: Pick<ControlDecision, "retry">): boolean {
 export function needsHuman(control: Pick<ControlDecision, "primary">): boolean {
   return control.primary === "escalate" || control.primary === "hold";
 }
+
+/* ====================================================== THE OUTCOME LAYER */
+
+/**
+ * Exactly three. INDETERMINATE is not an error and not a retry signal — it is
+ * Nyst saying it could not establish the answer, which your code must treat as
+ * "do not proceed" rather than "try again until it changes".
+ */
+export const OUTCOME_VERDICTS = ["satisfied", "unsatisfied", "indeterminate"] as const;
+export type OutcomeVerdict = (typeof OUTCOME_VERDICTS)[number];
+
+/** What software may do next. Never derived from the verdict alone. */
+export type OutcomeContinuation = "hold" | "allowed" | "blocked";
+
+export interface OutcomeInstance {
+  outcome_instance_id: string;
+  outcome_contract_id: string;
+  contract_version: number;
+  subject: Readonly<Record<string, unknown>>;
+  subject_key: string;
+  mode: "shadow" | "canary" | "enforced";
+  verdict: OutcomeVerdict;
+  lifecycle: "open" | "evaluating" | "settled" | "timed_out" | "cancelled";
+  continuation_disposition: OutcomeContinuation;
+  /** How much of the contract Nyst could actually evaluate. */
+  coverage_numerator: number;
+  coverage_denominator: number;
+  evaluation_sequence: number;
+  started_at: string;
+  deadline_at: string;
+  satisfied_at: string | null;
+}
+
+export interface InvariantResult {
+  invariant_id: string;
+  statement: string;
+  result: "true" | "false" | "indeterminate";
+  /** Why, in one sentence. Always specific; never "check failed". */
+  reason: string;
+  facts_used: readonly string[];
+  missing_facts: readonly string[];
+  contradictions: readonly string[];
+}
+
+export interface OutcomeEvaluation {
+  verdict: OutcomeVerdict;
+  required: readonly InvariantResult[];
+  coverage: { numerator: number; denominator: number };
+  /** The one a human should read first. Null when satisfied. */
+  primary_reason: string | null;
+}
+
+/** A typed observed value. Comparison never guesses across types. */
+export type FactValue =
+  | { type: "string"; value: string }
+  | { type: "integer"; value: number }
+  | { type: "boolean"; value: boolean }
+  | { type: "string_set"; value: readonly string[] }
+  | { type: "timestamp"; value: string }
+  | { type: "absent" };
+
+/** True only when the outcome was actually established. */
+export function outcomeEstablished(instance: Pick<OutcomeInstance, "verdict">): boolean {
+  return instance.verdict === "satisfied";
+}
+
+/**
+ * True when Nyst could not establish the outcome, as opposed to establishing
+ * that it is false. The distinction matters: one means the world is wrong, the
+ * other means you are blind, and they call for different responses.
+ */
+export function outcomeUnknown(instance: Pick<OutcomeInstance, "verdict">): boolean {
+  return instance.verdict === "indeterminate";
+}
+
+/** True when a dependent consequence may proceed. Never infer this from the verdict. */
+export function mayContinueOutcome(instance: Pick<OutcomeInstance, "continuation_disposition">): boolean {
+  return instance.continuation_disposition === "allowed";
+}

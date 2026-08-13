@@ -161,3 +161,61 @@ Anything not listed above as verified should be treated as unverified.
 | Managed secret vault | Out of scope — see [secrets](secrets.md) for the extension point |
 | A hosted Nyst service | Does not exist. Self-hosted only |
 | Published npm package | Built and verified, **not published** |
+
+---
+
+## v0.3.0 boundaries
+
+These are new in this release, and each one is a place where Nyst deliberately
+stops rather than guessing.
+
+**A read-only preflight cannot VERIFY a write capability.** Proving that a
+credential can change a collaborator's permission would require changing one,
+and invariant I20 forbids a preflight from mutating anything. So where a
+provider publishes its own authorization metadata — GitHub token scopes, Okta
+granted scopes — Nyst reads it and marks the capability AUTHORIZED. Where a
+provider publishes nothing (Stripe restricted keys report no scope list), the
+capability stays AVAILABLE and readiness says so by name. An operator may
+record an explicit attestation; Nyst stores it as a **claim** with an author,
+a timestamp and a mandatory justification, shows it as claimed-not-observed
+everywhere it appears, and an actual observation always overrides it.
+
+**Mutation through the customer Relay is NOT implemented.** Only reads. A
+mutation Relay needs a durable dispatch boundary on the customer's side, a
+two-phase protocol for the ambiguous window, and a read-back path Nyst can
+drive independently when the Relay itself disappears mid-request. Shipping a
+partial version would put a duplicate external consequence exactly where this
+product promises there is none. See [the Relay protocol](relay.md).
+
+**Google Sign-In has never run against a live Google project.** The
+implementation is complete and exercised against deterministic key fixtures
+covering twenty-one security cases — wrong audience, wrong issuer, expiry,
+nonce, algorithm confusion, open redirect, email-match takeover, duplicate
+subject and the rest. It has not been run against real Google credentials.
+**LIVE GOOGLE PROJECT CONFIGURATION REQUIRED** before anyone signs in with it
+in production.
+
+**AWS evidence is a declared optional module, not a live adapter.** Selecting
+it makes its invariant REQUIRED, which means an outcome stays INDETERMINATE
+until AWS evidence actually arrives — through Evidence Ingest or a Relay. Nyst
+ships no first-party AWS reader in this release, and an unselected module means
+Nyst makes **no claim at all** about AWS access.
+
+**Google Workspace has no first-party connector.** Customer-side evidence
+through Evidence Ingest or the Relay covers it. Nyst does not claim coverage it
+does not have.
+
+**Enterprise OIDC is architected, not proven against a live IdP.** The generic
+verifier is the same code path Google uses, and the provider configuration
+table exists. No enterprise identity provider has been connected.
+
+**Outcome coverage is only ever what is configured.** An outcome marked
+SATISFIED means every *required and configured* invariant held on fresh
+authoritative evidence. It does not mean nothing anywhere is wrong. Nyst
+reports coverage as a fraction precisely so this is visible rather than
+assumed.
+
+**NystBench is a simulation.** Its numbers describe behaviour under thirteen
+injected faults and nothing else. They are not a measurement of any customer's
+production system and may not be published without the SIMULATED / ADVERSARIAL
+BENCHMARK label.
