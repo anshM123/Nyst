@@ -21,8 +21,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p packages/sdk/tsconfig.json && tsc -p tsconfig.json && tsc -p tsconfig.scripts.json",
-    "typecheck": "tsc -p packages/sdk/tsconfig.json && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.scripts.json",
+    "build": "tsc -p packages/sdk/tsconfig.json && tsc -p tsconfig.json && tsc -p tsconfig.scripts.json && tsc -p tsconfig.api.json",
+    "typecheck": "tsc -p packages/sdk/tsconfig.json && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.scripts.json && tsc -p tsconfig.api.json",
     "test": "npm run build && node --test --test-concurrency=4 \"dist/tests/*.test.js\"",
     "test:github:live": "npm run build && node --experimental-strip-types scripts/verifyGitHubLive.ts",
     "test:github:gate4-live": "npm run build && node --experimental-strip-types scripts/verifyGitHubGate4Live.ts",

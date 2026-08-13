@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Type-check only. Vercel compiles the function itself, and this file
+    // imports from `dist`, so it is checked after the main build.
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["api/**/*.ts"]
+}
