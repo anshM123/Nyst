@@ -183,7 +183,9 @@ CREATE TABLE nyst_world_facts (
   subject_ref text NOT NULL CHECK (length(subject_ref) BETWEEN 1 AND 400),
   provider text NOT NULL CHECK (length(provider) BETWEEN 1 AND 60),
   -- Which property of the subject: "effective_permission", "account_status".
-  property text NOT NULL CHECK (property ~ '^[a-z][a-z0-9_]{2,80}$'),
+  -- Dots are meaningful: "vpn.active", "iam.access_keys". A property is a
+  -- namespaced name, not an identifier.
+  property text NOT NULL CHECK (property ~ '^[a-z][a-z0-9_.]{2,80}$'),
   -- The normalized typed value. {"type":"string","value":"none"} etc. Typed so
   -- the invariant engine never has to guess how to compare two values.
   value jsonb NOT NULL,

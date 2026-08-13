@@ -56,6 +56,7 @@ export const IDEMPOTENT_OPERATIONS = [
   "authority_exception.revoke",
   "continuation_grant.issue",
   "capability.attest",
+  "evidence_source.register",
 ] as const;
 
 export type IdempotentOperation = (typeof IDEMPOTENT_OPERATIONS)[number];

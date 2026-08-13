@@ -64,6 +64,7 @@ if (bootstrapScope && config.enable_development_fake) {
 
 const metrics = new InMemoryOperationalMetrics();
 const outcomeRepository = new OutcomeRepository(pool);
+const evidenceIngest = new EvidenceIngest(pool, outcomeRepository, secrets);
 
 /**
  * Adapt the provider read-only preflight to the readiness probe contract.
@@ -102,6 +103,8 @@ const app = await buildProductServer({
   outcomes: outcomeRepository,
   authority: new AuthorityRepository(pool),
   shadow: new OutcomeShadow(pool, outcomeRepository),
+  evidence: evidenceIngest,
+  relay: new RelayCoordinator(pool, evidenceIngest),
   signer,
 });
 

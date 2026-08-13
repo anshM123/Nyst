@@ -22,6 +22,8 @@ import { shellPage } from "./dashboard.js";
 import { autonomyPage, failureLab2Page, outcomePage, outcomesPage, shadowReportPage } from "./outcomeViews.js";
 import { OUTCOME_FAULTS, runNystBench, runOutcomeFault, type OutcomeFault } from "./outcome/failureLab2.js";
 import type { OutcomeShadow } from "./outcome/outcomeShadow.js";
+import type { EvidenceIngest, RelayCoordinator, RelayOperation } from "./outcome/evidenceIngest.js";
+import { RELAY_OPERATIONS } from "./outcome/evidenceIngest.js";
 import { subjectReferences as subjectReferencesFor } from "./outcome/outcomeRepository.js";
 import type { OutcomeRepository } from "./outcome/outcomeRepository.js";
 import type { AuthorityRepository } from "./authority/authorityRepository.js";
@@ -101,6 +103,10 @@ export interface ProductServerOptions {
   authority?: AuthorityRepository;
   /** Outcome Shadow: independent evaluation of a customer's existing Agents. */
   shadow?: OutcomeShadow;
+  /** Customer-pushed observations, for systems Nyst has no integration with. */
+  evidence?: EvidenceIngest;
+  /** Scoped signed reads performed inside the customer's own network. */
+  relay?: RelayCoordinator;
   /** Signs Outcome Receipts and ContinuationGrants. */
   signer?: { sign(content: unknown): { key_id: string; signature_b64: string; algorithm: "ed25519"; canonicalization: "ojc-1" }; verify(content: unknown, sig: { key_id: string; signature_b64: string; algorithm: "ed25519"; canonicalization: "ojc-1" }): boolean };
 }
@@ -497,6 +503,115 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     });
   }, options.repository));
 
+  /* ---------------- EVIDENCE INGEST + RELAY (Phases 8-10) ---------------- */
+
+  app.get("/v1/evidence-sources", api(async (principal) => {
+    requireAnyScope(principal, ["actions:read", "integrations:read"]);
+    return requireEvidence(options).sources(principal);
+  }, options.repository));
+
+  app.post("/v1/evidence-sources", api(async (principal, request) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const body = object(request.body);
+    const transport = string(body.transport, 30);
+    if (transport !== "evidence_ingest" && transport !== "customer_relay") {
+      throw Object.assign(new Error("transport must be evidence_ingest or customer_relay"), { statusCode: 400 });
+    }
+    const idempotent = await options.repository.idempotent(principal, "evidence_source.register", idempotencyKey(request), body,
+      async () => requireEvidence(options).registerSource(principal, principal.user_id!, {
+        source_key: string(body.source_key, 60), display_name: string(body.display_name, 120), transport,
+        permitted_properties: strings(body.permitted_properties, 50),
+        authoritative: body.authoritative === true,
+        adapter_version: string(body.adapter_version, 80),
+        signing_secret_ref: body.signing_secret_ref === undefined || body.signing_secret_ref === null
+          ? null : string(body.signing_secret_ref, 300),
+        default_freshness_seconds: body.default_freshness_seconds === undefined
+          ? 900 : Number(body.default_freshness_seconds),
+      }));
+    return idempotent.value;
+  }, options.repository));
+
+  app.post("/v1/evidence-sources/:key/revoke", api(async (principal, request, reply) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const key = String((request.params as { key?: unknown }).key ?? "");
+    const revoked = await requireEvidence(options).revokeSource(principal, key);
+    return revoked ? { revoked: true } : notFound(reply, request);
+  }, options.repository));
+
+  /**
+   * Push one observation.
+   *
+   * A customer pushes EVIDENCE. Nyst evaluates TRUTH. The handler refuses any
+   * push shaped like a conclusion, and a source may only report the properties
+   * it registered for.
+   */
+  app.post("/v1/evidence", api(async (principal, request) => {
+    requireScope(principal, "actions:write");
+    const body = object(request.body);
+    return requireEvidence(options).push(principal, {
+      source_key: string(body.source_key, 60),
+      event_id: string(body.event_id, 200),
+      subject_ref: string(body.subject_ref, 400),
+      property: string(body.property, 80),
+      value: object(body.value) as never,
+      observed_at: string(body.observed_at, 40),
+      provenance: body.provenance === undefined ? {} : object(body.provenance),
+      ...(body.fresh_until === undefined || body.fresh_until === null ? {} : { fresh_until: string(body.fresh_until, 40) }),
+      ...(body.signature === undefined || body.signature === null ? {} : { signature: string(body.signature, 200) }),
+      // Forwarded deliberately so the ingest layer REFUSES them by name. A
+      // caller trying to push a conclusion gets told why, rather than having
+      // the field silently dropped and believing it was accepted.
+      ...(body.verdict !== undefined ? { verdict: body.verdict } : {}),
+      ...(body.outcome !== undefined ? { outcome: body.outcome } : {}),
+      ...(body.verified !== undefined ? { verified: body.verified } : {}),
+    } as never);
+  }, options.repository));
+
+  app.get("/v1/evidence", api(async (principal) => {
+    requireScope(principal, "actions:read");
+    return requireEvidence(options).evidence(principal);
+  }, options.repository));
+
+  app.get("/v1/relay/requests", api(async (principal) => {
+    requireAnyScope(principal, ["actions:read", "integrations:read"]);
+    return requireRelay(options).requests(principal);
+  }, options.repository));
+
+  app.post("/v1/relay/requests", api(async (principal, request) => {
+    requireScope(principal, "actions:write"); requireCsrf(request, principal);
+    if (!options.signer) throw Object.assign(new Error("No signing identity is configured"), { statusCode: 503 });
+    const body = object(request.body);
+    const operation = string(body.operation, 60);
+    if (!(RELAY_OPERATIONS as readonly string[]).includes(operation)) {
+      throw Object.assign(new Error(
+        `Unsupported Relay operation. Every Relay operation in this release is a read: ${RELAY_OPERATIONS.join(", ")}`,
+      ), { statusCode: 400 });
+    }
+    return requireRelay(options).issueRequest(principal, {
+      source_key: string(body.source_key, 60), operation: operation as RelayOperation,
+      subject_ref: string(body.subject_ref, 400), property: string(body.property, 80),
+      operation_key: string(body.operation_key, 200),
+      expires_in_seconds: body.expires_in_seconds === undefined ? 300 : Number(body.expires_in_seconds),
+    }, options.signer as never);
+  }, options.repository));
+
+  /** A Relay returning the answer to a request Nyst signed. Nonce is single-use. */
+  app.post("/v1/relay/responses", api(async (principal, request) => {
+    requireScope(principal, "actions:write");
+    const body = object(request.body);
+    return requireRelay(options).fulfil(principal, {
+      nonce: string(body.nonce, 128),
+      push: {
+        source_key: string(body.source_key, 60), event_id: string(body.event_id, 200),
+        subject_ref: string(body.subject_ref, 400), property: string(body.property, 80),
+        value: object(body.value) as never, observed_at: string(body.observed_at, 40),
+        provenance: body.provenance === undefined ? {} : object(body.provenance),
+        ...(body.fresh_until === undefined || body.fresh_until === null ? {} : { fresh_until: string(body.fresh_until, 40) }),
+        ...(body.signature === undefined || body.signature === null ? {} : { signature: string(body.signature, 200) }),
+      },
+    });
+  }, options.repository));
+
   /* ---------------- FAILURE LAB 2.0 / NYSTBENCH (Phases 33-34) ---------------- */
 
   /**
@@ -716,6 +831,15 @@ function integrationProvider(request:{params:unknown}):"github"|"okta"|"stripe"{
   if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});
   return provider;
 }
+function requireEvidence(options: ProductServerOptions): EvidenceIngest {
+  if (!options.evidence) throw Object.assign(new Error("Evidence Ingest is not enabled in this deployment"), { statusCode: 503 });
+  return options.evidence;
+}
+function requireRelay(options: ProductServerOptions): RelayCoordinator {
+  if (!options.relay) throw Object.assign(new Error("The customer Relay is not enabled in this deployment"), { statusCode: 503 });
+  return options.relay;
+}
+
 function requireOutcomes(options: ProductServerOptions): OutcomeRepository {
   if (!options.outcomes) throw Object.assign(new Error("The Outcome layer is not enabled in this deployment"), { statusCode: 503 });
   return options.outcomes;
