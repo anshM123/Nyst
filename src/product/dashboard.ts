@@ -268,7 +268,9 @@ export function needsAttentionPage(incidents: readonly Record<string, unknown>[]
         const state = String(incident.effect_state);
         const blocked = state === "unprovable" || String(incident.control_decision) === "escalate";
         const actions = (incident.safe_actions as string[]) ?? [];
-        return `<article class="incident${blocked ? " is-blocked" : ""}">
+        // The deep-link target Slack and email use. Focus lands on the real
+        // control inside; nothing here is driven by a query parameter.
+        return `<article class="incident${blocked ? " is-blocked" : ""}" id="review-${escape(String(incident.incident_id))}" tabindex="-1">
         <header>
           <div>
             <h3>${escape(String(incident.title))}</h3>

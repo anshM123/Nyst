@@ -8,7 +8,7 @@ import { composeReadiness, evaluateEffectSpecReadiness, isPreflightStale, probeC
 import { buildCapabilityManifest, CAPABILITY_MANIFEST, observedCapabilities, requiredCapabilities, requiredCapabilityRecords, sufficientCapabilities, type CapabilityAttestation, type ProviderCapabilityManifest } from "./capabilityManifest.js";
 import type { SecretProvider } from "./secretProvider.js";
 import { pruneIdempotencyKeys, withIdempotency, type IdempotentOperation } from "./idempotency.js";
-import { admitConsequence, linkAdmissionToAction, lockEnvironmentAuthority, type AdmissionDecision, type AdmissionRequest } from "./admission.js";
+import { admitConsequence, FREEZE_COVERAGE_PREDICATE, linkAdmissionToAction, lockEnvironmentAuthority, type AdmissionDecision, type AdmissionRequest } from "./admission.js";
 import { POLICY_TEMPLATES, type PolicyTemplateId } from "./policyTemplates.js";
 import { buildProtectionReport, type HighestRiskIncident, type ProtectionReport } from "./protectionReport.js";
 import { evaluateGoLiveReadiness, type GoLiveReadiness } from "./goLiveReadiness.js";
@@ -519,6 +519,28 @@ export class ProductRepository {
       ORDER BY (effect_name IS NOT NULL) DESC,version DESC LIMIT 1`, [scope.environment_id, scope.project_id, scope.organization_id, effectName ?? null]);
     const row = result.rows[0]; if (!row) throw new Error("No policy is configured for this environment");
     return { policy_version_id: String(row.policy_version_id), execution_mode: row.execution_mode === "approval_required" ? "approval_required" : "automatic", retry_mode: "never", auto_continuation: row.auto_continuation === true, auto_compensation: row.auto_compensation === true, reconcile_timeout_seconds: Number(row.reconcile_timeout_seconds) };
+  }
+
+  /**
+   * WHICH immutable policy version would this exact workload bind right now?
+   *
+   * Readiness must ask the production question, not a weaker one. This calls
+   * the same resolver `currentPolicy` uses for real execution — same ordering,
+   * same specificity rules — and returns null when nothing would bind, rather
+   * than throwing, because "no policy" is an answer readiness must display.
+   */
+  async effectivePolicyFor(scope: TenantScope, effectName: string): Promise<{ policy_version_id: string; effect_name: string | null; version: number; execution_mode: "automatic" | "approval_required" } | null> {
+    const result = await this.db.query(`SELECT policy_version_id,effect_name,version,execution_mode
+      FROM nyst_policy_versions WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND (effect_name=$4 OR effect_name IS NULL)
+      ORDER BY (effect_name IS NOT NULL) DESC,version DESC LIMIT 1`, [scope.environment_id, scope.project_id, scope.organization_id, effectName]);
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      policy_version_id: String(row.policy_version_id),
+      effect_name: row.effect_name === null ? null : String(row.effect_name),
+      version: Number(row.version),
+      execution_mode: row.execution_mode === "approval_required" ? "approval_required" : "automatic",
+    };
   }
 
   async policyHistory(scope: TenantScope): Promise<Record<string, unknown>[]> {
@@ -1725,10 +1747,37 @@ export class ProductRepository {
     return { active: rows.filter((row) => row.released_at === null), history: rows };
   }
 
-  /** Is any freeze currently covering this scope? Used by the UI banner. */
+  /**
+   * Is ANY freeze active in this environment? Used only by the environment-wide
+   * banner, which is a true statement about the environment.
+   *
+   * This is NOT the question a workload label may ask. See `freezeCoverage`.
+   */
   async freezeState(scope: TenantScope): Promise<{ frozen: boolean; freezes: Record<string, unknown>[] }> {
     const { active } = await this.freezes(scope);
     return { frozen: active.length > 0, freezes: active };
+  }
+
+  /**
+   * Would a freeze actually block THIS Agent and THIS EffectSpec right now?
+   *
+   * Uses the identical predicate admission uses, imported from admission.ts,
+   * so readiness and the gate can never diverge. Go-Live previously called
+   * `freezeState` and therefore labelled every workload in the environment
+   * Frozen as soon as one narrowly scoped freeze existed.
+   */
+  async freezeCoverage(scope: TenantScope, agentId: string | null, effectName: string | null): Promise<{ frozen: boolean; freeze_id: string | null; scope_description: string | null }> {
+    const row = (await this.db.query(
+      `SELECT freeze_id,scope_agent_id,scope_effect_name FROM nyst_freezes
+       WHERE ${FREEZE_COVERAGE_PREDICATE} ORDER BY activated_at, freeze_id LIMIT 1`,
+      [scope.environment_id, agentId, effectName])).rows[0];
+    if (!row) return { frozen: false, freeze_id: null, scope_description: null };
+    return {
+      frozen: true, freeze_id: String(row.freeze_id),
+      scope_description: row.scope_agent_id === null && row.scope_effect_name === null
+        ? "the whole environment"
+        : [row.scope_agent_id ? "this Agent" : null, row.scope_effect_name ? `EffectSpec ${String(row.scope_effect_name)}` : null].filter(Boolean).join(" and "),
+    };
   }
 
   /**
@@ -1881,9 +1930,13 @@ export class ProductRepository {
       agentId ? this.db.query(`SELECT agent_id,name,status FROM nyst_agents WHERE agent_id=$1 AND environment_id=$2 AND project_id=$3 AND organization_id=$4`,
         [agentId, scope.environment_id, scope.project_id, scope.organization_id]) : Promise.resolve({ rows: [] as Record<string, unknown>[] }),
       this.resolveExecutionMode(scope, agentId, effectName),
-      this.freezeState(scope),
-      this.db.query(`SELECT 1 FROM nyst_policy_versions WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 LIMIT 1`,
-        [scope.environment_id, scope.project_id, scope.organization_id]),
+      // The SCOPED question, not "is anything frozen anywhere". Phase 1E.
+      this.freezeCoverage(scope, agentId, effectName),
+      // Phase 1F: ask the production resolver WHICH immutable policy this exact
+      // workload would bind, not whether some policy row exists somewhere in
+      // the environment. The old query returned true for an environment holding
+      // only a policy for an unrelated EffectSpec.
+      this.effectivePolicyFor(scope, effectName),
       this.db.query(`SELECT enabled FROM nyst_webhook_endpoints WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3`,
         [scope.environment_id, scope.project_id, scope.organization_id]),
     ]);
@@ -1904,8 +1957,12 @@ export class ProductRepository {
       execution_mode: execution.mode,
       integration,
       credential_free_effect: credentialFree,
-      policy_bound: policy.rows.length > 0,
+      policy_bound: policy !== null,
+      policy_description: policy
+        ? `Policy version ${policy.version}${policy.effect_name ? ` for ${policy.effect_name}` : " (environment fallback)"}, ${policy.execution_mode.replace("_", " ")}.`
+        : null,
       frozen: frozen.frozen,
+      freeze_scope_description: frozen.scope_description,
       // Every registered EffectSpec in this build carries an authoritative
       // observation method; an unregistered one does not.
       observation_semantics_available: descriptor !== undefined,

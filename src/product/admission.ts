@@ -87,12 +87,36 @@ export class ConsequenceBlockedError extends Error {
  * Returns the decision rather than throwing so callers can persist an
  * intervention and open a Human Review before surfacing the refusal.
  */
+/**
+ * THE FREEZE COVERAGE PREDICATE.
+ *
+ * A freeze covers a workload when its scope is either unset (environment-wide)
+ * or exactly equal to that workload's Agent and EffectSpec. Nothing else.
+ *
+ * This is exported as one string, with fixed parameter positions, because
+ * readiness previously asked a DIFFERENT question. Go-Live called
+ * `freezeState`, which answered "does ANY active freeze exist in this
+ * environment?" — so freezing Agent A displayed Agent B as Frozen while
+ * admission would cheerfully have admitted Agent B's consequence. A workload
+ * label that says Frozen when the gate would not block is a lie about the one
+ * thing an operator uses Freeze to be certain of.
+ *
+ * Parameters: $1 environment_id, $2 agent_id (nullable uuid), $3 effect_name.
+ */
+export const FREEZE_COVERAGE_PREDICATE = `environment_id=$1 AND released_at IS NULL
+  AND (scope_agent_id IS NULL OR scope_agent_id=$2::uuid)
+  AND (scope_effect_name IS NULL OR scope_effect_name=$3::text)`;
+
+/** The same predicate, renumbered for admission's parameter layout. */
+const ADMISSION_FREEZE_PREDICATE = FREEZE_COVERAGE_PREDICATE
+  .replace("environment_id=$1", "environment_id=$1")
+  .replace("scope_agent_id=$2::uuid", "scope_agent_id=$4::uuid")
+  .replace("scope_effect_name=$3::text", "scope_effect_name=$5::text");
+
 const ADMISSION_SQL = `
     WITH active_freeze AS (
       SELECT freeze_id FROM nyst_freezes
-      WHERE environment_id=$1 AND released_at IS NULL
-        AND (scope_agent_id IS NULL OR scope_agent_id=$4::uuid)
-        AND (scope_effect_name IS NULL OR scope_effect_name=$5::text)
+      WHERE ${ADMISSION_FREEZE_PREDICATE}
       ORDER BY activated_at, freeze_id LIMIT 1
     ), applicable AS (
       -- FOR UPDATE serializes concurrent admissions against the same budget,
@@ -138,9 +162,25 @@ const ADMISSION_SQL = `
              'The action currency does not match the currency this consequence budget is denominated in.'
         FROM evaluated WHERE currency IS NOT NULL AND $7::text IS NOT NULL AND currency <> $7::text
       UNION ALL
-      SELECT budget_id, 'amount_per_window'::text, (used_amount + coalesce($6::bigint,0)), max_amount_minor_per_window::bigint, window_seconds,
+      -- Fail closed on a currency-denominated budget whose action declares no
+      -- currency at all. Without one there is nothing to compare, and comparing
+      -- nothing is not the same as comparing equal.
+      SELECT budget_id, 'amount_per_action'::text, NULL::bigint, coalesce(max_amount_minor_per_action,max_amount_minor_per_window)::bigint, window_seconds,
+             'This consequence budget is denominated in ' || currency || ', and the action carries no authoritative currency.'
+        FROM evaluated WHERE currency IS NOT NULL AND $7::text IS NULL
+          AND (max_amount_minor_per_action IS NOT NULL OR max_amount_minor_per_window IS NOT NULL)
+      UNION ALL
+      -- Fail closed BEFORE the aggregate comparison. The previous version used
+      -- coalesce($6,0) here, so an action carrying no authoritative amount
+      -- added zero to the window total and passed every aggregate monetary
+      -- budget ever configured. Missing is not zero.
+      SELECT budget_id, 'amount_per_window'::text, NULL::bigint, max_amount_minor_per_window::bigint, window_seconds,
+             'This effect carries no authoritative amount, so an aggregate monetary consequence budget cannot be evaluated.'
+        FROM evaluated WHERE max_amount_minor_per_window IS NOT NULL AND $6::bigint IS NULL
+      UNION ALL
+      SELECT budget_id, 'amount_per_window'::text, (used_amount + $6::bigint), max_amount_minor_per_window::bigint, window_seconds,
              'The aggregate amount budget for this window is exhausted.'
-        FROM evaluated WHERE max_amount_minor_per_window IS NOT NULL AND used_amount + coalesce($6::bigint,0) > max_amount_minor_per_window
+        FROM evaluated WHERE max_amount_minor_per_window IS NOT NULL AND $6::bigint IS NOT NULL AND used_amount + $6::bigint > max_amount_minor_per_window
     ), verdict AS (
       SELECT
         (SELECT freeze_id FROM active_freeze) frozen_by,

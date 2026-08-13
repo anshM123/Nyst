@@ -228,6 +228,10 @@ small, .small { font-size: .8rem; color: var(--ink-muted); }
 .metric.is-primary { background: var(--surface-warm); }
 .metric.is-primary .value { color: var(--navy); }
 
+/* A notification deep-link landed here. Make that visible, briefly and calmly. */
+.incident.is-deep-linked { box-shadow: 0 0 0 3px var(--focus-soft, rgba(52,101,164,0.25)); }
+.incident:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+
 /* ============================================================ disclosure */
 /* Progressive disclosure for detail that would otherwise bury the summary. */
 details { border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; background: var(--cream-deep); }

@@ -156,6 +156,32 @@ export const APP_JS = `
     if (result) location.href = "/";
   });
 
+  /**
+   * Deep link from a notification to one incident's REAL control.
+   *
+   * Slack used to link to a re-observation intent query parameter, which
+   * nothing honoured: you
+   * clicked a button labelled "Request re-observation" and nothing was
+   * requested. Nyst does not mutate through URL parameters — a link is
+   * something a chat client or a link previewer may fetch with nobody
+   * deciding anything. So arriving here scrolls to the incident and puts
+   * keyboard focus on the control, and the person presses it.
+   */
+  const focusIncident = () => {
+    const match = /^#review-[A-Za-z0-9_-]+$/.exec(location.hash);
+    if (!match) return;
+    const incident = document.querySelector(location.hash);
+    if (!incident) return;
+    incident.scrollIntoView({ block: "center" });
+    const control = incident.querySelector("button[data-operation='request_reobservation']:not([disabled])")
+      || incident.querySelector("button[data-review]:not([disabled])")
+      || incident;
+    control.focus();
+    incident.classList.add("is-deep-linked");
+  };
+  focusIncident();
+  window.addEventListener("hashchange", focusIncident);
+
   document.getElementById("lab-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;

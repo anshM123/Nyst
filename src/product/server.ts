@@ -17,6 +17,7 @@ export const NYST_VERSION = "0.3.0";
 import { protectionReportCsv } from "./protectionReport.js";
 import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
+import { authoritativeConsequenceMetadata } from "./effectSemantics.js";
 import { sanitizeForProduct } from "./sanitize.js";
 import type { EffectSpecDescriptor, ProductCommitter, ProductContext, ProductPrincipal } from "./types.js";
 import type { InMemoryOperationalMetrics } from "./scheduler.js";
@@ -32,23 +33,6 @@ const API_SCOPES = new Set(["actions:read", "actions:write", "receipts:read", "i
  * is unconditional: the operation runs at most once and an exact replay returns
  * the stored response without re-running anything.
  */
-/**
- * Authoritative monetary value of an action, taken ONLY from the structured
- * EffectSpec input. Nyst never infers an amount from free text; an effect
- * without a structured amount reports null and a monetary budget then fails
- * closed rather than guessing.
- */
-function authoritativeAmountMinor(input: unknown): number | null {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-  const value = (input as Record<string, unknown>).amount_minor;
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
-}
-function authoritativeCurrency(input: unknown): string | null {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-  const value = (input as Record<string, unknown>).currency;
-  return typeof value === "string" && /^[a-z]{3}$/.test(value) ? value : null;
-}
-
 /** Print-quality standalone HTML wrapper for a Proof Pack. */
 function proofPackDocument(pack: ProofPack): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
@@ -278,9 +262,18 @@ export async function buildProductServer(options: ProductServerOptions): Promise
    * controlled an action it did not.
    */
   app.post("/v1/actions", api(async (principal, request) => { requireScope(principal, "actions:write"); requireCsrf(request, principal); if (!options.commit) throw Object.assign(new Error("Commit unavailable"), { statusCode: 503 }); const body = object(request.body); const effect = string(body.effect, 200); const businessKey = string(body.businessKey, 463); const agentId = await options.repository.resolveActingAgent(principal, body.agent_id === undefined || body.agent_id === null ? null : string(body.agent_id, 36)); const execution = await options.repository.resolveExecutionMode(principal, agentId, effect); if (execution.mode === "shadow") throw Object.assign(new Error(execution.reason), { statusCode: 409 }); const policy=await options.repository.currentPolicy(principal,effect); if(policy.execution_mode==="approval_required"&&(principal.kind!=="session"||body.approved!==true)) throw Object.assign(new Error("Human approval required before execution"),{statusCode:409}); const availability = await options.repository.requireEffectSpec(principal, effect, options.effect_specs, options.production === true); const namespacedKey = `${principal.environment_id}:${businessKey}`;
+    // PURE EFFECTSPEC VALIDATION, and the authoritative consequence metadata.
+    //
+    // Phase 1G. This runs BEFORE admission, so an invalid request consumes no
+    // budget: previously a caller could exhaust an Agent's blast radius with a
+    // stream of malformed inputs that never reached a provider. It is also the
+    // only place an amount may come from. Nyst does not scrape amount_minor out
+    // of arbitrary caller JSON — a GitHub permission change carrying an amount
+    // is refused, not silently budgeted at one cent.
+    const consequence = authoritativeConsequenceMetadata(effect, body.input);
     // ADMISSION GATE: Emergency Freeze and Blast Radius are evaluated together,
     // in one linearized statement, BEFORE any provider preparation happens.
-    const admission = await options.repository.admitConsequence(principal, { agent_id: agentId, effect_name: effect, business_key: businessKey, amount_minor: authoritativeAmountMinor(body.input), currency: authoritativeCurrency(body.input) });
+    const admission = await options.repository.admitConsequence(principal, { agent_id: agentId, effect_name: effect, business_key: businessKey, amount_minor: consequence.amount_minor, currency: consequence.currency });
     // A blocked consequence never becomes an action, so there is no action row to
     // hang a Human Review on. The durable intervention written by admitConsequence
     // IS the operator-facing artefact, and Needs Attention surfaces it beside

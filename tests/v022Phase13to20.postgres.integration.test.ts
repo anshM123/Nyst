@@ -191,20 +191,32 @@ describe("Nyst v0.2.2 Phases 13-20", { skip: databaseUrl ? false : "DATABASE_URL
   /* ============================================================ PHASE 16 */
 
   it("P16: the Slack notification is informative and offers no unsafe action", () => {
+    const incidentId = randomUUID();
     const message = buildHumanReviewMessage({
-      action_id: randomUUID(), agent_name: "HR Offboarding Agent", effect_name: "github.repository_permission_change",
+      action_id: randomUUID(), incident_id: incidentId, agent_name: "HR Offboarding Agent", effect_name: "github.repository_permission_change",
       environment: "Production", effect_state: "satisfied_unattributed", control_primary: "do_not_retry",
-      reason: "Inherited GitHub access remains", incident_url: "https://nyst.example.com/actions/abc", opened_at: new Date().toISOString(),
+      reason: "Inherited GitHub access remains", incident_url: "https://nyst.example.com/reviews", opened_at: new Date().toISOString(),
     }, "env:NYST_SLACK_WEBHOOK");
     const serialized = JSON.stringify(message);
     assert.match(serialized, /HR Offboarding Agent/);
     assert.match(serialized, /satisfied_unattributed/);
     assert.match(serialized, /Open in Nyst/);
-    assert.match(serialized, /Request re-observation/);
     assert.doesNotMatch(serialized.toLowerCase(), /force continue|force_retry|approve and continue/);
     const actions = (message.blocks as Array<{ type: string; elements?: Array<{ url?: string }> }>).find((block) => block.type === "actions");
     for (const element of actions?.elements ?? []) assert.ok(element.url, "every Slack affordance is a link, never a state change from Slack");
     assert.equal(message.channel_reference, "env:NYST_SLACK_WEBHOOK", "the destination is an opaque reference, never an inline URL");
+
+    // v0.3.0 Phase 1H. The button used to promise an action a link cannot
+    // perform, and pointed at a query parameter nothing in Nyst read.
+    assert.doesNotMatch(serialized, /intent=reobserve/, "the dead query parameter came back");
+    assert.doesNotMatch(serialized, /"Request re-observation"/,
+      "a Slack link may not claim to request anything: clicking it requests nothing");
+    for (const element of actions?.elements ?? []) {
+      assert.doesNotMatch(String(element.url), /[?&]/,
+        "a Slack affordance must not carry query parameters: link previewers fetch links with nobody deciding anything");
+    }
+    assert.match(serialized, new RegExp(`https://nyst\.example\.com/reviews#review-${incidentId}`),
+      "the second affordance must deep-link to the incident's real control");
   });
 
   /* ============================================================ PHASE 17 */

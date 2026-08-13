@@ -79,7 +79,11 @@ export interface GoLiveInput {
   /** True when the effect needs no external provider credential (the dev fake). */
   credential_free_effect: boolean;
   policy_bound: boolean;
+  /** Which immutable policy version would actually bind. Null when none would. */
+  policy_description?: string | null;
   frozen: boolean;
+  /** What the covering freeze is scoped to, for a truthful label. Null when none. */
+  freeze_scope_description?: string | null;
   observation_semantics_available: boolean;
   recovery_behavior_known: boolean;
   webhook_required: boolean;
@@ -117,10 +121,21 @@ export function evaluateGoLiveReadiness(input: GoLiveInput): GoLiveReadiness {
         : integration?.capabilities_sufficient ? "Every capability this workload requires was observed as granted."
         : (integration?.missing_capabilities ?? []).length ? `The provider did not grant: ${(integration?.missing_capabilities ?? []).join(", ")}.`
         : "Capability sufficiency has not been observed, so Nyst will not assume it." },
-    { id: "policy_bound", label: "Policy bound", blocking: true, satisfied: input.policy_bound,
-      detail: input.policy_bound ? "A conservative policy version governs this environment." : "No policy version is configured." },
-    { id: "not_frozen", label: "Environment not frozen", blocking: true, satisfied: !input.frozen,
-      detail: input.frozen ? "An Emergency Freeze covering this scope is active." : "No freeze covers this scope." },
+    // Phase 1F: resolved through the production policy resolver, so this names
+    // the exact immutable version this workload would bind. It previously only
+    // asked whether any policy row existed in the environment.
+    { id: "policy_bound", label: "Effective policy resolves", blocking: true, satisfied: input.policy_bound,
+      detail: input.policy_bound
+        ? (input.policy_description ?? "An immutable policy version binds this workload.")
+        : "No policy version would bind this EffectSpec: neither an EffectSpec-specific policy nor an environment fallback exists." },
+    // Phase 1E: this asks whether a freeze COVERS THIS WORKLOAD, using the
+    // identical predicate admission uses. It previously asked whether any
+    // freeze existed in the environment, so one narrowly scoped freeze marked
+    // every unrelated workload Frozen.
+    { id: "not_frozen", label: "Not covered by a freeze", blocking: true, satisfied: !input.frozen,
+      detail: input.frozen
+        ? `An Emergency Freeze scoped to ${input.freeze_scope_description ?? "this scope"} covers this workload.`
+        : "No active freeze covers this Agent and EffectSpec." },
     { id: "rollout_mode_configured", label: "Rollout mode configured", blocking: false, satisfied: true,
       detail: `The environment is ${input.environment_mode}; this workload executes as ${input.execution_mode}.` },
     { id: "observation_semantics", label: "Observation semantics available", blocking: true, satisfied: input.observation_semantics_available,

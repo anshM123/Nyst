@@ -27,6 +27,8 @@ export interface SlackHumanReviewNotification {
 
 export interface HumanReviewContext {
   action_id: string;
+  /** The Human Review this message is about. Used to deep-link to its controls. */
+  incident_id: string;
   agent_name: string | null;
   effect_name: string;
   environment: string;
@@ -38,11 +40,25 @@ export interface HumanReviewContext {
   opened_at: string;
 }
 
+/** The fragment that deep-links to one incident's controls inside Nyst. */
+export function incidentFragment(incidentId: string): string {
+  return `#review-${incidentId.replace(/[^A-Za-z0-9_-]/g, "")}`;
+}
+
 /**
  * Build the Slack message for a Human Review.
  *
- * Two safe affordances only: open the incident in Nyst, and request a
- * read-only re-observation. Both are links; neither changes state from Slack.
+ * v0.3.0 Phase 1H: the second button used to link to `?intent=reobserve`, and
+ * NOTHING IN NYST HONOURED THAT PARAMETER. It said "Request re-observation",
+ * you clicked it, you landed on the incident page, and no re-observation had
+ * been requested — the most dangerous kind of control, one that looks like it
+ * did something.
+ *
+ * It now links to a fragment. Arriving at that fragment scrolls to the
+ * incident and moves keyboard focus onto the real control, which is a CSRF-
+ * protected POST behind a session. Nyst never mutates through a URL query
+ * parameter: a link is something a chat client, a link previewer or a crawler
+ * may fetch without a person deciding anything.
  */
 export function buildHumanReviewMessage(context: HumanReviewContext, channelReference: string): SlackHumanReviewNotification {
   const summary = `Nyst needs a human: ${context.effect_name} in ${context.environment}`;
@@ -65,7 +81,10 @@ export function buildHumanReviewMessage(context: HumanReviewContext, channelRefe
       // anything from Slack.
       { type: "actions", elements: [
         { type: "button", text: { type: "plain_text", text: "Open in Nyst" }, url: context.incident_url, style: "primary" },
-        { type: "button", text: { type: "plain_text", text: "Request re-observation" }, url: `${context.incident_url}?intent=reobserve` },
+        // Not "Request re-observation": clicking a Slack link does not request
+        // anything. It takes you to the control, which you then use.
+        { type: "button", text: { type: "plain_text", text: "Go to the re-observation control" },
+          url: `${context.incident_url}${incidentFragment(context.incident_id)}` },
       ] },
     ],
   };
