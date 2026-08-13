@@ -383,11 +383,16 @@ describe("Nyst v0.2.2 Phase 1 correctness", { skip: databaseUrl ? false : "DATAB
     let mutations = 0;
     const preflight = await repository.runIntegrationPreflight(tenant, "github", {
       resolve: async () => "synthetic-token-value",
-    }, async () => { return { ok: true, account_identity: "nyst-fixture-org", scopes: ["repo:read"], resource: "nyst-permission-fixture", mutated: (mutations += 0) > 0 }; });
+      // v0.3.0 Phase 1D: readiness gained a CAPABILITIES SUFFICIENT dimension,
+      // so a preflight must report scopes that actually cover what this
+      // EffectSpec requires. The old fixture reported "repo:read", which is not
+      // a GitHub scope at all, and would now correctly fail to grant anything.
+    }, async () => { return { ok: true, account_identity: "nyst-fixture-org", scopes: ["repo", "read:org"], resource: "nyst-permission-fixture", mutated: (mutations += 0) > 0 }; });
     assert.equal(preflight.status, "verified_ready");
     assert.equal(mutations, 0, "provider preflight may never mutate provider state");
     const after = await repository.integrationReadiness(tenant, "github", { resolve: async () => "synthetic-token-value" });
     assert.equal(after.preflight_verified, true);
+    assert.equal(after.capabilities_sufficient, true);
     assert.equal(after.ready, true);
     assert.ok(after.last_preflight_at);
     assert.doesNotMatch(JSON.stringify(after), /synthetic-token-value/);

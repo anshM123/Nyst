@@ -80,6 +80,9 @@ const preflight = async (provider: "github" | "okta" | "stripe", _secret: string
       account_identity: identityOf(result),
       resource: typeof result.repository === "object" && result.repository
         ? String((result.repository as Record<string, unknown>).name ?? "") : undefined,
+      // Only capabilities the probe actually proved by reading. Never a write.
+      verified_capabilities: Array.isArray(result.verified_capabilities)
+        ? result.verified_capabilities.filter((item): item is string => typeof item === "string") : [],
       mutated: result.provider_mutation_performed === true,
     };
   } catch (error) {

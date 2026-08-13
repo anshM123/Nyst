@@ -276,6 +276,7 @@ describe("Nyst v0.2.2 Phases 9-12", { skip: databaseUrl ? false : "DATABASE_URL 
   it("P9: the rollout recommendation is deterministic and states its inputs", async () => {
     const range = resolveRange("7d");
     const ready = [{ provider: "github", available: true, enabled: true, configured: true, credential_available: true, preflight_verified: true,
+      capabilities_sufficient: true, missing_capabilities: [], capability_manifest: null,
       ready: true, last_preflight_at: new Date().toISOString(), last_preflight_status: "verified_ready" as const, preflight_stale: false,
       failure_category: null, reason: "ok", enabled_effect_specs: ["github.repository_permission_change"] }];
     const notReady = [{ ...ready[0]!, ready: false, preflight_verified: false, failure_category: "credential_unavailable" as const, reason: "credential missing" }];

@@ -42,7 +42,7 @@ export const WORKLOAD_LABEL_DEFINITIONS: Readonly<Record<WorkloadLabel, string>>
 export interface ReadinessCheck {
   id:
     | "agent_configured" | "effect_spec_enabled" | "integration_configured" | "credential_resolvable"
-    | "preflight_recent" | "policy_bound" | "not_frozen" | "rollout_mode_configured"
+    | "preflight_recent" | "capabilities_sufficient" | "policy_bound" | "not_frozen" | "rollout_mode_configured"
     | "observation_semantics" | "recovery_behavior_known" | "webhook_configured";
   label: string;
   satisfied: boolean;
@@ -111,6 +111,12 @@ export function evaluateGoLiveReadiness(input: GoLiveInput): GoLiveReadiness {
         : integration?.preflight_verified ? `Last verified ${integration.last_preflight_at}.`
         : integration?.preflight_stale ? "The last successful preflight is outside the 12-hour trust window."
         : "No successful read-only preflight has been recorded." },
+    { id: "capabilities_sufficient", label: "Required capabilities granted", blocking: !input.credential_free_effect,
+      satisfied: input.credential_free_effect || integration?.capabilities_sufficient === true,
+      detail: input.credential_free_effect ? "Not applicable."
+        : integration?.capabilities_sufficient ? "Every capability this workload requires was observed as granted."
+        : (integration?.missing_capabilities ?? []).length ? `The provider did not grant: ${(integration?.missing_capabilities ?? []).join(", ")}.`
+        : "Capability sufficiency has not been observed, so Nyst will not assume it." },
     { id: "policy_bound", label: "Policy bound", blocking: true, satisfied: input.policy_bound,
       detail: input.policy_bound ? "A conservative policy version governs this environment." : "No policy version is configured." },
     { id: "not_frozen", label: "Environment not frozen", blocking: true, satisfied: !input.frozen,

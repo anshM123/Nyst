@@ -4,7 +4,8 @@ import type { ActionFilters, EffectSpecDescriptor, ProductContext, ProductPrinci
 import { validateWebhookTarget, type ConservativePolicy, type EnvironmentMode, type FailureScenario, type ShadowObservation } from "./controlPlane.js";
 import { effectiveAuthority, permittedHumanReviewOperations, SQL_AUTOMATIC_COMPENSATION_AUTHORITY, SQL_AUTOMATIC_CONTINUATION_AUTHORITY, type HumanReviewOperation } from "./effectiveAuthority.js";
 import { assertShadowObservationSchema, deriveShadowSemantics } from "./shadowSemantics.js";
-import { composeReadiness, probeCredentialAvailability, runPreflight, type IntegrationReadiness, type PreflightProbe, type PreflightStatus } from "./readiness.js";
+import { composeReadiness, evaluateEffectSpecReadiness, isPreflightStale, probeCredentialAvailability, runPreflight, type IntegrationReadiness, type PreflightProbe, type PreflightStatus } from "./readiness.js";
+import { buildCapabilityManifest, CAPABILITY_MANIFEST, observedCapabilities, requiredCapabilities, requiredCapabilityRecords, sufficientCapabilities, type CapabilityAttestation, type ProviderCapabilityManifest } from "./capabilityManifest.js";
 import type { SecretProvider } from "./secretProvider.js";
 import { pruneIdempotencyKeys, withIdempotency, type IdempotentOperation } from "./idempotency.js";
 import { admitConsequence, linkAdmissionToAction, lockEnvironmentAuthority, type AdmissionDecision, type AdmissionRequest } from "./admission.js";
@@ -249,9 +250,45 @@ export class ProductRepository {
 
   async apiKeys(scope:TenantScope):Promise<Record<string,unknown>[]>{return (await this.db.query(`SELECT k.api_key_id,k.name,k.prefix,k.scopes,k.created_at,k.last_used_at,k.expires_at,k.revoked_at,k.agent_id,a.name agent_name FROM nyst_api_keys k LEFT JOIN nyst_agents a USING(agent_id) WHERE k.organization_id=$1 AND k.project_id=$2 AND k.environment_id=$3 ORDER BY k.created_at DESC`,[scope.organization_id,scope.project_id,scope.environment_id])).rows;}
 
-  async effectSpecStatuses(scope:TenantScope,descriptors:readonly EffectSpecDescriptor[],production:boolean):Promise<Record<string,unknown>[]>{
-    await this.requireTenantScope(scope);const result=await this.db.query(`SELECT s.effect_name,s.spec_version,s.enabled,i.configured,i.credential_ref FROM nyst_environment_effect_specs s LEFT JOIN nyst_integrations i ON i.environment_id=s.environment_id AND i.project_id=s.project_id AND i.organization_id=s.organization_id AND i.provider=split_part(s.effect_name,'.',1) WHERE s.organization_id=$1 AND s.project_id=$2 AND s.environment_id=$3`,[scope.organization_id,scope.project_id,scope.environment_id]);const configured=new Map(result.rows.map(row=>[String(row.effect_name),row]));
-    return descriptors.map(descriptor=>{const row=configured.get(descriptor.effect_name);const versionMatches=!!row&&String(row.spec_version)===descriptor.spec_version;const enabled=versionMatches&&row.enabled===true;const integrationReady=descriptor.provider==="fake"?!production:row?.configured===true&&row?.credential_ref===EXPECTED_PROVIDER_REFS[descriptor.provider];const ready=enabled&&integrationReady;const status=!row?"available":!versionMatches?"historical_version":!enabled?"disabled":ready?"ready":"blocked_missing_integration";return {...descriptor,available:true,enabled,ready,status,configured_spec_version:row?String(row.spec_version):null,integration_configured:row?.configured===true,credential_ref:row?.credential_ref??null}});
+  /**
+   * Every registered EffectSpec's readiness in this environment.
+   *
+   * `secrets` is REQUIRED, not optional. The previous signature let a caller
+   * omit it and still receive a `ready: true`, because readiness was decided by
+   * comparing a stored credential reference string against a constant. That is
+   * the second definition Phase 1D exists to delete. If a caller genuinely has
+   * no SecretProvider it may pass null, and every provider-backed EffectSpec
+   * comes back `readiness_unevaluated` — never ready.
+   */
+  async effectSpecStatuses(scope:TenantScope,descriptors:readonly EffectSpecDescriptor[],production:boolean,secrets:SecretProvider|null,now:Date=new Date()):Promise<Record<string,unknown>[]>{
+    await this.requireTenantScope(scope);
+    const result=await this.db.query(`SELECT s.effect_name,s.spec_version,s.enabled,i.configured,i.credential_ref FROM nyst_environment_effect_specs s LEFT JOIN nyst_integrations i ON i.environment_id=s.environment_id AND i.project_id=s.project_id AND i.organization_id=s.organization_id AND i.provider=split_part(s.effect_name,'.',1) WHERE s.organization_id=$1 AND s.project_id=$2 AND s.environment_id=$3`,[scope.organization_id,scope.project_id,scope.environment_id]);
+    const configured=new Map(result.rows.map(row=>[String(row.effect_name),row]));
+    // One canonical readiness evaluation per provider, shared by every
+    // EffectSpec that dispatches through it.
+    const providers=new Map<string,IntegrationReadiness>();
+    if(secrets){
+      for(const provider of new Set(descriptors.map(d=>d.provider).filter(p=>p!=="fake"))){
+        providers.set(provider,await this.integrationReadiness(scope,provider,secrets,now));
+      }
+    }
+    return descriptors.map(descriptor=>{
+      const row=configured.get(descriptor.effect_name);
+      const credentialFree=descriptor.provider==="fake";
+      const readiness=evaluateEffectSpecReadiness({
+        registered:true,
+        configured_in_environment:!!row,
+        version_matches:!!row&&String(row.spec_version)===descriptor.spec_version,
+        environment_enabled:row?.enabled===true,
+        credential_free:credentialFree,
+        production,
+        integration:credentialFree?null:providers.get(descriptor.provider)??null,
+      });
+      return {...descriptor,...readiness,
+        configured_spec_version:row?String(row.spec_version):null,
+        integration_configured:row?.configured===true,
+        credential_ref:row?.credential_ref??null};
+    });
   }
 
   async requireEffectSpec(scope: TenantScope, effectName: string, descriptors: readonly EffectSpecDescriptor[], production: boolean): Promise<EffectSpecDescriptor & { enabled: true; credential_ref: string | null }> {
@@ -680,27 +717,120 @@ export class ProductRepository {
   /** Overview reads the canonical contract. There is no second definition. */
   async overview(scope: TenantScope): Promise<CanonicalMetrics> { return this.canonicalMetrics(scope); }
 
-  async integrationReadiness(scope:TenantScope,provider:string,secrets:SecretProvider,now:Date=new Date()):Promise<IntegrationReadiness>{
-    if(!["github","okta","stripe"].includes(provider))throw new Error("Unsupported integration provider");
-    const row=(await this.db.query(`SELECT i.credential_ref,i.configured,
-        (SELECT status FROM nyst_integration_preflights WHERE environment_id=$1 AND provider=$4 ORDER BY performed_at DESC LIMIT 1) last_status,
-        (SELECT performed_at FROM nyst_integration_preflights WHERE environment_id=$1 AND provider=$4 ORDER BY performed_at DESC LIMIT 1) last_at,
+  /** The raw facts one provider's readiness and capability manifest are both built from. */
+  private async integrationFacts(scope:TenantScope,provider:string,now:Date):Promise<{
+    credentialRef:string|null;configured:boolean;enabledEffects:string[];
+    lastStatus:PreflightStatus|null;lastAt:string|null;scopeResult:unknown;accountIdentity:string|null;
+    resourceCoverage:string[];attestations:CapabilityAttestation[];stale:boolean;
+  }>{
+    const row=(await this.db.query(`SELECT i.credential_ref,i.configured,p.status last_status,p.performed_at last_at,
+        p.scope_result last_scope_result,p.account_identity last_account_identity,p.resource_result last_resource_result,
         (SELECT coalesce(array_agg(effect_name ORDER BY effect_name),ARRAY[]::text[]) FROM nyst_environment_effect_specs
           WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND enabled AND split_part(effect_name,'.',1)=$4) enabled_effects
       FROM (SELECT 1) one
-      LEFT JOIN nyst_integrations i ON i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND i.provider=$4`,
+      LEFT JOIN nyst_integrations i ON i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND i.provider=$4
+      LEFT JOIN LATERAL (SELECT status,performed_at,scope_result,account_identity,resource_result
+        FROM nyst_integration_preflights WHERE environment_id=$1 AND provider=$4 ORDER BY performed_at DESC LIMIT 1) p ON true`,
       [scope.environment_id,scope.project_id,scope.organization_id,provider])).rows[0]??{};
-    const credentialRef=typeof row.credential_ref==="string"?row.credential_ref:null;
-    const configured=row.configured===true&&credentialRef!==null;
-    const enabledEffects=Array.isArray(row.enabled_effects)?row.enabled_effects.map(String):[];
-    const credential=configured?await probeCredentialAvailability(secrets,credentialRef):{available:false,category:"credential_unavailable" as const};
-    return composeReadiness({
-      provider, available:true, enabled:enabledEffects.length>0, configured,
-      credential_available:credential.available, credential_failure:credential.category,
-      last_preflight_at:row.last_at?new Date(String(row.last_at)).toISOString():null,
-      last_preflight_status:(row.last_status as PreflightStatus|undefined)??null,
-      enabled_effect_specs:enabledEffects, now,
+    const attestations=(await this.db.query(`SELECT c.capability,u.email attested_by,c.attested_at
+      FROM nyst_capability_attestations c JOIN nyst_users u ON u.user_id=c.attested_by
+      WHERE c.environment_id=$1 AND c.project_id=$2 AND c.organization_id=$3 AND c.provider=$4 AND c.revoked_at IS NULL`,
+      [scope.environment_id,scope.project_id,scope.organization_id,provider])).rows
+      .map(item=>({capability:String(item.capability),attested_by:String(item.attested_by),attested_at:new Date(String(item.attested_at)).toISOString()}));
+    const lastAt=row.last_at?new Date(String(row.last_at)).toISOString():null;
+    const resource=row.last_resource_result&&typeof row.last_resource_result==="object"
+      ? Object.values(row.last_resource_result as Record<string,unknown>).filter((item):item is string=>typeof item==="string") : [];
+    return {
+      credentialRef:typeof row.credential_ref==="string"?row.credential_ref:null,
+      configured:row.configured===true&&typeof row.credential_ref==="string",
+      enabledEffects:Array.isArray(row.enabled_effects)?row.enabled_effects.map(String):[],
+      lastStatus:(row.last_status as PreflightStatus|undefined)??null,
+      lastAt, scopeResult:row.last_scope_result,
+      accountIdentity:row.last_account_identity?String(row.last_account_identity):null,
+      resourceCoverage:resource, attestations, stale:isPreflightStale(lastAt,now),
+    };
+  }
+
+  /**
+   * The durable CapabilityManifest for one provider connection.
+   *
+   * There is no `connected: true` anywhere in this product. Each required
+   * capability carries one of six states and the reason it is in that state,
+   * and an attestation is always labelled as a claim rather than an
+   * observation.
+   */
+  async capabilityManifest(scope:TenantScope,provider:string,now:Date=new Date()):Promise<ProviderCapabilityManifest>{
+    if(!["github","okta","stripe"].includes(provider))throw new Error("Unsupported integration provider");
+    return this.composeCapabilityManifest(provider,await this.integrationFacts(scope,provider,now));
+  }
+
+  private composeCapabilityManifest(provider:string,facts:Awaited<ReturnType<ProductRepository["integrationFacts"]>>):ProviderCapabilityManifest{
+    const observed=observedCapabilities(provider,facts.scopeResult);
+    const verifiedPreflight=facts.lastStatus==="verified_ready";
+    const raw=facts.scopeResult&&typeof facts.scopeResult==="object"?(facts.scopeResult as {scopes?:unknown}).scopes:undefined;
+    const scopes=Array.isArray(raw)?raw.filter((item):item is string=>typeof item==="string"):[];
+    return buildCapabilityManifest({
+      provider, account_identity:facts.accountIdentity,
+      required:requiredCapabilityRecords(facts.enabledEffects),
+      // Nothing is observed until a preflight actually succeeded. A failed
+      // preflight tells us about the credential, not about its capabilities.
+      granted_scopes:verifiedPreflight?scopes:[],
+      verified_capabilities:verifiedPreflight?observed.verified:[],
+      refused_capabilities:facts.lastStatus==="insufficient_permission"?requiredCapabilities(facts.enabledEffects):[],
+      attestations:facts.attestations,
+      resource_coverage:facts.resourceCoverage,
+      observed_at:facts.lastAt, stale:facts.stale,
     });
+  }
+
+  async integrationReadiness(scope:TenantScope,provider:string,secrets:SecretProvider,now:Date=new Date()):Promise<IntegrationReadiness>{
+    if(!["github","okta","stripe"].includes(provider))throw new Error("Unsupported integration provider");
+    const facts=await this.integrationFacts(scope,provider,now);
+    const credential=facts.configured?await probeCredentialAvailability(secrets,facts.credentialRef):{available:false,category:"credential_unavailable" as const};
+    const manifest=this.composeCapabilityManifest(provider,facts);
+    return composeReadiness({
+      provider, available:true, enabled:facts.enabledEffects.length>0, configured:facts.configured,
+      credential_available:credential.available, credential_failure:credential.category,
+      last_preflight_at:facts.lastAt, last_preflight_status:facts.lastStatus,
+      enabled_effect_specs:facts.enabledEffects,
+      // Capability sufficiency compares what the enabled workloads REQUIRE
+      // against what was actually observed or explicitly attested. A credential
+      // that resolves and authenticates can still be unable to perform the
+      // consequence, and that must not read as Ready.
+      required_capabilities:requiredCapabilities(facts.enabledEffects),
+      granted_capabilities:sufficientCapabilities(manifest),
+      capability_manifest:manifest,
+      now,
+    });
+  }
+
+  /**
+   * Record an operator's claim that a credential holds a capability Nyst could
+   * not observe. This is a claim, not evidence, and is stored and shown as such.
+   */
+  async attestCapability(scope:TenantScope,userId:string,provider:string,capability:string,justification:string):Promise<Record<string,unknown>>{
+    if(!["github","okta","stripe"].includes(provider))throw Object.assign(new Error("Unsupported integration provider"),{statusCode:400});
+    await this.requireTenantScope(scope);
+    const known=new Set(Object.values(CAPABILITY_MANIFEST).flat().map(item=>item.capability));
+    if(!known.has(capability))throw Object.assign(new Error("Unknown capability token"),{statusCode:400});
+    if(!capability.startsWith(`${provider}:`))throw Object.assign(new Error("That capability does not belong to this provider"),{statusCode:400});
+    if(justification.trim().length<10)throw Object.assign(new Error("An attestation requires a justification of at least 10 characters"),{statusCode:400});
+    const inserted=await this.db.query(`INSERT INTO nyst_capability_attestations(attestation_id,environment_id,project_id,organization_id,provider,capability,attested_by,justification)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (environment_id,provider,capability) WHERE revoked_at IS NULL DO NOTHING
+      RETURNING attestation_id,capability,attested_at`,
+      [randomUUID(),scope.environment_id,scope.project_id,scope.organization_id,provider,capability,userId,justification.trim()]);
+    if(!inserted.rows[0])throw Object.assign(new Error("A live attestation for that capability already exists"),{statusCode:409});
+    return {...inserted.rows[0]!,attested_not_observed:true};
+  }
+
+  /** Withdraw an attestation. The row survives; only a withdrawal is recorded. */
+  async revokeCapabilityAttestation(scope:TenantScope,userId:string,attestationId:string):Promise<boolean>{
+    await this.requireTenantScope(scope);
+    const result=await this.db.query(`UPDATE nyst_capability_attestations SET revoked_at=now(),revoked_by=$4
+      WHERE attestation_id=$1 AND environment_id=$2 AND organization_id=$3 AND revoked_at IS NULL RETURNING attestation_id`,
+      [attestationId,scope.environment_id,scope.organization_id,userId]);
+    return result.rows.length>0;
   }
 
   /**

@@ -660,6 +660,7 @@ export function effectRegistryPage(specs: readonly Record<string, unknown>[], co
       <div><dt>Enabled here</dt><dd>${spec.enabled ? "yes" : "no"}</dd></div>
       <div><dt>Supported topology</dt><dd>${escape(String(spec.supported_topology ?? ""))}</dd></div>
       <div><dt>Credential reference</dt><dd>${spec.credential_ref ? `<span class="mono">${escape(String(spec.credential_ref))}</span>` : "not required"}</dd></div>
+      <div><dt>Readiness</dt><dd>${escape(String(spec.reason ?? ""))}</dd></div>
     </dl>
   </div>`).join("") : `<div class="panel panel-pad"><p class="empty">No EffectSpecs are registered.</p></div>`}
 
@@ -735,7 +736,7 @@ export function integrationsPage(readiness: readonly Record<string, unknown>[], 
   <div class="page-head">
     <p class="eyebrow">Connection readiness</p>
     <h1>Integrations</h1>
-    <p class="lede">Readiness is six separate conditions, not one flag. "Test" runs a bounded read-only preflight; it never mutates provider state, and Nyst never displays a credential.</p>
+    <p class="lede">Readiness is seven separate conditions, not one flag. Every screen in Nyst reads this same evaluation, so no page can call a workload Ready while this one says Not ready. "Test" runs a bounded read-only preflight; it never mutates provider state, and Nyst never displays a credential.</p>
   </div>
   ${readiness.map((item) => `<div class="panel panel-pad gap-below-m">
     <header class="split-top">
@@ -748,7 +749,9 @@ export function integrationsPage(readiness: readonly Record<string, unknown>[], 
       ${dimension("Configured", item.configured === true, "A credential reference is stored. The value itself is never stored.")}
       ${dimension("Credential available", item.credential_available === true, "The SecretProvider resolved the reference without exposing it.")}
       ${dimension("Preflight verified", item.preflight_verified === true, item.last_preflight_at ? `Last read-only preflight ${String(item.last_preflight_at)}${item.preflight_stale ? " (outside the 12-hour trust window)" : ""}` : "No successful read-only preflight recorded.")}
+      ${dimension("Capabilities sufficient", item.capabilities_sufficient === true, ((item.missing_capabilities as string[]) ?? []).length ? `Not granted: ${((item.missing_capabilities as string[]) ?? []).join(", ")}` : "Every capability the enabled EffectSpecs require was observed as granted.")}
     </ul>
+    ${capabilityBlock(item)}
     <div class="button-row gap-l">
       <button data-preflight="${escape(String(item.provider))}">Run read-only preflight</button>
     </div>
@@ -764,6 +767,36 @@ export function integrationsPage(readiness: readonly Record<string, unknown>[], 
         <td><span class="badge ${spec.ready ? "resolved" : "neutral"}">${escape(String(spec.status ?? ""))}</span></td>
       </tr>`).join("")}</tbody></table></div>` : `<div class="panel panel-pad"><p class="empty">No EffectSpecs registered.</p></div>`}
   </section>`, context);
+}
+
+/**
+ * The CapabilityManifest, rendered as six states rather than a green dot.
+ *
+ * An attested capability is always shown as a CLAIM. Nyst cannot verify a
+ * write capability read-only — proving it would require a mutation — so the
+ * page says which capabilities were observed, which were authorized by the
+ * provider's own metadata, and which a person vouched for.
+ */
+function capabilityBlock(item: Record<string, unknown>): string {
+  const manifest = item.capability_manifest as {
+    capabilities?: Array<{ capability: string; kind: string; state: string; why: string; detail: string; attested_not_observed: boolean }>;
+    granted_scopes?: string[]; limitation?: string | null; account_identity?: string | null;
+  } | null | undefined;
+  const capabilities = manifest?.capabilities ?? [];
+  if (!capabilities.length) return "";
+  const rows = capabilities.map((capability) => `<tr>
+    <td class="mono small">${escape(capability.capability)}</td>
+    <td>${escape(capability.kind)}</td>
+    <td><span class="badge ${capability.state === "verified" || capability.state === "authorized" ? "resolved" : capability.state === "insufficient_permission" || capability.state === "unavailable" ? "blocked" : "uncertain"}">${escape(capability.state.replace(/_/g, " "))}</span></td>
+    <td class="small">${escape(capability.detail)}${capability.attested_not_observed ? ` <strong>Claimed, not observed.</strong>` : ""}</td>
+  </tr>`).join("");
+  return `<details class="gap-l"><summary>Capabilities (${capabilities.length})</summary>
+    <p class="small">Nyst compares what each enabled EffectSpec requires against what a read-only preflight could observe. A write capability cannot be proved without performing a write, so it is only ever authorized by the provider's own metadata or claimed by a person.</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th scope="col">Capability</th><th scope="col">Kind</th><th scope="col">State</th><th scope="col">Why it is in that state</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    ${manifest?.limitation ? `<p class="note">${escape(String(manifest.limitation))}</p>` : ""}
+  </details>`;
 }
 
 function dimension(label: string, satisfied: boolean, detail: string): string {

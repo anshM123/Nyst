@@ -228,6 +228,14 @@ small, .small { font-size: .8rem; color: var(--ink-muted); }
 .metric.is-primary { background: var(--surface-warm); }
 .metric.is-primary .value { color: var(--navy); }
 
+/* ============================================================ disclosure */
+/* Progressive disclosure for detail that would otherwise bury the summary. */
+details { border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; background: var(--cream-deep); }
+details + details { margin-top: 10px; }
+details > summary { cursor: pointer; font-weight: 600; font-size: 0.92rem; }
+details > summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 4px; }
+details[open] > summary { margin-bottom: 10px; }
+
 /* ============================================================ badges */
 /* Status is never colour-only: every badge carries a text label. */
 .badge {

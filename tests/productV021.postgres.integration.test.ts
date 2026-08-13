@@ -46,7 +46,34 @@ describe("Nyst v0.2.1 PostgreSQL correctness controls",{skip:databaseUrl?false:"
 
   it("does not follow a webhook redirect and persists the bounded failure",async()=>{const action=(await pool.query(`SELECT action_id FROM nyst_action_scopes WHERE environment_id=$1 ORDER BY created_at DESC LIMIT 1`,[tenant.environment_id])).rows[0]!;const resolution=await runtime.reconcile(String(action.action_id));await repository.recordResolutionTransition(String(action.action_id),resolution,"manual_reconcile");let requests=0;const worker=new NystDecisionWebhookWorker(pool,{async resolve(){return"synthetic-v021-webhook-secret-000000000"}},async(_input,init)=>{requests++;assert.equal(init?.redirect,"error");return new Response("",{status:302,headers:{location:"https://127.0.0.1/"}})},30_000,async()=>[{address:"93.184.216.34"}]);assert.equal(await worker.runOne(),true);assert.equal(requests,1);const attempt=(await pool.query(`SELECT response_status,error_code FROM nyst_webhook_attempts ORDER BY attempted_at DESC LIMIT 1`)).rows[0]!;assert.equal(attempt.response_status,302);assert.equal(attempt.error_code,"webhook_http_302")});
 
-  it("distinguishes available, enabled, and consequence-ready EffectSpecs and performs no mutation in credential readiness",async()=>{const initial=await repository.effectSpecStatuses(tenant,descriptors,false);const fake=initial.find(item=>item.effect_name===effect)!;const github=initial.find(item=>item.provider==="github")!;assert.equal(fake.status,"ready");assert.equal(github.status,"available");const githubDescriptor=descriptors.find(item=>item.provider==="github")!;await repository.configureIntegration(tenant,"github","env:NYST_GITHUB_TOKEN");await repository.configureEffectSpec(tenant,githubDescriptor,true);const configured=(await repository.effectSpecStatuses(tenant,descriptors,false)).find(item=>item.provider==="github")!;assert.equal(configured.enabled,true);assert.equal(configured.ready,true);const readiness=await repository.integrationReadiness(tenant,"github",new TestSecretProvider({"env:NYST_GITHUB_TOKEN":"synthetic-readiness-only"}));assert.equal(readiness.credential_available,true);assert.equal(readiness.preflight_verified,false,"resolving a credential is never preflight verification");assert.equal(readiness.ready,false,"Ready additionally requires a recent read-only preflight")});
+  it("distinguishes available, enabled, and consequence-ready EffectSpecs and performs no mutation in credential readiness",async()=>{
+    // v0.3.0 Phase 1D: this test previously asserted the contradiction it was
+    // supposed to prevent. It required effectSpecStatuses to report the GitHub
+    // spec `ready: true` while integrationReadiness, for the same provider in
+    // the same environment at the same instant, reported `ready: false`. Both
+    // now come from one evaluator, so the answer is the same on every screen.
+    const secrets=new TestSecretProvider({"env:NYST_GITHUB_TOKEN":"synthetic-readiness-only"});
+    const initial=await repository.effectSpecStatuses(tenant,descriptors,false,secrets);
+    const fake=initial.find(item=>item.effect_name===effect)!;const github=initial.find(item=>item.provider==="github")!;
+    assert.equal(fake.status,"ready");assert.equal(github.status,"available");
+    const githubDescriptor=descriptors.find(item=>item.provider==="github")!;
+    await repository.configureIntegration(tenant,"github","env:NYST_GITHUB_TOKEN");
+    await repository.configureEffectSpec(tenant,githubDescriptor,true);
+    const configured=(await repository.effectSpecStatuses(tenant,descriptors,false,secrets)).find(item=>item.provider==="github")!;
+    assert.equal(configured.enabled,true);
+    const readiness=await repository.integrationReadiness(tenant,"github",secrets);
+    assert.equal(readiness.credential_available,true);
+    assert.equal(readiness.preflight_verified,false,"resolving a credential is never preflight verification");
+    assert.equal(readiness.ready,false,"Ready additionally requires a recent read-only preflight");
+    assert.equal(configured.ready,readiness.ready,"the Effects screen and the Integrations screen disagreed about the same provider");
+    assert.equal(configured.ready,false);
+    assert.equal(configured.status,"blocked_missing_integration");
+    assert.equal(configured.failure_category,readiness.failure_category);
+    // And with no SecretProvider at all, readiness is unevaluated — never ready.
+    const unevaluated=(await repository.effectSpecStatuses(tenant,descriptors,false,null)).find(item=>item.provider==="github")!;
+    assert.equal(unevaluated.ready,false);
+    assert.equal(unevaluated.status,"readiness_unevaluated");
+  });
 
   it("disables future webhook events without rewriting history and exposes attempt status",async()=>{const before=(await pool.query(`SELECT count(*)::int count FROM nyst_webhook_events e JOIN nyst_webhook_endpoints w USING(webhook_endpoint_id) WHERE w.environment_id=$1`,[tenant.environment_id])).rows[0]!.count;await repository.setWebhookEnabled(tenant,tenant.user_id,false);const status=(await repository.webhookStatus(tenant))[0]!;assert.equal(status.enabled,false);assert.ok(Number(status.delivery_attempt_count)>=1);await assert.rejects(()=>repository.queueWebhookTest(tenant),/enabled webhook endpoint/);const after=(await pool.query(`SELECT count(*)::int count FROM nyst_webhook_events e JOIN nyst_webhook_endpoints w USING(webhook_endpoint_id) WHERE w.environment_id=$1`,[tenant.environment_id])).rows[0]!.count;assert.equal(after,before);await repository.setWebhookEnabled(tenant,tenant.user_id,true)});
 

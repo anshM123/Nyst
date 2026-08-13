@@ -114,15 +114,26 @@ export function createProductProviderRuntime(
       const organization=await githubClient.getOrganization(owner,ref),repo=await githubClient.getRepository(owner,repository,ref),user=await githubClient.getUser(principal,ref),member=await githubClient.checkOrganizationMember(owner,principal,ref),collaborators=await githubClient.listDirectCollaborators(owner,repository,ref),permission=await githubClient.getPermission(owner,repository,principal,ref);
       if(organization.status!==200||repo.status!==200||user.status!==200||member.status!==204||collaborators.status!==200||permission.status!==200||!organization.data||!repo.data||!user.data||member.data!==true||!collaborators.data||!permission.data)throw new Error("GitHub read-only preflight failed");
       const direct=collaborators.data.find(item=>item.id===user.data!.id);if(!repo.data.private||!direct)throw new Error("GitHub fixture topology is unsupported");
-      return {status:"ready",provider,provider_mutation_performed:false,repository:{owner:repo.data.owner,name:repo.data.name,id:repo.data.id,private:repo.data.private},principal:{login:user.data.login,id:user.data.id,organization_member:true,direct_collaborator:true,role_name:direct.role_name,effective_permission:permission.data.permission}};
+      // Capabilities this read-only preflight ACTUALLY proved by performing
+      // the read. github:collaborator:write is deliberately absent: proving it
+      // would require a mutation, which invariant I20 forbids. It becomes
+      // AUTHORIZED only from GitHub's own scope metadata, or from an explicit
+      // operator attestation labelled as a claim.
+      return {status:"ready",provider,provider_mutation_performed:false,verified_capabilities:["github:organization:read","github:repository:read"],repository:{owner:repo.data.owner,name:repo.data.name,id:repo.data.id,private:repo.data.private},principal:{login:user.data.login,id:user.data.id,organization_member:true,direct_collaborator:true,role_name:direct.role_name,effective_permission:permission.data.permission}};
     }
     if(provider==="okta"){
       const origin=requiredFixtureAny(["NYST_OKTA_ORG_URL","OKTA_ORG_URL"]),userId=requiredFixtureAny(["NYST_OKTA_TEST_USER_ID","OKTA_TEST_USER_ID"]);const user=await oktaClient.getUser(origin,userId,OKTA_CREDENTIAL_REF),roles=await oktaClient.listUserRoles(origin,userId,OKTA_CREDENTIAL_REF);
       if(user.status!==200||roles.status!==200||!user.data||!roles.data||user.data.id!==userId)throw new Error("Okta read-only preflight failed");
-      return {status:"ready",provider,provider_mutation_performed:false,tenant:new URL(origin).hostname,user:{id:user.data.id,login:user.data.login,status:user.data.status,source_type:user.data.source_type,admin_role_count:roles.data.length}};
+      // okta:user:lifecycle is a write capability and cannot be proved by a
+      // read-only preflight. See the GitHub note above.
+      return {status:"ready",provider,provider_mutation_performed:false,verified_capabilities:["okta:user:read"],tenant:new URL(origin).hostname,user:{id:user.data.id,login:user.data.login,status:user.data.status,source_type:user.data.source_type,admin_role_count:roles.data.length}};
     }
     const account=await stripeClient.getAccount(STRIPE_CREDENTIAL_REF);if(account.status!==200||!account.data)throw new Error("Stripe read-only preflight failed");
-    return {status:"ready",provider,provider_mutation_performed:false,account:{id:account.data.id},mode:"test_or_restricted_test_credential"};
+    // Reading the account proves the key authenticates. It proves nothing
+    // about charge/refund/capture permissions: Stripe restricted keys publish
+    // no scope list, so those capabilities stay AVAILABLE until an operator
+    // attests to them. This boundary is named in docs/product/known-boundaries.md.
+    return {status:"ready",provider,provider_mutation_performed:false,verified_capabilities:[],account:{id:account.data.id},mode:"test_or_restricted_test_credential"};
   };
   return { runtime, descriptors, commit, offboarding:new OffboardingCoordinator(store,runtime,okta,github,clock), preflight };
 }
