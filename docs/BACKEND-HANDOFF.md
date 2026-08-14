@@ -264,5 +264,5 @@ Stated plainly so you do not build against something that does not exist.
 | Where Nyst stops | `docs/product/known-boundaries.md` |
 | Why a defect exists | its test file — every v0.3.1 fix has one, and each failed before it passed |
 
-**991 tests, 0 failing, 0 skipped, 124 suites. 30 migrations, applied cleanly
+**998 tests, 0 failing, 0 skipped, 125 suites. 30 migrations, applied cleanly
 from an empty database.**

@@ -13,13 +13,13 @@ verified, with the reason.
 | | |
 | --- | --- |
 | Version | **0.3.1 — backend-hardened** |
-| Automated tests | **956 passing, 0 failing, 0 skipped** |
-| Test suites | 121 |
-| Migrations | 29, applied cleanly from an empty database |
+| Automated tests | **998 passing, 0 failing, 0 skipped** |
+| Test suites | 125 |
+| Migrations | 30, applied cleanly from an empty database |
 | Runtime dependencies | 4 — `fastify`, `@fastify/cookie`, `bcryptjs`, `pg` |
 | Secret scan | No credential-shaped value in source, tests, docs, migrations, brand assets, the packed SDK tarball, or the Docker build context |
 
-Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → **956**.
+Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → **998**.
 
 ---
 
@@ -244,7 +244,7 @@ provider-shaped clients and fault injection.
 
 **Nyst v0.3.1 is not LAUNCH READY**, and this document will say so until it is.
 
-What is true: the architecture is complete across all three layers, 956 tests
+What is true: the architecture is complete across all three layers, 998 tests
 pass with nothing skipped, every known defect has a regression test that failed
 first, and every boundary above is stated rather than hidden.
 
