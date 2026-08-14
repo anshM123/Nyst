@@ -309,27 +309,119 @@ export class OutcomeRepository {
    * because "what did Nyst believe at 14:02, and on what basis" is the
    * question a customer will eventually need answered.
    */
+  /**
+   * Record an observation about the world.
+   *
+   * TWO THINGS THIS HAS TO GET RIGHT (v0.3.1 issue 7).
+   *
+   * ONE CURRENT FACT. The previous implementation read the incumbent, inserted,
+   * then superseded — with nothing held across the three statements. Two
+   * observations arriving together both read the same incumbent and both stayed
+   * current, handing the invariant engine two contradictory statements about
+   * one property. The incumbent is now locked FOR UPDATE first, and a partial
+   * unique index makes a second current fact impossible regardless of who
+   * writes it.
+   *
+   * SUPERSESSION FOLLOWS OBSERVATION TIME, NOT ARRIVAL TIME. The incumbent was
+   * chosen by `ORDER BY observed_at DESC`, but the INCOMING fact's observed_at
+   * was never compared against it — so a delayed webhook, a retried job or a
+   * Relay reconnecting after an outage could supersede a newer observation with
+   * an older one. Nyst observes at 10:05 that Alice still has WRITE, a stale
+   * 10:00 "none" lands at 10:06, and the outcome flips to SATISFIED while the
+   * access is live. That is the worst failure this system can have: not
+   * refusing to answer, but answering confidently and wrongly.
+   *
+   * A stale observation is still recorded. It is evidence, and evidence is
+   * never discarded — it simply arrives already superseded, as history rather
+   * than as truth.
+   */
   async recordFact(scope: TenantScope, input: WorldFactInput): Promise<WorldFact> {
-    const id = randomUUID();
-    const previous = (await this.db.query(
-      `SELECT fact_id FROM nyst_world_facts
-       WHERE environment_id=$1 AND subject_ref=$2 AND property=$3 AND provider=$4 AND superseded_at IS NULL
-       ORDER BY observed_at DESC LIMIT 1`,
-      [scope.environment_id, input.subject_ref, input.property, input.provider])).rows[0];
+    return this.inFactTransaction(async (client) => {
+      /**
+       * Serialize on the KEY, not on a row.
+       *
+       * `SELECT ... FOR UPDATE` is the obvious choice and it is wrong here, in
+       * a way worth recording because it looks correct and passes a two-way
+       * test. Under READ COMMITTED a waiter blocks on the incumbent row, and
+       * when the winner commits the lock is released — but the row now has
+       * `superseded_at` set, so it no longer matches `superseded_at IS NULL`.
+       * The waiter re-reads, finds NO incumbent, concludes it is the first
+       * observation, and inserts as current. Both rows are current.
+       *
+       * The thing that needs serializing is the slot (environment, subject,
+       * provider, property), which is not a row and is absent entirely for a
+       * first observation. So the lock is taken on the key itself. It is held
+       * to the end of the transaction and released by COMMIT or ROLLBACK.
+       *
+       * A hash collision between two unrelated keys costs a little needless
+       * contention and can never cost correctness.
+       */
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0::bigint))",
+        [`${scope.environment_id}|${input.subject_ref}|${input.provider}|${input.property}`]);
 
-    const inserted = await this.db.query(
-      `INSERT INTO nyst_world_facts(fact_id,organization_id,project_id,environment_id,subject_ref,provider,property,
-         value,value_type,observed_at,fresh_until,evidence_id,source_type,authoritative,provenance,adapter_version,supersedes)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
-      [id, scope.organization_id, scope.project_id, scope.environment_id, input.subject_ref, input.provider, input.property,
-        JSON.stringify(input.value), input.value.type, input.observed_at, input.fresh_until,
-        input.evidence_id ?? null, input.source_type, input.authoritative,
-        JSON.stringify(input.provenance ?? {}), input.adapter_version, previous ? previous.fact_id : null]);
+      const incumbent = (await client.query(
+        `SELECT fact_id,observed_at FROM nyst_world_facts
+         WHERE environment_id=$1 AND subject_ref=$2 AND property=$3 AND provider=$4 AND superseded_at IS NULL`,
+        [scope.environment_id, input.subject_ref, input.property, input.provider])).rows[0];
 
-    if (previous) {
-      await this.db.query(`UPDATE nyst_world_facts SET superseded_at=now() WHERE fact_id=$1`, [previous.fact_id]);
+      // Strictly later, or it does not displace the incumbent. A tie is not
+      // later; without that the rule is not total and equal timestamps thrash.
+      const stale = incumbent !== undefined
+        && Date.parse(input.observed_at) <= new Date(String(incumbent.observed_at)).getTime();
+
+      if (incumbent && !stale) {
+        await client.query(
+          `UPDATE nyst_world_facts SET superseded_at=now() WHERE fact_id=$1`, [incumbent.fact_id]);
+      }
+
+      const inserted = await client.query(
+        `INSERT INTO nyst_world_facts(fact_id,organization_id,project_id,environment_id,subject_ref,provider,property,
+           value,value_type,observed_at,fresh_until,evidence_id,source_type,authoritative,provenance,adapter_version,
+           supersedes,superseded_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+        [randomUUID(), scope.organization_id, scope.project_id, scope.environment_id,
+          input.subject_ref, input.provider, input.property,
+          JSON.stringify(input.value), input.value.type, input.observed_at, input.fresh_until,
+          input.evidence_id ?? null, input.source_type, input.authoritative,
+          JSON.stringify(input.provenance ?? {}), input.adapter_version,
+          // A stale arrival supersedes nothing and is current for no time at
+          // all: it goes in already closed, so the history reads correctly
+          // without ever having been true.
+          stale ? null : (incumbent ? incumbent.fact_id : null),
+          stale ? new Date().toISOString() : null]);
+
+      return hydrateFact(inserted.rows[0]!);
+    });
+  }
+
+  /**
+   * A transaction for a WorldFact write.
+   *
+   * Same reasoning as `inInstanceTransaction`: a pool is not a connection, so
+   * the lock and the writes it protects must go through one checked-out client.
+   * Without a pool there is no way to hold a lock across statements, so this
+   * refuses rather than silently writing without one.
+   */
+  private async inFactTransaction<T>(work: (client: ProductDb) => Promise<T>): Promise<T> {
+    const pool = this.db as ProductDb & { connect?: () => Promise<ProductDb & { release(): void }> };
+    if (typeof pool.connect !== "function") {
+      throw new Error(
+        "Recording a WorldFact requires a connection pool that can open a transaction. " +
+        "Supersession must be atomic; on a single-statement interface two observations " +
+        "can both remain current, and the invariant engine would see contradictory truth.");
     }
-    return hydrateFact(inserted.rows[0]!);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const value = await work(client);
+      await client.query("COMMIT");
+      return value;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   /** Current, non-superseded facts for a set of subjects. */

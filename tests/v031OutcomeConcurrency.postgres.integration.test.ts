@@ -216,15 +216,23 @@ describe("Nyst v0.3.1 issue 6 — concurrent Outcome evaluation", { skip: databa
     // reobservation worker writes evidence, and evaluation reads it.
     await Promise.all([
       ...Array.from({ length: 8 }, () => outcomes.evaluate(tenant, instance.outcome_instance_id)),
+      // NOT wrapped in a catch. An earlier draft of this test swallowed every
+      // error here and used a source_type the schema rejects, so the writes
+      // silently failed and the test passed while proving nothing.
       ...Array.from({ length: 8 }, (_, index) => outcomes.recordFact(tenant, {
         subject_ref: subject, provider: "github", property: "github.direct_access",
         value: { type: "string" as const, value: index % 2 === 0 ? "none" : "write" },
-        authoritative: true, source_type: "provider_api",
+        authoritative: true, source_type: "provider_api_read",
         adapter_version: "github-adapter/1.0.0",
-        observed_at: new Date().toISOString(),
+        observed_at: new Date(Date.now() + index * 1000).toISOString(),
         fresh_until: new Date(Date.now() + 3_600_000).toISOString(),
-      }).catch(() => null)),
+      })),
     ]);
+
+    // The facts really landed, so the interleaving was real.
+    const factCount = (await pool.query(
+      `SELECT count(*)::int count FROM nyst_world_facts WHERE subject_ref=$1`, [subject])).rows[0]!;
+    assert.equal(Number(factCount.count), 8, "the interleaved evidence was never written");
 
     const written = await sequences(instance.outcome_instance_id);
     assert.equal(new Set(written).size, written.length, "the sequence repeated under interleaved load");
