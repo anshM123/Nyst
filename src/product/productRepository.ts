@@ -70,7 +70,20 @@ export class ProductRepository {
     }
   }
 
-  async createBootstrap(input: { organization: string; organization_slug: string; project: string; project_slug: string; environment: string; environment_slug: string; email: string; display_name: string; password: string }): Promise<TenantScope & { user_id: string }> {
+  /**
+   * Create an organization, project, environment and first user.
+   *
+   * `mode` is REQUIRED to be considered, not defaulted silently. The schema
+   * default is 'enforced' — a sensible default for a design-partner
+   * deployment being bootstrapped by an operator, and a dangerous one for a
+   * public signup, which used to land a stranger in the posture where Nyst is
+   * in the path of real consequence while the signup page told them they were
+   * in Shadow.
+   *
+   * Callers now say which they mean. Omitting it keeps the historical
+   * behaviour for existing bootstrap callers.
+   */
+  async createBootstrap(input: { organization: string; organization_slug: string; project: string; project_slug: string; environment: string; environment_slug: string; email: string; display_name: string; password: string; mode?: EnvironmentMode }): Promise<TenantScope & { user_id: string }> {
     const organizationId = randomUUID(); const projectId = randomUUID(); const environmentId = randomUUID(); const userId = randomUUID();
     const email = normalizedEmail(input.email); const passwordHash = await hash(input.password, 12);
     await this.db.query(`WITH organization AS (
@@ -78,9 +91,9 @@ export class ProductRepository {
     ), project AS (
       INSERT INTO nyst_projects(project_id,organization_id,slug,name) SELECT $2,organization_id,$7,$8 FROM organization RETURNING project_id,organization_id
     ), environment AS (
-      INSERT INTO nyst_environments(environment_id,project_id,organization_id,slug,name) SELECT $3,project_id,organization_id,$9,$10 FROM project
+      INSERT INTO nyst_environments(environment_id,project_id,organization_id,slug,name,mode) SELECT $3,project_id,organization_id,$9,$10,$14 FROM project
     ) INSERT INTO nyst_users(user_id,organization_id,email,display_name,password_hash) SELECT $4,organization_id,$11,$12,$13 FROM organization`,
-      [organizationId, projectId, environmentId, userId, slug(input.organization_slug), bounded(input.organization, 120, "organization"), slug(input.project_slug), bounded(input.project, 120, "project"), slug(input.environment_slug), bounded(input.environment, 120, "environment"), email, bounded(input.display_name, 120, "display name"), passwordHash]);
+      [organizationId, projectId, environmentId, userId, slug(input.organization_slug), bounded(input.organization, 120, "organization"), slug(input.project_slug), bounded(input.project, 120, "project"), slug(input.environment_slug), bounded(input.environment, 120, "environment"), email, bounded(input.display_name, 120, "display name"), passwordHash, input.mode ?? "enforced"]);
     await this.db.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by)
       VALUES($1,$2,$3,$4,NULL,1,'automatic','never',false,false,300,$5)`, [randomUUID(), environmentId, projectId, organizationId, userId]);
     return { organization_id: organizationId, project_id: projectId, environment_id: environmentId, user_id: userId };
@@ -149,9 +162,10 @@ export class ProductRepository {
     return id;
   }
 
-  async createEnvironment(scope: Pick<TenantScope, "organization_id" | "project_id">, name: string, environmentSlug: string): Promise<string> {
+  /** `mode` defaults to the schema's 'enforced'; a caller creating an environment for someone else should say. */
+  async createEnvironment(scope: Pick<TenantScope, "organization_id" | "project_id">, name: string, environmentSlug: string, mode?: EnvironmentMode): Promise<string> {
     const id = randomUUID();
-    await this.db.query(`INSERT INTO nyst_environments(environment_id,project_id,organization_id,slug,name) VALUES($1,$2,$3,$4,$5)`, [id, scope.project_id, scope.organization_id, slug(environmentSlug), bounded(name, 120, "environment")]);
+    await this.db.query(`INSERT INTO nyst_environments(environment_id,project_id,organization_id,slug,name,mode) VALUES($1,$2,$3,$4,$5,$6)`, [id, scope.project_id, scope.organization_id, slug(environmentSlug), bounded(name, 120, "environment"), mode ?? "enforced"]);
     await this.db.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by)
       SELECT $1,$2,$3,$4,NULL,1,'automatic','never',false,false,300,user_id FROM nyst_users
       WHERE organization_id=$4 AND disabled_at IS NULL ORDER BY created_at,user_id LIMIT 1`, [randomUUID(), id, scope.project_id, scope.organization_id]);

@@ -139,18 +139,32 @@ registerPublicRoutes(app, {
    */
   create_account: async (input) => {
     try {
-      await repository.createBootstrap({
+      const created = await repository.createBootstrap({
         organization: input.organization,
         organization_slug: input.organization_slug,
         project: "Platform",
         project_slug: "platform",
         environment: "Shadow",
         environment_slug: "shadow",
+        // SHADOW, explicitly. The schema default is 'enforced', which would
+        // put a stranger who just signed up in the path of real consequence
+        // while the signup page told them otherwise.
+        mode: "shadow",
         email: input.email,
         display_name: input.display_name,
         password: input.password,
       });
-      structuredLog({ type: "signup_created", organization_slug: input.organization_slug });
+      // The rest of the lifecycle, so a new account arrives somewhere real
+      // rather than at an empty shell. None of it grants authority: an Agent
+      // with no Autonomy Line rule has no autonomy, and a Shadow environment
+      // controls nothing regardless.
+      await repository.createAgent(created, created.user_id, {
+        name: "First Agent", slug: "first-agent", owner: input.display_name,
+        description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
+        framework: "unspecified", tags: [],
+      }).catch(() => null);
+
+      structuredLog({ type: "signup_created", organization_slug: input.organization_slug, mode: "shadow" });
       return { ok: true as const };
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
