@@ -392,21 +392,37 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     return requireOutcomes(options).issueReceipt(principal, routeId(request), options.signer as never);
   }, options.repository));
 
-  /** Record an observation of the world. Never a consequence, always a read. */
-  app.post("/v1/world-facts", api(async (principal, request) => {
-    requireScope(principal, "actions:write"); requireCsrf(request, principal);
-    const body = object(request.body);
-    return requireOutcomes(options).recordFact(principal, {
-      subject_ref: string(body.subject_ref, 400),
-      provider: string(body.provider, 60),
-      property: string(body.property, 80),
-      value: object(body.value) as never,
-      observed_at: string(body.observed_at, 40),
-      fresh_until: string(body.fresh_until, 40),
-      source_type: string(body.source_type, 40) as never,
-      authoritative: body.authoritative === true,
-      adapter_version: string(body.adapter_version, 80),
-    });
+  /**
+   * WORLDFACTS ARE NOT WRITABLE OVER HTTP.
+   *
+   * This route used to exist and accept `authoritative: true` from any caller
+   * holding `actions:write` — which is exactly the key an Agent uses. The Agent
+   * whose outcome Nyst exists to independently verify could therefore
+   * manufacture the evidence Nyst evaluates, and mark its own offboarding
+   * SATISFIED without touching GitHub or Okta at all.
+   *
+   * The whole outcome layer rests on one sentence: a customer pushes EVIDENCE,
+   * and Nyst evaluates TRUTH. A request body that classifies its own authority
+   * inverts that.
+   *
+   * So there is no write path here. External observations go through
+   * POST /v1/evidence against a REGISTERED source, and that source's
+   * authority — decided by an operator in Settings, not by a caller — is what
+   * classifies the resulting fact. Nyst's own adapters call
+   * `OutcomeRepository.recordFact()` in-process, where authority is a property
+   * of the adapter rather than of an HTTP request.
+   *
+   * The route is answered rather than deleted so a client that still calls it
+   * is told exactly why, instead of guessing at a 404.
+   */
+  app.post("/v1/world-facts", api(async (principal) => {
+    void principal;
+    throw Object.assign(new Error(
+      "WorldFacts cannot be written over HTTP. A caller may not classify the authority of its own evidence — " +
+      "that would let the system Nyst is verifying manufacture the truth Nyst evaluates. " +
+      "Submit observations to POST /v1/evidence using a registered Evidence Source; " +
+      "the source's registered authority and provenance are what classify the fact.",
+    ), { statusCode: 405 });
   }, options.repository));
 
   /* ---------------- AUTHORITY (Phases 28-31) ---------------- */
