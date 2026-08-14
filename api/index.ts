@@ -50,39 +50,43 @@ app.addHook("onRequest", async (_request, reply) => {
   reply.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
 });
 
+/**
+ * THE CONTACT FORM IS CLOSED ON THIS DEPLOYMENT, DELIBERATELY.
+ *
+ * This entry point serves the marketing site with NO DATABASE. Until v0.3.1 it
+ * supplied a `record_contact` that wrote a line to the platform log and let the
+ * page answer "Thank you — we have it". A platform log is not an inbox: the
+ * lines roll off, nobody is subscribed to them, and the message itself was
+ * deliberately not written to them. So every visitor who used that form was
+ * thanked for a message that no longer existed by the time they closed the tab.
+ *
+ * Supplying no sink at all is the honest configuration. The form renders as
+ * closed and the page offers a direct address instead, which is a route that
+ * actually reaches someone.
+ *
+ * TO OPEN IT: give this deployment a database and pass
+ * `record_contact: (s) => new InboundRepository(pool).recordContact(s)`, exactly
+ * as `scripts/startProduct.ts` does.
+ */
 registerPublicRoutes(app, {
+  // Unset means no address is advertised, rather than one that may bounce.
+  ...(process.env.NYST_SALES_CONTACT_EMAIL
+    ? { sales_contact_email: process.env.NYST_SALES_CONTACT_EMAIL }
+    : {}),
   /**
-   * Where a contact submission goes.
-   *
-   * Right now: the platform log, and nowhere else. That is honest but not
-   * useful, and the page currently tells the visitor "Thank you — we have it",
-   * which is only true in the narrowest sense.
-   *
-   * BEFORE THIS IS A REAL FRONT DOOR, wire this to something a person reads —
-   * an inbox, a ticket, a webhook. A form that thanks people and drops their
-   * message is precisely the kind of quiet dishonesty this product exists to
-   * argue against.
+   * The configurator is a calculator, so it still works with no database. The
+   * visitor gets their own answer; only the lead record is lost, and that is
+   * recorded as a known gap rather than presented as success.
    */
-  record_contact: async (submission) => {
-    console.log(JSON.stringify({
-      type: "contact_submission",
-      topic: submission.topic,
-      company: submission.company,
-      received_at: submission.received_at,
-      // The message and email are NOT logged. A platform log is not an inbox,
-      // and it is not a place to put someone's details.
-      has_message: submission.message.length > 0,
-      destination: "UNCONFIGURED — see api/index.ts",
-    }));
-  },
   record_quote: async (quote) => {
     console.log(JSON.stringify({
-      type: "quote_submission",
+      type: "quote_request_not_recorded",
       recommended_plan: quote.recommended_plan,
-      agents: quote.input.agents,
+      agents: (quote.input as { agents?: unknown }).agents,
       received_at: quote.received_at,
-      destination: "UNCONFIGURED — see api/index.ts",
+      destination: "UNCONFIGURED — this deployment has no database; see api/index.ts",
     }));
+    return "NYST-QUOTE-NOTSTORED";
   },
 });
 

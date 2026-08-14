@@ -219,19 +219,40 @@ function quoteSummary(result: QuoteResult, input: QuoteInput): string {
  * Reachable from every page, at every animation frame, with no signup, no
  * gate, and a plain email address for anyone who does not want to use a form.
  */
-export function contactPage(topic: string | null, sent: boolean): string {
-  return publicShell("Contact", "/contact", `
-  <section class="page-head-public">
-    <p class="eyebrow">Contact</p>
-    <h1>Talk to us</h1>
-    <p class="lede">No signup, no gate, no qualification form disguised as a conversation.</p>
-  </section>
+export interface ContactPageContext {
+  /** The address a visitor may write to directly. Null: none is advertised. */
+  sales_email?: string | null;
+  /** False when no inbox is configured, so the form is honestly closed. */
+  accepting?: boolean;
+  /** Shown instead of the form's success state when something went wrong. */
+  error?: string | null;
+}
 
-  ${sent ? `<section class="band band-quiet"><h2>Thank you — we have it.</h2>
-    <p class="lede">Someone will reply. If it is urgent, email us directly at the address below.</p></section>` : ""}
+/**
+ * The contact page.
+ *
+ * `reference` is the receipt for a message that was actually stored. It is a
+ * string rather than a boolean on purpose: the old signature took `sent:
+ * boolean`, which let the page claim delivery with nothing behind it, and did,
+ * for every submission, because no sink was ever configured.
+ */
+export function contactPage(topic: string | null, reference: string | null, context: ContactPageContext = {}): string {
+  const accepting = context.accepting !== false;
+  const salesEmail = context.sales_email ?? null;
+  const direct = salesEmail
+    ? `<p class="small">Or email <a href="mailto:${escape(salesEmail)}">${escape(salesEmail)}</a> directly.</p>`
+    : "";
 
-  <section class="configure">
-    <form method="post" action="/contact" class="steps">
+  const banner = reference
+    ? `<section class="band band-quiet"><h2>Thank you — we have it.</h2>
+    <p class="lede">Your message is recorded. Quote <strong>${escape(reference)}</strong> if you follow up.</p></section>`
+    : context.error
+      ? `<section class="band band-quiet"><h2>This message was not sent.</h2>
+    <p class="lede">${escape(context.error)}</p></section>`
+      : "";
+
+  const form = accepting
+    ? `<form method="post" action="/contact" class="steps">
       <fieldset class="step">
         <legend>Your message</legend>
         <label>Name <input type="text" name="name" maxlength="120" required></label>
@@ -246,8 +267,33 @@ export function contactPage(topic: string | null, sent: boolean): string {
           </select></label>
         <label>Message <textarea name="message" rows="6" maxlength="4000" required></textarea></label>
       </fieldset>
+      <div class="nyst-hp" aria-hidden="true">
+        <label>Company website<input type="text" name="company_website" tabindex="-1" autocomplete="off"></label>
+      </div>
       <div class="step-actions"><button type="submit" class="button primary">Send</button></div>
-    </form>
-    <p class="small">Or email <a href="mailto:hello@nyst.ai">hello@nyst.ai</a> directly.</p>
+    </form>`
+    : salesEmail
+      ? `<p class="lede">This deployment has no contact inbox configured, so the form is closed rather than
+      accepting messages nobody would receive. Email us directly instead — that address is read.</p>`
+      // THE DEAD END. No form and no address is the one state this page must
+      // never be silently in, so it says so plainly rather than looking like a
+      // Contact page that simply has nothing on it.
+      : `<p class="lede">This deployment offers no contact route at all: it has neither a configured inbox
+      nor a published address. That is a deployment misconfiguration, not a decision about you.</p>
+    <p class="small">If you are running this deployment: set <code>NYST_SALES_CONTACT_EMAIL</code>, or supply
+      <code>record_contact</code> as <code>scripts/startProduct.ts</code> does.</p>`;
+
+  return publicShell("Contact", "/contact", `
+  <section class="page-head-public">
+    <p class="eyebrow">Contact</p>
+    <h1>Talk to us</h1>
+    <p class="lede">No signup, no gate, no qualification form disguised as a conversation.</p>
+  </section>
+
+  ${banner}
+
+  <section class="configure">
+    ${form}
+    ${direct}
   </section>`);
 }

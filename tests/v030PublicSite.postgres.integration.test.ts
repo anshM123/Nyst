@@ -134,10 +134,46 @@ describe("Nyst v0.3.0 Phases 37-45 — the public site", () => {
   it("CONTACT IS NEVER GATED: no session, no signup, no JavaScript, from every page", async () => {
     const contact = await app.inject({ method: "GET", url: "/contact" });
     assert.equal(contact.statusCode, 200);
-    // A real form with a real method and action, which works without script.
-    assert.match(contact.body, /<form[^>]*method="post"[^>]*action="\/contact"/);
-    assert.match(contact.body, /mailto:hello@nyst\.ai/, "there is no way to email us without using the form");
     assert.doesNotMatch(contact.body, /sign in to continue|create an account to contact/i);
+
+    /**
+     * THE INVARIANT, restated for v0.3.1.
+     *
+     * It used to be "there is always a form and always a mailto:hello@nyst.ai".
+     * Both halves were wrong. The form accepted messages into a sink that was
+     * never configured, and the address was a constant in a template rather
+     * than a mailbox anyone had committed to reading.
+     *
+     * What actually matters is weaker and true: the Contact page always offers
+     * at least ONE working route to a person — an open form, a published
+     * address, or both. Never neither, and never a form that discards.
+     */
+    const configured = Fastify({ logger: false });
+    registerPublicRoutes(configured, {
+      record_contact: async () => "NYST-LEAD-ABCD2345",
+      sales_contact_email: "sales@nyst.test",
+    });
+    await configured.ready();
+    try {
+      const page = (await configured.inject({ method: "GET", url: "/contact" })).body;
+      // A real form with a real method and action, which works without script.
+      assert.match(page, /<form[^>]*method="post"[^>]*action="\/contact"/);
+      assert.match(page, /mailto:sales@nyst\.test/, "there is no way to email us without using the form");
+    } finally { await configured.close(); }
+
+    // Closed form, but an address: still reachable.
+    const addressOnly = Fastify({ logger: false });
+    registerPublicRoutes(addressOnly, { sales_contact_email: "sales@nyst.test" });
+    await addressOnly.ready();
+    try {
+      const page = (await addressOnly.inject({ method: "GET", url: "/contact" })).body;
+      assert.doesNotMatch(page, /<form[^>]*action="\/contact"/, "a closed deployment still showed the form");
+      assert.match(page, /mailto:sales@nyst\.test/, "THE CONTACT PAGE OFFERED NO ROUTE TO A PERSON");
+    } finally { await addressOnly.close(); }
+
+    // Neither: it must say so, not present an empty page that looks fine.
+    assert.match(contact.body, /no contact route at all/i,
+      "a deployment with no inbox and no address rendered a Contact page with nothing on it");
 
     // And it is linked from every public page, including the footer.
     for (const path of ["/", "/product", "/pricing", "/security", "/privacy", "/terms", "/configure"]) {
@@ -479,7 +515,11 @@ describe("Nyst v0.3.0 Phases 37-45 — the public site", () => {
   it("a contact submission is accepted, and a malformed one is refused rather than lost", async () => {
     const received: unknown[] = [];
     const recording = Fastify({ logger: false });
-    registerPublicRoutes(recording, { record_contact: async (submission) => { received.push(submission); } });
+    registerPublicRoutes(recording, {
+      // The sink now returns the reference the visitor is shown, so the page
+      // can only claim delivery for something that was actually stored.
+      record_contact: async (submission) => { received.push(submission); return "NYST-LEAD-ABCD2345"; },
+    });
     await recording.ready();
     try {
       const good = await recording.inject({

@@ -29,12 +29,38 @@ export interface PublicRouteOptions {
    * the product registers that route and passes `publicHome` into it.
    */
   mount_root?: boolean;
-  /** Where a contact submission goes. Omit and submissions are logged only. */
+  /**
+   * Where a contact submission goes, durably.
+   *
+   * Returns the reference shown to the visitor. OMIT IT AND THE FORM REFUSES
+   * TO ACCEPT MESSAGES — it does not accept them and drop them, which is what
+   * it did before v0.3.1. A form that thanks people for messages nobody will
+   * ever read is worse than a form that is honestly closed.
+   */
   record_contact?: (submission: {
-    name: string; email: string; company: string; topic: string; message: string; received_at: string;
-  }) => Promise<void>;
-  /** Where a configuration submission goes. */
-  record_quote?: (quote: { input: QuoteInput; recommended_plan: string; received_at: string }) => Promise<void>;
+    name: string; email: string; company: string; topic: string; message: string;
+    received_at: string; source_ip?: string | null; user_agent?: string | null;
+  }) => Promise<string>;
+  /**
+   * Where a configuration submission goes.
+   *
+   * Unlike contact, a failure here does NOT fail the page: the configurator is
+   * a calculator, and losing the lead record is Nyst's problem rather than the
+   * visitor's. The failure is logged, not shown.
+   */
+  record_quote?: (quote: {
+    input: QuoteInput; recommended_plan: string; received_at: string; source_ip?: string | null;
+  }) => Promise<string>;
+  /**
+   * The address a visitor can write to directly.
+   *
+   * Configuration, never a constant: a hardcoded address in a template is an
+   * address nobody has committed to reading. Unset, no address is advertised
+   * at all rather than one that may bounce.
+   */
+  sales_contact_email?: string;
+  /** Reports a submission that could not be stored. Never shown to a visitor. */
+  on_error?: (event: Record<string, unknown>) => void;
   /**
    * Create a real Shadow trial account.
    *
@@ -48,9 +74,57 @@ export interface PublicRouteOptions {
   }) => Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
+/**
+ * A fixed-window limit on contact submissions, per source address.
+ *
+ * In-process and deliberately small. It is a speed bump against a script
+ * hammering one form, not a defence against a distributed flood — that belongs
+ * at the edge, and claiming otherwise here would be the kind of overstatement
+ * this codebase exists to avoid. A multi-instance deployment gets this limit
+ * per instance.
+ */
+class SubmissionLimiter {
+  readonly #seen = new Map<string, { count: number; window: number }>();
+
+  constructor(
+    private readonly limit = 10,
+    private readonly windowMs = 10 * 60 * 1000,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  allow(key: string): boolean {
+    const window = Math.floor(this.now() / this.windowMs);
+    const entry = this.#seen.get(key);
+    if (!entry || entry.window !== window) {
+      // Bounded: a flood of distinct addresses must not become a memory leak.
+      if (this.#seen.size > 10_000) this.#seen.clear();
+      this.#seen.set(key, { count: 1, window });
+      return true;
+    }
+    entry.count += 1;
+    return entry.count <= this.limit;
+  }
+}
+
 export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteOptions = {}): void {
   const html = (reply: FastifyReply, body: string): FastifyReply =>
     reply.type("text/html; charset=utf-8").send(body);
+  const limiter = new SubmissionLimiter();
+
+  /**
+   * The visitor's address, for rate limiting and spam triage.
+   *
+   * `x-forwarded-for` is only meaningful when Fastify is configured to trust
+   * the proxy; it is read here because the limit it feeds is a speed bump, and
+   * a spoofed value costs an attacker their own bucket rather than someone
+   * else's. It is never used for authorization.
+   */
+  const clientAddress = (request: FastifyRequest): string | null => {
+    const forwarded = request.headers["x-forwarded-for"];
+    const header = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+    const first = typeof header === "string" ? header.split(",")[0]?.trim() : undefined;
+    return first || request.ip || null;
+  };
 
   /**
    * Parse HTML form submissions.
@@ -132,8 +206,20 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
   app.post("/configure", async (request, reply) => {
     const input = parseQuote(request.body);
     const result = recommendPlan(input);
+    // Recorded, but never at the cost of the visitor's own answer: this is a
+    // calculator, and a storage failure is Nyst's problem, not theirs.
     if (options.record_quote) {
-      await options.record_quote({ input, recommended_plan: result.recommended_plan, received_at: new Date().toISOString() });
+      try {
+        await options.record_quote({
+          input, recommended_plan: result.recommended_plan,
+          received_at: new Date().toISOString(), source_ip: clientAddress(request),
+        });
+      } catch (error) {
+        options.on_error?.({
+          type: "quote_request_not_recorded",
+          detail: error instanceof Error ? error.message : "unknown",
+        });
+      }
     }
     return html(reply, configuratorPage(null, result, input));
   });
@@ -185,22 +271,76 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
 
   app.get("/contact", async (request, reply) => {
     const query = request.query as { topic?: unknown };
-    return html(reply, contactPage(query.topic === undefined ? null : String(query.topic), false));
+    return html(reply, contactPage(query.topic === undefined ? null : String(query.topic), null, {
+      sales_email: options.sales_contact_email ?? null,
+      accepting: options.record_contact !== undefined,
+    }));
   });
 
+  /**
+   * A contact submission.
+   *
+   * THE ORDER IS THE POINT. The message is stored first, and the visitor is
+   * thanked only if that succeeded. Before v0.3.1 the sink was optional and
+   * never supplied, so every message was discarded behind a thank-you page.
+   */
   app.post("/contact", async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
     const submission = {
       name: bounded(body.name, 120), email: bounded(body.email, 320), company: bounded(body.company, 120),
       topic: bounded(body.topic, 40) || "general", message: bounded(body.message, 4000),
       received_at: new Date().toISOString(),
+      source_ip: clientAddress(request), user_agent: bounded(request.headers["user-agent"], 400) || null,
     };
-    if (!submission.email || !submission.message) {
-      return reply.code(400).type("text/html; charset=utf-8")
-        .send(contactPage(submission.topic, false));
+    const context = {
+      sales_email: options.sales_contact_email ?? null,
+      accepting: options.record_contact !== undefined,
+    };
+
+    if (!submission.email || !submission.message || !submission.name) {
+      return reply.code(400).type("text/html; charset=utf-8").send(contactPage(submission.topic, null, {
+        ...context,
+        error: "A name, a work email and a message are all needed before this can be sent.",
+      }));
     }
-    if (options.record_contact) await options.record_contact(submission);
-    return html(reply, contactPage(submission.topic, true));
+
+    // A hidden field no person can see and no person fills in. The response is
+    // indistinguishable from success, so a bot gets no signal to adapt to.
+    if (bounded(body.company_website, 200) !== "") {
+      return html(reply, contactPage(submission.topic, "NYST-LEAD-RECEIVED", context));
+    }
+
+    if (!limiter.allow(submission.source_ip ?? "unknown")) {
+      return reply.code(429).type("text/html; charset=utf-8").send(contactPage(submission.topic, null, {
+        ...context,
+        error: "That is more messages than this form accepts in a short window. Wait a few minutes, or email us directly.",
+      }));
+    }
+
+    // No sink means no delivery. Say so; do not accept and discard.
+    if (!options.record_contact) {
+      return reply.code(503).type("text/html; charset=utf-8").send(contactPage(submission.topic, null, {
+        ...context,
+        error: "This message could not be recorded, because this deployment has no contact inbox configured. Nothing was sent.",
+      }));
+    }
+
+    let reference: string;
+    try {
+      reference = await options.record_contact(submission);
+    } catch (error) {
+      // The visitor learns their message did not land, and gets a route that
+      // does not depend on the thing that just failed. The cause is ours.
+      options.on_error?.({
+        type: "contact_submission_failed",
+        detail: error instanceof Error ? error.message : "unknown",
+      });
+      return reply.code(503).type("text/html; charset=utf-8").send(contactPage(submission.topic, null, {
+        ...context,
+        error: "This message could not be delivered right now, so it has not been sent. Please email us directly instead.",
+      }));
+    }
+    return html(reply, contactPage(submission.topic, reference, context));
   });
 
   /* -------------------------------------------------------- legal pages */

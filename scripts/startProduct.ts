@@ -28,6 +28,7 @@ import { OutcomeShadow } from "../dist/src/product/outcome/outcomeShadow.js";
 import { EvidenceIngest, RelayCoordinator } from "../dist/src/product/outcome/evidenceIngest.js";
 import { AuthorityRepository } from "../dist/src/product/authority/authorityRepository.js";
 import { registerPublicRoutes } from "../dist/src/public/publicRoutes.js";
+import { InboundRepository } from "../dist/src/public/inboundRepository.js";
 import { homePage } from "../dist/src/public/site.js";
 import { FederatedRepository } from "../dist/src/product/auth/federatedRepository.js";
 import { GoogleAuth, googleConfigFromEnv, httpGoogleTransport } from "../dist/src/product/auth/googleAuth.js";
@@ -154,8 +155,24 @@ const app = await buildProductServer({
 
 // The public site shares the origin. It owns everything except "/", which the
 // product server handles so a signed-in operator lands on their dashboard.
+/**
+ * Contact and quote submissions go to the database, not to nowhere.
+ *
+ * Before v0.3.1 neither sink was supplied anywhere in the repository, so every
+ * message a visitor sent was validated, discarded, and answered with a
+ * thank-you page.
+ */
+const inbound = new InboundRepository(pool);
+
 registerPublicRoutes(app, {
   mount_root: false,
+  record_contact: (submission) => inbound.recordContact(submission),
+  record_quote: (quote) => inbound.recordQuote(quote),
+  // Unset means no address is advertised at all, rather than one that bounces.
+  ...(process.env.NYST_SALES_CONTACT_EMAIL
+    ? { sales_contact_email: process.env.NYST_SALES_CONTACT_EMAIL }
+    : {}),
+  on_error: structuredLog,
   /**
    * A real Shadow trial.
    *
