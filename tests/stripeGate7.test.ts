@@ -17,15 +17,15 @@ describe("Gate 7 Stripe contracts and sandbox boundaries", () => {
     assert.equal(STRIPE_API_VERSION, "2026-02-25.clover"); assert.equal(STRIPE_REFUND_SPEC_VERSION, "stripe.refund/1.0.0"); assert.equal(STRIPE_CAPTURE_SPEC_VERSION, "stripe.payment_capture/1.0.0");
   });
   it("rejects live, malformed, missing, and wrong-reference credentials", async () => {
-    const source = new EnvironmentStripeCredentialSource(); const prior = process.env.NYST_STRIPE_API_KEY;
+    const source = new EnvironmentStripeCredentialSource(); const prior = process.env.NYST_STRIPE_CREDENTIAL;
     try {
       for (const value of [undefined, "sk_live_REAL_MONEY_FORBIDDEN", "rk_live_FORBIDDEN", "bad", "sk_test_bad\nvalue"]) {
-        if (value === undefined) delete process.env.NYST_STRIPE_API_KEY; else process.env.NYST_STRIPE_API_KEY = value;
+        if (value === undefined) delete process.env.NYST_STRIPE_CREDENTIAL; else process.env.NYST_STRIPE_CREDENTIAL = value;
         await assert.rejects(() => source.resolve("env:NYST_STRIPE_CREDENTIAL"), StripeCredentialError);
       }
-      process.env.NYST_STRIPE_API_KEY = "sk_test_VALID_FAKE_ONLY";
+      process.env.NYST_STRIPE_CREDENTIAL = "sk_test_VALID_FAKE_ONLY";
       await assert.rejects(() => source.resolve("env:OTHER"), StripeCredentialError);
-    } finally { if (prior === undefined) delete process.env.NYST_STRIPE_API_KEY; else process.env.NYST_STRIPE_API_KEY = prior; }
+    } finally { if (prior === undefined) delete process.env.NYST_STRIPE_CREDENTIAL; else process.env.NYST_STRIPE_CREDENTIAL = prior; }
   });
   it("persists action-derived idempotency and credential reference, never a key", async () => {
     const h = makeStripeHarness("refund"); const result = await h.service.commit("refund-plan", STRIPE_INPUT, EMPTY_CONTEXT);

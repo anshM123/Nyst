@@ -38,7 +38,7 @@ class CountingResponseLossTransport {
 }
 
 const databaseUrl = required("DATABASE_URL");
-const apiKey = required("NYST_STRIPE_API_KEY");
+const apiKey = required("NYST_STRIPE_CREDENTIAL");
 requireTestStripeKey(apiKey);
 const runId = randomUUID();
 const fixtures: Array<{ id: string; amount: number; charge: string | null }> = [];

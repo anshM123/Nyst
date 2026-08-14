@@ -10,11 +10,11 @@ if (!/^(?:sk|rk)_test_[A-Za-z0-9_]{8,255}$/.test(key)) {
   throw new Error("Stripe Gate-7 credential file must contain exactly one test-mode key");
 }
 
-process.env.NYST_STRIPE_API_KEY = key;
+process.env.NYST_STRIPE_CREDENTIAL = key;
 try {
   await import("./verifyStripeGate7Live.ts");
 } finally {
-  delete process.env.NYST_STRIPE_API_KEY;
+  delete process.env.NYST_STRIPE_CREDENTIAL;
   key = "";
   rmSync(secretPath, { force: true });
   console.log(`secret_file_deleted=${!existsSync(secretPath)}`);

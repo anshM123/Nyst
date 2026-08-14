@@ -72,7 +72,7 @@ describe("Gate 7 Stripe live canary packaging", () => {
     const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts: Record<string, string> };
     assert.equal(packageJson.scripts["test:stripe:gate7-live"], "npm run build && node --experimental-strip-types scripts/verifyStripeGate7Live.ts");
     const result = spawnSync(process.execPath, ["--experimental-strip-types", join(root, "scripts", "verifyStripeGate7Live.ts")], {
-      cwd: root, encoding: "utf8", env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "DATABASE_URL" && key !== "NYST_STRIPE_API_KEY")),
+      cwd: root, encoding: "utf8", env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "DATABASE_URL" && key !== "NYST_STRIPE_CREDENTIAL")),
     });
     assert.notEqual(result.status, 0); assert.match(`${result.stdout}${result.stderr}`, /DATABASE_URL is required/);
     assert.doesNotMatch(`${result.stdout}${result.stderr}`, /does not provide an export/);

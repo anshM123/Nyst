@@ -128,8 +128,11 @@ variables rather than a 404.
 3. Set:
    ```
    NYST_OKTA_ACCESS_TOKEN=<token>
-   NYST_OKTA_ORG=https://YOUR-ORG.okta.com
+   NYST_OKTA_TOKEN_TYPE=SSWS
+   NYST_OKTA_EXPECTED_LOGIN=<the login this token belongs to, checked at preflight>
    ```
+   Your Okta org URL is **not** an environment variable. It travels with each
+   offboarding request, so one deployment can serve more than one org.
 
 > Same standing: no Okta credential exists in this build, and no Okta mutation
 > has been performed.

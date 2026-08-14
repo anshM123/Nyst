@@ -94,9 +94,23 @@ export interface StripeTransport { send(request: StripeHttpRequest): Promise<Str
 export interface StripeCredentialSource { resolve(reference: string): Promise<string>; }
 
 export class EnvironmentStripeCredentialSource implements StripeCredentialSource {
+  /**
+   * A REFERENCE NAMES A VARIABLE, AND THIS ONE DID NOT (v0.3.1).
+   *
+   * `STRIPE_CREDENTIAL_REF` is `env:NYST_STRIPE_CREDENTIAL`, and that is the
+   * reference an operator must store — `EXPECTED_PROVIDER_REFS` refuses to
+   * admit a Stripe action configured with anything else. But this then read a
+   * DIFFERENT environment variable — the old Stripe API-key name — entirely.
+   *
+   * So following the documented reference produced an integration that passed
+   * admission and then failed to resolve its credential at execution. GitHub
+   * and Okta both read exactly the variable their own reference names; Stripe
+   * was the only one where the two disagreed. `v031EnvTemplate` now asserts the
+   * general property so a fourth provider cannot reintroduce it.
+   */
   async resolve(reference: string): Promise<string> {
     if (reference !== STRIPE_CREDENTIAL_REF) throw new StripeCredentialError("Unsupported Stripe credential reference");
-    const key = process.env.NYST_STRIPE_API_KEY;
+    const key = process.env.NYST_STRIPE_CREDENTIAL;
     if (!key) throw new StripeCredentialError("Stripe credential is unavailable");
     requireTestStripeKey(key);
     return key;
