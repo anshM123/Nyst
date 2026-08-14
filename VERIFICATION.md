@@ -1,4 +1,4 @@
-# Verification status — Nyst v0.3.0
+# Verification status — Nyst v0.3.1 (backend-hardened)
 
 What was actually checked for this release, how, and what was not.
 
@@ -12,14 +12,14 @@ verified, with the reason.
 
 | | |
 | --- | --- |
-| Version | **0.3.0** |
-| Automated tests | **851 passing, 0 failing, 0 skipped** |
-| Test suites | 111 |
-| Migrations | 24, applied cleanly from an empty database |
+| Version | **0.3.1 — backend-hardened** |
+| Automated tests | **956 passing, 0 failing, 0 skipped** |
+| Test suites | 121 |
+| Migrations | 29, applied cleanly from an empty database |
 | Runtime dependencies | 4 — `fastify`, `@fastify/cookie`, `bcryptjs`, `pg` |
 | Secret scan | No credential-shaped value in source, tests, docs, migrations, brand assets, the packed SDK tarball, or the Docker build context |
 
-Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → **851**.
+Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → **956**.
 
 ---
 
@@ -151,13 +151,102 @@ failing assertions.
 
 ---
 
+## v0.3.1 — the backend hardening pass
+
+Nine defects, each **reproduced by a failing test before it was fixed**. The
+reproductions are kept, so a regression fails loudly rather than quietly.
+
+| # | Defect | Fix | Migration |
+|---|---|---|---|
+| 1 | Public WorldFact forgery via `POST /v1/world-facts` | Route closed with a 405 that explains the Evidence/Truth boundary | — |
+| 2 / 10 | `/signup` absent, then landing accounts in Enforced | Route built; `mode` is explicit, never the schema default | — |
+| 3 | Google Sign-In unreachable; disconnected identity unrelinkable | Real routes wired end to end; partial unique index over live bindings | 0025 |
+| 4 / 5 | Contact and quote submissions silently discarded | Durable tables; the page cannot claim delivery without a stored row | 0026 |
+| 6 | Concurrent Outcome evaluation collided on `evaluation_sequence` | `FOR UPDATE` on the instance, taken before the facts are read | — |
+| 7 | Out-of-order and concurrent WorldFact supersession | Partial unique index + BEFORE INSERT trigger on observation order | 0027 |
+| 8 | One Outcome Receipt per instance, forever | Keyed `(instance, evaluation_sequence)`; the series grows | 0028 |
+| 9 | Subject identity as permanent idempotency key | `request_key` separated from `subject_key`; live-only uniqueness | 0029 |
+| 12 | `/ready` answered "ready" for any reachable socket | Asserts the required migration and signing capability | — |
+
+Three defects were found **by the tests written for other defects**:
+
+- Contract-version allocation had the same unlocked read-then-write race as
+  issue 6, and ten concurrent creations failed nine times.
+- A `FOR UPDATE` fix for issue 7 was *wrong in a way that passes a two-way test*
+  — under READ COMMITTED the waiter re-reads after the winner commits, finds no
+  incumbent, and inserts as current too. It fails at twenty. Replaced with an
+  advisory lock on the key.
+- An adversarial test in the issue 6 suite used a `source_type` the schema
+  rejects, behind a blanket `.catch`, so its writes silently failed and it
+  passed while proving nothing.
+
+Migration 0027 **failed to apply on the development database**, because the
+defect it fixes had already produced duplicate current facts there. Every
+migration in this pass now repairs before it constrains.
+
+---
+
+## NOT INDEPENDENTLY VERIFIED
+
+Stated plainly, because a passing test suite is not evidence for any of these.
+
+### DOCKER IMAGE NOT BUILT
+
+`docker build` was never run. Docker is not installed in the build environment
+(`docker: command not found`; no Docker service registered), so **no claim is
+made that the production image builds or runs.**
+
+What *was* verified, without a daemon:
+
+- Every path the Dockerfile `COPY`s exists; every artifact it takes from the
+  build stage is one `npm run build` actually produces; every `npm run` script
+  it invokes is defined.
+- All three documented roles were executed locally with **the exact commands
+  the image uses**:
+  - `node --experimental-strip-types scripts/migrate.ts` — 29 migrations applied
+    cleanly to an empty database.
+  - `node --experimental-strip-types scripts/startProduct.ts` — served
+    `/health` 200, `/ready` 200, `/`, `/login`, `/signup`, `/contact` all 200.
+  - `node --experimental-strip-types scripts/startWorker.ts` — started and ran.
+- `CMD` is exec form, the final `USER` is not root, no credential-shaped value
+  is baked into any `ENV`, and `HEALTHCHECK` probes `/health` rather than
+  `/ready`.
+
+A test asserts Docker is *absent*, so if it ever becomes available that test
+fails and tells whoever sees it to run the real build.
+
+### LIVE GOOGLE PROJECT CONFIGURATION REQUIRED
+
+Google Sign-In is implemented and driven end to end through the real routes
+against a fixture Google — a locally generated RSA key pair standing in for
+Google's signing keys, and a transport standing in for its token and JWKS
+endpoints. **No real Google credential has ever been used, and the flow has not
+run against a live Google project.**
+
+For the failure cases the fixture is *better* than a live project, because each
+one can be produced exactly: wrong nonce, wrong issuer, wrong audience, expired,
+unknown key, forged signature, `alg: none`, unverified email, replayed callback.
+All seven refusals are asserted **byte-identical**.
+
+What a live project would additionally establish: that the real client ID and
+redirect URI are registered correctly, that Google's actual JWKS parses, and
+that consent behaves as expected.
+
+### NO PROVIDER MUTATION HAS BEEN PERFORMED
+
+No real GitHub, Okta or Stripe credential exists in this environment and none
+was requested. Provider behaviour is exercised through deterministic
+provider-shaped clients and fault injection.
+
+---
+
 ## Honest overall status
 
-**Nyst v0.3.0 is not LAUNCH READY**, and this document will say so until it is.
+**Nyst v0.3.1 is not LAUNCH READY**, and this document will say so until it is.
 
-What is true: the architecture is complete across all three layers, 851 tests
-pass with nothing skipped, every known defect has a regression test, and every
-boundary above is stated rather than hidden.
+What is true: the architecture is complete across all three layers, 956 tests
+pass with nothing skipped, every known defect has a regression test that failed
+first, and every boundary above is stated rather than hidden.
 
 What is not: nothing in this release has been run against a real provider, a
 real Google project, or a built production image. Those are the gates between

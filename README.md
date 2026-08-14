@@ -10,11 +10,34 @@
 INTENT → EXECUTION → OBSERVATION → RECONCILIATION → EFFECT STATE → CONTROL DECISION → SIGNED RECEIPT
 ```
 
-**Version 0.3.0.**
+**Version 0.3.1 — backend-hardened.**
 
 > **Just want to run it?** → **[RUN.md](RUN.md)** (fifteen minutes)
 > **Want to know what was actually verified?** → **[VERIFICATION.md](VERIFICATION.md)**
 > **Want to know where Nyst stops?** → **[Known boundaries](docs/product/known-boundaries.md)**
+
+## What is new in 0.3.1
+
+A backend hardening pass. No redesign of the public site or the authenticated
+application: the work was in persistence, concurrency, authentication and
+deployment, so a frontend team can build against a substrate that behaves.
+
+Nine defects, each reproduced by a failing test before it was fixed:
+
+| # | Defect | Why it mattered |
+|---|---|---|
+| 1 | `POST /v1/world-facts` accepted `authoritative: true` | An Agent could manufacture the truth Nyst evaluates about it |
+| 2 | `/signup` was linked six times and did not exist | And when built, it landed new accounts in **Enforced** |
+| 3 | Google Sign-In had a verifier, a schema and 21 tests — and no route | Nothing was reachable; a disconnected account could never be reconnected |
+| 4 | The contact form thanked people for messages it discarded | `record_contact` was never supplied anywhere |
+| 5 | The quote configurator kept no record of any quote | A company that priced Nyst and left was invisible |
+| 6 | Concurrent Outcome evaluation collided on its sequence | The optimistic guard ran *after* the statement that collided |
+| 7 | A late-arriving older observation superseded a newer one | Nyst could report access removed while it was live |
+| 8 | One Outcome Receipt per instance, forever | "Prove it is now satisfied" returned a signed *unsatisfied* statement |
+| 9 | A person's identity was a permanent idempotency key | A rehired contractor could not be offboarded a second time |
+
+Plus `/ready`, which answered "ready" for any process that could open a socket
+to PostgreSQL — including one running against a schema three releases behind.
 
 ## What is new in 0.3.0
 

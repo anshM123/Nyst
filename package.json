@@ -1,6 +1,6 @@
 {
   "name": "nyst",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Nyst \u2014 effect-control infrastructure for autonomous software.",
   "type": "module",

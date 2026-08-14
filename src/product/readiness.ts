@@ -424,3 +424,95 @@ function bounded(value: string | undefined): string | null {
   if (typeof value !== "string" || !value) return null;
   return value.replace(/[\r\n\0]/g, " ").slice(0, 500);
 }
+
+/* ==================================================================
+ * PROCESS READINESS (v0.3.1 issue 12)
+ *
+ * The seven dimensions above answer "can this EffectSpec run?". This section
+ * answers a different question: "can THIS PROCESS serve traffic at all?" —
+ * which is what a load balancer's readiness probe is asking.
+ *
+ * They are kept in one file because they are the same kind of claim, and the
+ * lesson of v0.2.2 was that a second definition of "ready" living somewhere
+ * else will eventually disagree with the first.
+ * ================================================================== */
+
+/**
+ * The migration this build requires.
+ *
+ * `SELECT 1` succeeding proves a socket, not a schema. A process running
+ * against a database three releases behind will answer a connectivity check
+ * happily and then fail every write with `column "..." does not exist` — after
+ * the deploy has already drained the pods that worked.
+ *
+ * RAISE THIS whenever a migration adds something the code cannot run without.
+ * A test asserts the named file is actually applied to a fully migrated
+ * database, because a required version that was never written would make every
+ * deployment permanently not-ready — a worse failure than the one this
+ * prevents.
+ */
+export const REQUIRED_SCHEMA_MIGRATION = "0029_v031_request_key.sql";
+
+/** Coarse on purpose: /ready is unauthenticated. */
+export type ProcessReadyReason = "database_unreachable" | "schema_behind" | "signing_unavailable";
+
+export interface ProcessReadiness {
+  ready: boolean;
+  reason: ProcessReadyReason | null;
+}
+
+/**
+ * Decide whether this process can serve.
+ *
+ * Every branch fails CLOSED. An unexpected error while checking readiness means
+ * readiness is unknown, and unknown is not ready.
+ *
+ * Bounded, because a probe that hangs is worse than one that fails: the
+ * orchestrator's check stalls instead of returning, and a hung probe looks
+ * exactly like a healthy one until it times out somewhere less useful.
+ */
+export async function evaluateProcessReadiness(input: {
+  db: { query(sql: string, params?: readonly unknown[]): Promise<{ rows: unknown[] }> };
+  /** True when this deployment offers something that requires signing. */
+  requires_signing: boolean;
+  has_signer: boolean;
+  timeout_ms?: number;
+}): Promise<ProcessReadiness> {
+  const timeoutMs = input.timeout_ms ?? 3000;
+
+  // Checked first and without touching the database: a missing signing identity
+  // is a configuration fact, and there is no reason to make it wait on I/O.
+  if (input.requires_signing && !input.has_signer) {
+    return { ready: false, reason: "signing_unavailable" };
+  }
+
+  try {
+    // ONE statement, and it proves both things: reaching the migrations ledger
+    // proves the connection, and finding the row proves the schema. A separate
+    // SELECT 1 would only add a round trip to a probe polled every second.
+    const rows = await withDeadline(timeoutMs, input.db.query(
+      "SELECT 1 FROM outcome_migrations WHERE name=$1", [REQUIRED_SCHEMA_MIGRATION]));
+    if (!rows.rows.length) return { ready: false, reason: "schema_behind" };
+  } catch {
+    // Includes the timeout. The driver's error is deliberately not inspected
+    // and never surfaces: it carries hostnames, addresses and usernames, and
+    // this endpoint answers anyone.
+    return { ready: false, reason: "database_unreachable" };
+  }
+
+  return { ready: true, reason: null };
+}
+
+async function withDeadline<T>(ms: number, work: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("readiness check timed out")), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

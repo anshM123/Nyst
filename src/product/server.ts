@@ -13,11 +13,12 @@ import { healthMetricsText } from "./operationalHealth.js";
 import { LAB_EFFECT } from "./failureLabEngine.js";
 
 /** Single source of the product version string. */
-export const NYST_VERSION = "0.3.0";
+export const NYST_VERSION = "0.3.1";
 import { protectionReportCsv } from "./protectionReport.js";
 import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
 import { authoritativeConsequenceMetadata } from "./effectSemantics.js";
+import { evaluateProcessReadiness } from "./readiness.js";
 import type { GoogleAuth } from "./auth/googleAuth.js";
 import type { FederatedRepository } from "./auth/federatedRepository.js";
 import { TokenRejected, safeRedirect } from "./auth/federatedIdentity.js";
@@ -172,7 +173,30 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   // dependency-free so a load balancer can use it.
   app.get("/health",async()=>({status:"ok",service:"nyst-web",version:NYST_VERSION}));
   // Readiness: can this process actually serve? Requires the database.
-  app.get("/ready",async(_request,reply)=>{try{await options.repository.health();return {status:"ready",service:"nyst-web",version:NYST_VERSION}}catch{return reply.code(503).send({status:"not_ready",reason:"database_unreachable"})}});
+  /**
+   * READINESS (v0.3.1 issue 12).
+   *
+   * This used to be `SELECT 1`, which proves a socket and nothing else. A
+   * process running against a database three releases behind answered "ready",
+   * the deploy drained the pods that worked, and every write then failed with
+   * `column "..." does not exist`.
+   *
+   * It now asserts the schema this build requires, and that a deployment
+   * offering signed receipts can actually sign. Unauthenticated by necessity —
+   * a load balancer cannot hold a credential — so the reason is coarse and
+   * carries no hostname, address, username or schema position.
+   */
+  app.get("/ready", async (_request, reply) => {
+    const readiness = await evaluateProcessReadiness({
+      db: { query: (sql, params) => options.repository.raw(sql, params) },
+      requires_signing: options.outcomes !== undefined,
+      has_signer: options.signer !== undefined,
+    });
+    if (!readiness.ready) {
+      return reply.code(503).send({ status: "not_ready", reason: readiness.reason, service: "nyst-web" });
+    }
+    return { status: "ready", service: "nyst-web", version: NYST_VERSION };
+  });
 
   /**
    * Operational health (Phase 23). PROTECTED: it reveals queue depths and

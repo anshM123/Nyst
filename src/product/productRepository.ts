@@ -32,6 +32,18 @@ export class ProductRepository {
   async health():Promise<void>{await this.db.query("SELECT 1")}
 
   /**
+   * One parameterised statement, for the readiness probe.
+   *
+   * Deliberately narrow rather than a general escape hatch: /ready must reach
+   * the migrations ledger, which is infrastructure rather than product state
+   * and has no business getting a typed repository method of its own. Callers
+   * pass a literal SQL string with bound parameters; nothing here interpolates.
+   */
+  async raw(sql: string, params?: readonly unknown[]): Promise<{ rows: Record<string, unknown>[] }> {
+    return this.db.query(sql, params);
+  }
+
+  /**
    * Run work inside a transaction that holds the environment authority row.
    *
    * This is the shared boundary that gives consequence admission, freeze
