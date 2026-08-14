@@ -392,8 +392,19 @@ export class ProductRepository {
     await this.requireTenantScope(scope);
     if (!["github","okta","stripe"].includes(provider)) throw new Error("Unsupported integration provider");
     const ref=bounded(credentialRef,300,"credential reference"); if (!/^(?:env|vault|secret-manager):[A-Za-z0-9_./:-]{3,280}$/.test(ref)) throw new Error("Integration requires an opaque credential reference");
+    /**
+     * ROTATION INVALIDATES THE PREFLIGHT (v0.3.1 issue 11).
+     *
+     * Nothing extra is needed here. Each preflight records the reference it was
+     * run against, and readiness requires that to equal the reference
+     * configured now — so changing this value drops the integration back to
+     * unverified, and changing it back restores the earlier verdict, which is
+     * the right answer in both directions. No timestamp is involved, so no
+     * comparison crosses a clock boundary.
+     */
     const result=await this.db.query(`INSERT INTO nyst_integrations(integration_id,environment_id,project_id,organization_id,provider,credential_ref,configured)
-      VALUES($1,$2,$3,$4,$5,$6,true) ON CONFLICT(environment_id,provider) DO UPDATE SET credential_ref=excluded.credential_ref,configured=true,last_verified_at=NULL
+      VALUES($1,$2,$3,$4,$5,$6,true) ON CONFLICT(environment_id,provider) DO UPDATE SET
+        credential_ref=excluded.credential_ref,configured=true,last_verified_at=NULL
       WHERE nyst_integrations.project_id=excluded.project_id AND nyst_integrations.organization_id=excluded.organization_id
       RETURNING provider,configured,credential_ref,last_verified_at`,[randomUUID(),scope.environment_id,scope.project_id,scope.organization_id,provider,ref]); const row=result.rows[0];if(!row)throw new Error("Integration belongs to a different tenant scope");return row;
   }
@@ -778,7 +789,26 @@ export class ProductRepository {
       FROM (SELECT 1) one
       LEFT JOIN nyst_integrations i ON i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND i.provider=$4
       LEFT JOIN LATERAL (SELECT status,performed_at,scope_result,account_identity,resource_result
-        FROM nyst_integration_preflights WHERE environment_id=$1 AND provider=$4 ORDER BY performed_at DESC LIMIT 1) p ON true`,
+        FROM nyst_integration_preflights
+        WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4
+          -- A preflight proves the credential it was RUN AGAINST. If the
+          -- integration now points somewhere else, that verdict says nothing
+          -- about the credential in use, so readiness drops rather than
+          -- inheriting it for the rest of the twelve-hour window (issue 11).
+          --
+          -- Compared by IDENTITY, not by time. The first attempt compared
+          -- performed_at against the integration's configured-at stamp, and the
+          -- existing readiness tests caught it at once: performed_at comes from
+          -- the APPLICATION clock and the integration row is stamped by the
+          -- DATABASE clock, so a preflight run milliseconds after a configure
+          -- could compare as earlier and a freshly verified integration
+          -- reported unverified. Identity also correctly treats rotating away
+          -- and back to the same reference as still verified.
+          --
+          -- The lateral now also carries the full tenant tuple; it was the one
+          -- scoping query in this subsystem that did not.
+          AND credential_ref IS NOT DISTINCT FROM i.credential_ref
+        ORDER BY performed_at DESC LIMIT 1) p ON true`,
       [scope.environment_id,scope.project_id,scope.organization_id,provider])).rows[0]??{};
     const attestations=(await this.db.query(`SELECT c.capability,u.email attested_by,c.attested_at
       FROM nyst_capability_attestations c JOIN nyst_users u ON u.user_id=c.attested_by
@@ -895,9 +925,13 @@ export class ProductRepository {
       [scope.environment_id,scope.project_id,scope.organization_id,provider])).rows[0];
     const reference=row?.configured===true&&typeof row.credential_ref==="string"?row.credential_ref:null;
     const record=await runPreflight(provider,reference,secrets,probe,now);
-    const stored=await this.db.query(`INSERT INTO nyst_integration_preflights(preflight_id,environment_id,project_id,organization_id,provider,status,account_identity,scope_result,resource_result,failure_detail,provider_mutation_performed,performed_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false,$11) RETURNING preflight_id,provider,status,account_identity,scope_result,resource_result,failure_detail,provider_mutation_performed,performed_at`,
-      [randomUUID(),scope.environment_id,scope.project_id,scope.organization_id,provider,record.status,record.account_identity,record.scope_result,record.resource_result,record.failure_detail,record.performed_at]);
+    // The reference this preflight actually tested is recorded alongside it, so
+    // readiness can tell whether the verdict says anything about the credential
+    // configured NOW. See 0030 for why that is an identity check rather than a
+    // timestamp comparison (v0.3.1 issue 11).
+    const stored=await this.db.query(`INSERT INTO nyst_integration_preflights(preflight_id,environment_id,project_id,organization_id,provider,status,account_identity,scope_result,resource_result,failure_detail,provider_mutation_performed,performed_at,credential_ref)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false,$11,$12) RETURNING preflight_id,provider,status,account_identity,scope_result,resource_result,failure_detail,provider_mutation_performed,performed_at`,
+      [randomUUID(),scope.environment_id,scope.project_id,scope.organization_id,provider,record.status,record.account_identity,record.scope_result,record.resource_result,record.failure_detail,record.performed_at,reference]);
     if(record.status==="verified_ready"){
       await this.db.query(`UPDATE nyst_integrations SET last_verified_at=$5 WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,
         [scope.environment_id,scope.project_id,scope.organization_id,provider,record.performed_at]);
@@ -916,7 +950,15 @@ export class ProductRepository {
       [scope.environment_id,scope.project_id,scope.organization_id,provider,Math.min(Math.max(1,limit),50)])).rows;
   }
 
-  async markIntegrationVerified(scope:TenantScope,provider:string):Promise<void>{const result=await this.db.query(`UPDATE nyst_integrations SET last_verified_at=now() WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4 AND configured RETURNING integration_id`,[scope.environment_id,scope.project_id,scope.organization_id,provider]);if(!result.rows.length)throw new Error("Integration is unavailable in this tenant scope");}
+  /*
+   * `markIntegrationVerified` was REMOVED in v0.3.1 (issue 11).
+   *
+   * It set last_verified_at=now() with no preflight, and had zero callers, so
+   * it was never a live bypass. But it was a mark-ready-without-verifying
+   * primitive sitting in the codebase waiting for someone to reach for it, and
+   * this product's whole claim is that "ready" means verified. Verification
+   * comes from `runIntegrationPreflight` and nowhere else.
+   */
 
   async recordResolutionTransition(actionId:string,resolutionValue:unknown,origin:"action_commit"|"scheduler"|"manual_reconcile"|"recovery_worker"|"human_review"|"compensation"|"backfill"):Promise<boolean>{
     const resolution=resolutionValue as OutcomeResolution;if(!resolution?.effect||!resolution.control||!resolution.runtime||!resolution.trust)throw new Error("Canonical OutcomeResolution required");

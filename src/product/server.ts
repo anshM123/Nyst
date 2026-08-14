@@ -320,8 +320,14 @@ export async function buildProductServer(options: ProductServerOptions): Promise
 
   app.post("/v1/auth/identities/:id/disconnect", api(async (principal, request, reply) => {
     sessionOnly(principal); requireCsrf(request, principal);
+    // The route parameter is validated BEFORE the configuration check. It used
+    // to be validated inside the call below, so a malformed identity id on a
+    // deployment without federated identity produced a 503 about configuration
+    // rather than a 400 about the input — the caller was told the wrong thing,
+    // and the answer depended on how the deployment happened to be configured.
+    const identityId = routeId(request);
     if (!options.federated) throw Object.assign(new Error("Federated identity is not enabled"), { statusCode: 503 });
-    const result = await options.federated.disconnectIdentity(principal.user_id, routeId(request));
+    const result = await options.federated.disconnectIdentity(principal.user_id, identityId);
     if (result.ok) return { disconnected: true };
     // A refusal to remove the last sign-in method is a 409, not a 404: the
     // identity exists, and Nyst is declining to lock someone out.
@@ -487,7 +493,13 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     requireScope(principal, "receipts:read");
     const query = request.query as { evaluation_sequence?: unknown };
     const sequence = query.evaluation_sequence === undefined ? undefined : Number(query.evaluation_sequence);
-    if (sequence !== undefined && (!Number.isInteger(sequence) || sequence < 0)) {
+    // Bounded, not merely integral. `Number.isInteger(1e22)` is true — it is a
+    // float with no fractional part — so an absurd value passed validation and
+    // reached PostgreSQL as a bigint parameter, which answered with an
+    // out-of-range error and a 500. Input that cannot be a real sequence is
+    // refused here, at the boundary, rather than by the database.
+    if (sequence !== undefined
+      && (!Number.isSafeInteger(sequence) || sequence < 0 || sequence > 2 ** 53 - 1)) {
       throw Object.assign(new Error("evaluation_sequence must be a non-negative integer"), { statusCode: 400 });
     }
     const receipt = await requireOutcomes(options).receipt(principal, routeId(request), sequence);
@@ -1023,7 +1035,65 @@ function routeId(request: FastifyRequest): string { const id = String((request.p
 function object(value: unknown): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw Object.assign(new Error("Object required"), { statusCode: 400 }); return value as Record<string, unknown>; }
 function string(value: unknown, max: number): string { if (typeof value !== "string" || !value || value.length > max || /[\r\n\0]/.test(value)) throw Object.assign(new Error("Invalid string"), { statusCode: 400 }); return value; }
 function strings(value: unknown, max: number): string[] { if (!Array.isArray(value) || !value.length || value.length > max || value.some((item) => typeof item !== "string")) throw Object.assign(new Error("Invalid string list"), { statusCode: 400 }); return value as string[]; }
-function credentialReference(value:unknown):string{const ref=string(value,300);if(!/^(?:env|vault|secret-manager):[A-Za-z0-9_./:-]{3,280}$/.test(ref))throw Object.assign(new Error("Invalid credential reference"),{statusCode:400});return ref;}
+/**
+ * A credential REFERENCE is the NAME of a secret, never the secret.
+ *
+ * v0.3.1 issue 11. This checked syntax only — does it start with `env:` — and
+ * the sole thing stopping someone pasting a real token here was a database
+ * CHECK blacklisting six specific prefixes. An Okta SSWS token, a 40-hex
+ * GitHub classic token, a Google client secret or a JWT passed both and was
+ * stored in cleartext. `sanitizeForProduct` deliberately exempts this field —
+ * correctly, since `env:NYST_GITHUB_TOKEN` is a name the UI must display — so
+ * a stored secret was then echoed back by the API and rendered into a page.
+ *
+ * The refusal now happens HERE, so the caller is told what a reference is
+ * rather than receiving a constraint violation from PostgreSQL. The database
+ * CHECK stays as the backstop for any future code path that forgets.
+ */
+function credentialReference(value:unknown):string{
+  const ref = string(value, 300);
+  if (!/^(?:env|vault|secret-manager):[A-Za-z0-9_./:-]{3,280}$/.test(ref)) {
+    throw Object.assign(new Error(
+      "A credential reference must look like env:NAME_OF_VARIABLE, vault:path or secret-manager:name."),
+      { statusCode: 400 });
+  }
+  const name = ref.slice(ref.indexOf(":") + 1);
+  if (looksLikeSecret(name)) {
+    throw Object.assign(new Error(
+      "That looks like a secret value, not the NAME of one. Nyst stores a reference — for example " +
+      "env:NYST_GITHUB_TOKEN — and resolves the actual credential at the moment of use, so it is " +
+      "never written to the database. Set the token in the environment and give its variable name here."),
+      { statusCode: 400 });
+  }
+  return ref;
+}
+
+/**
+ * Does this look like a credential rather than a variable name?
+ *
+ * Deliberately broader than the six-prefix blacklist it replaces, and
+ * deliberately shape-based rather than a list of vendors: the next provider is
+ * not on any list. A variable name is short, and conventionally upper snake
+ * case; a token is long and mixes cases and digits with high entropy.
+ *
+ * False positives are acceptable here. Refusing an oddly-named variable costs
+ * someone a rename; accepting a token writes it to the database in cleartext
+ * and echoes it back over the API.
+ */
+function looksLikeSecret(name: string): boolean {
+  // Known vendor prefixes, kept because they are unambiguous.
+  if (/(github_pat_|ghp_|gho_|ghs_|ghu_|sk_(test|live)_|rk_(test|live)_|xox[baprs]-|AKIA|GOCSPX-|AIza)/.test(name)) return true;
+  // A JWT.
+  if (/^ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\./.test(name)) return true;
+  // A path or a dotted name is a legitimate reference shape (vault:kv/data/x).
+  const bare = name.replace(/^[A-Za-z0-9_.-]*[/:]/, "");
+  if (bare.length < 25) return false;
+  // 32+ hex characters. A GitHub classic token is 40 lowercase hex, which has
+  // no uppercase at all and so slips past the mixed-case rule below.
+  if (/^[0-9a-fA-F]{32,}$/.test(bare)) return true;
+  // Long AND mixed-case AND containing digits: a variable name is not.
+  return /[a-z]/.test(bare) && /[A-Z]/.test(bare) && /[0-9]/.test(bare);
+}
 function filters(value: unknown) { const q = value && typeof value === "object" ? value as Record<string, unknown> : {}; const limit=typeof q.limit==="string"?Number(q.limit):undefined;if(limit!==undefined&&(!Number.isInteger(limit)||limit<1||limit>200))throw Object.assign(new Error("Invalid limit"),{statusCode:400});let since: string|undefined;if(typeof q.since==="string"){const parsed=new Date(q.since);if(!Number.isFinite(parsed.getTime()))throw Object.assign(new Error("Invalid since"),{statusCode:400});since=parsed.toISOString();}return { ...(typeof q.provider === "string" ? { provider: filterString(q.provider,60) } : {}), ...(typeof q.effect === "string" ? { effect: filterString(q.effect,200) } : {}), ...(typeof q.state === "string" ? { state: filterString(q.state,40) } : {}), ...(typeof q.decision === "string" ? { decision: filterString(q.decision,40) } : {}), ...(since ? { since } : {}), ...(limit!==undefined ? { limit } : {}) }; }
 function filterString(value:string,max:number):string{if(!value||value.length>max||/[\r\n\0]/.test(value))throw Object.assign(new Error("Invalid filter"),{statusCode:400});return value;}
 /**
