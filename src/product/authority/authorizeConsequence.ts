@@ -181,16 +181,9 @@ export async function authorizeConsequence(
   await authority.recordDecision(scope, {
     agent_id: input.agent_id,
     effect_name: input.effect_name,
-    disposition: decision.disposition,
-    primary_reason: decision.primary_reason,
-    reasons: decision.reasons,
-    controlling_policy_version_id: input.policy_version_id,
-    autonomy_rule_id: decision.autonomy.rule?.autonomy_rule_id ?? null,
-    freeze_id: input.admission.freeze_id ?? null,
-    budget_id: input.admission.budget_id ?? null,
-    exception_id: decision.exception_id ?? null,
-    grant_id: input.outcome_dependency?.grant_id ?? null,
-  } as never).catch(() => undefined);
+    outcome_instance_id: input.outcome_dependency?.outcome_instance_id ?? null,
+    decision,
+  });
 
   return decision;
 }

@@ -29,6 +29,17 @@ const EXPECTED_PROVIDER_REFS: Readonly<Record<string, string>> = { github: "env:
 
 export class ProductRepository {
   constructor(private readonly db: ProductDb) {}
+
+  /**
+   * The connection this repository writes through.
+   *
+   * Exposed for ONE reason: so `buildProductServer` can construct the Authority
+   * layer itself rather than accepting it as an option a deployment might
+   * forget to pass. Until v0.3.2 `authority` was optional, and a server built
+   * without it dispatched consequences with no Autonomy Line check at all --
+   * the defect this accessor exists to make structurally impossible.
+   */
+  get database(): ProductDb { return this.db; }
   async health():Promise<void>{await this.db.query("SELECT 1")}
 
   /**
@@ -108,6 +119,38 @@ export class ProductRepository {
       [organizationId, projectId, environmentId, userId, slug(input.organization_slug), bounded(input.organization, 120, "organization"), slug(input.project_slug), bounded(input.project, 120, "project"), slug(input.environment_slug), bounded(input.environment, 120, "environment"), email, bounded(input.display_name, 120, "display name"), passwordHash, input.mode ?? "enforced"]);
     await this.db.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by)
       VALUES($1,$2,$3,$4,NULL,1,'automatic','never',false,false,300,$5)`, [randomUUID(), environmentId, projectId, organizationId, userId]);
+    /**
+     * THE DEFAULT AUTONOMY LINE RULE (v0.3.2 Phase 1).
+     *
+     * Once the Authority layer actually gates consequences, a workspace with no
+     * Autonomy Line rule can dispatch nothing at all — correctly, because "an
+     * undescribed Agent has no autonomy". But a brand-new workspace whose first
+     * action is refused with no way to discover why is not a usable product, so
+     * the bootstrap DESCRIBES a starting posture rather than leaving it absent.
+     *
+     * That distinction is the whole point. This is not "no rule, therefore
+     * anything goes". It is an explicit rule, visible on the Autonomy Line page,
+     * carrying a rationale the customer can read and tighten.
+     *
+     * `requires_reversible` is the conservative half. A reversible effect may
+     * proceed; anything IRREVERSIBLE still finds no applicable rule and falls
+     * through to "Nyst asks a person". Irreversible is where being wrong is
+     * permanent, so it is what stays with a human by default.
+     *
+     * HONEST TRADE-OFF: a stricter product would default to `human` and make
+     * every first action wait for approval. That is defensible and safer. This
+     * chooses usable-by-default for reversible effects, and the choice is
+     * stated here rather than buried in a migration.
+     */
+    await this.db.query(`INSERT INTO nyst_autonomy_rules(autonomy_rule_id,organization_id,project_id,environment_id,
+        requires_reversible,requires_no_open_incident,disposition,rationale,created_by)
+      VALUES($1,$2,$3,$4,true,true,'autonomous',$5,$6)`,
+      [randomUUID(), organizationId, projectId, environmentId,
+        "Default starting posture created with this workspace: an Agent may act autonomously on REVERSIBLE "
+        + "effects while no incident is open. Irreversible effects still ask a person. Tighten or replace this "
+        + "rule on the Autonomy Line page once you know what your Agents actually do.",
+        userId]);
+
     return { organization_id: organizationId, project_id: projectId, environment_id: environmentId, user_id: userId };
   }
 

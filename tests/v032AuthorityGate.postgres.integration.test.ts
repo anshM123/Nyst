@@ -109,6 +109,22 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
     cookie = String(login.headers["set-cookie"] ?? "").split(";")[0]!;
     csrf = String((login.json() as { csrf?: unknown }).csrf ?? "");
 
+    /**
+     * REMOVE THE BOOTSTRAP DEFAULT RULE.
+     *
+     * `createBootstrap` now creates one -- deliberately, so a new workspace is
+     * usable -- and it covers reversible effects. That is correct behaviour and
+     * it makes this file's premise stale: the whole point here is an Agent that
+     * NO rule covers, and the default rule covers it.
+     *
+     * So it is disabled explicitly, which is also the more honest test: it
+     * proves the gate holds when authority is genuinely absent, rather than
+     * relying on a workspace happening not to have been given a default.
+     */
+    for (const rule of await authority.autonomyRules(tenant)) {
+      await authority.disableAutonomyRule(tenant, rule.autonomy_rule_id);
+    }
+
     // The EffectSpec must be ENABLED for this environment, or the route refuses
     // before authority is ever consulted and the suite passes for the wrong
     // reason -- which it did on the first run.
@@ -230,6 +246,25 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
 
   /* ===================================================== STRUCTURAL */
 
+  it("a new workspace gets a DESCRIBED default posture, scoped to reversible effects", async () => {
+    // The counterpart to the test above. Absent authority is refused; a new
+    // workspace is not left absent, it is given an explicit, visible, tightenable
+    // rule -- and that rule does not cover irreversible effects.
+    const fresh = await repository.createBootstrap({
+      organization: "Fresh Co", organization_slug: `fresh-${suffix}`,
+      project: "Prod", project_slug: "prodproject",
+      environment: "Production", environment_slug: "production", mode: "enforced",
+      email: `fresh-${suffix}@test.test`, display_name: "Fresh", password: PASSWORD,
+    });
+    const rules = await authority.autonomyRules(fresh);
+    assert.equal(rules.length, 1, "a new workspace has no default Autonomy Line rule at all");
+    assert.equal(rules[0]!.disposition, "autonomous");
+    assert.equal(rules[0]!.requires_reversible, true,
+      "THE DEFAULT RULE COVERS IRREVERSIBLE EFFECTS — where being wrong is permanent");
+    assert.ok(String(rules[0]!.rationale).length > 40,
+      "the default rule has no rationale a person could read on the Autonomy Line page");
+  });
+
   it("STRUCTURAL: the action route calls the canonical evaluator", async () => {
     // The v0.3.0 structural test asserted there is no SECOND evaluator. True,
     // and not the same as the one evaluator being used — which is precisely how
@@ -243,10 +278,21 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
       "THE ACTION ROUTE DOES NOT CONSULT THE CANONICAL AUTHORITY EVALUATOR");
   });
 
-  it("STRUCTURAL: a deployment without the Authority layer fails CLOSED", async () => {
-    // The wiring hazard: `authority` is an optional server option. If a missing
-    // Authority layer skipped the check instead of refusing, the same defect
-    // returns as a configuration flag.
+  it("STRUCTURAL: the Authority layer cannot be omitted from a deployment", async () => {
+    /**
+     * The wiring hazard, closed structurally rather than by convention.
+     *
+     * `authority` used to be an optional server option, and a server built
+     * without it dispatched consequences with no Autonomy Line check at all --
+     * which is how absent authority became full authority in the first place.
+     * Making the option REQUIRED would only have moved the mistake to every
+     * call site; `buildProductServer` now constructs the layer from the
+     * repository's own connection, so there is no configuration in which it is
+     * missing.
+     *
+     * This asserts the consequence: a server built with NO authority option is
+     * still gated.
+     */
     providerCalls = [];
     const bare = await buildProductServer({
       repository,
@@ -267,8 +313,8 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
         payload: { effect: EFFECT, businessKey: `bare-${suffix}`, agent_id: agentId, input: {} },
       });
       assert.equal(providerCalls.length, 0,
-        "A DEPLOYMENT WITH NO AUTHORITY LAYER DISPATCHED A CONSEQUENCE — the defect returned as a config flag");
-      assert.equal(response.statusCode, 503);
+        "A SERVER BUILT WITH NO AUTHORITY OPTION DISPATCHED A CONSEQUENCE — the defect returned as a config flag");
+      assert.ok(response.statusCode >= 400, `expected a refusal, got ${response.statusCode}`);
     } finally { await bare.close(); }
   });
 });

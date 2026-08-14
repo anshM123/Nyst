@@ -19,7 +19,8 @@ import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
 import { authoritativeConsequenceMetadata } from "./effectSemantics.js";
 import { evaluateProcessReadiness } from "./readiness.js";
-import { authorizeConsequence, AuthorityUnavailable } from "./authority/authorizeConsequence.js";
+import { authorizeConsequence } from "./authority/authorizeConsequence.js";
+import { AuthorityRepository } from "./authority/authorityRepository.js";
 import type { GoogleAuth } from "./auth/googleAuth.js";
 import type { FederatedRepository } from "./auth/federatedRepository.js";
 import { TokenRejected, safeRedirect } from "./auth/federatedIdentity.js";
@@ -31,7 +32,6 @@ import type { EvidenceIngest, RelayCoordinator, RelayOperation } from "./outcome
 import { RELAY_OPERATIONS } from "./outcome/evidenceIngest.js";
 import { subjectReferences as subjectReferencesFor } from "./outcome/outcomeRepository.js";
 import type { OutcomeRepository } from "./outcome/outcomeRepository.js";
-import type { AuthorityRepository } from "./authority/authorityRepository.js";
 import { sanitizeForProduct } from "./sanitize.js";
 import type { EffectSpecDescriptor, ProductCommitter, ProductContext, ProductPrincipal } from "./types.js";
 import type { InMemoryOperationalMetrics } from "./scheduler.js";
@@ -127,6 +127,24 @@ export interface ProductServerOptions {
 }
 
 export async function buildProductServer(options: ProductServerOptions): Promise<FastifyInstance> {
+  /**
+   * THE AUTHORITY LAYER IS NOT OPTIONAL (v0.3.2 Phase 1).
+   *
+   * It used to be, and a server built without it dispatched consequences with
+   * no Autonomy Line check whatsoever -- which is exactly how an Agent with no
+   * rule came to have unlimited authority in production.
+   *
+   * Making the option required would have been the obvious fix and the wrong
+   * one: it turns a safety property into something every call site has to
+   * remember, and twenty-one test files plus every future one become places it
+   * can be forgotten again. Constructing it here from the repository's own
+   * connection means there is no configuration in which it is absent.
+   *
+   * `options.authority` is still honoured when supplied, so a caller can pass a
+   * differently-scoped instance; it just cannot pass nothing.
+   */
+  const authorityLayer = options.authority ?? new AuthorityRepository(options.repository.database);
+
   const app = Fastify({
     logger: false, bodyLimit: 64 * 1024, requestIdHeader: false, genReqId: () => randomUUID(),
     trustProxy: options.trust_proxy === true,
@@ -928,7 +946,7 @@ export async function buildProductServer(options: ProductServerOptions): Promise
      * because after it there is a provider mutation, and an authority decision
      * taken after the consequence is not a gate, it is a log line.
      */
-    const authorityDecision = await authorizeConsequence(options.authority, principal, {
+    const authorityDecision = await authorizeConsequence(authorityLayer, principal, {
       agent_id: agentId,
       effect_name: effect,
       amount_minor: consequence.amount_minor,
