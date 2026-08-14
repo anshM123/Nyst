@@ -117,9 +117,11 @@ export class MemoryOffboardingRunLedger implements OffboardingRunLedger {
         if (existing.input_hash !== hash) throw new OffboardingCollisionError("Conflicting offboarding intent");
         return { run: structuredClone(existing), created: false };
       }
-      if (this.bySubject.has(intent.subject.subject_key)) {
-        throw new OffboardingCollisionError("Subject already has a different offboarding run");
-      }
+      // NO SUBJECT COLLISION CHECK (v0.3.1 issue 9). It used to refuse any
+      // second run for a subject that already had one, which made a person's
+      // identity a permanent idempotency key: a contractor who left, returned,
+      // and left again could not be offboarded the second time. The request
+      // identity is `business_key`, and it is checked above.
       const run = newOffboardingRun(intent);
       this.byId.set(run.run_id, structuredClone(run));
       this.byBusiness.set(run.business_key, run.run_id);
@@ -162,21 +164,18 @@ export class PostgresOffboardingRunLedger implements OffboardingRunLedger {
   async recordIntent(intentValue: OffboardingRunIntent): Promise<{ run: OffboardingRunRecord; created: boolean }> {
     const intent = validateOffboardingIntent(intentValue);
     const candidate = newOffboardingRun(intent);
-    let inserted;
-    try {
-      inserted = await this.db.query(
-        `INSERT INTO outcome_offboarding_runs
-         (run_id,business_key,subject_key,input_hash,intent,created_at)
-         VALUES ($1,$2,$3,$4,$5::jsonb,$6::timestamptz)
-         ON CONFLICT (business_key) DO NOTHING RETURNING *`,
-        [candidate.run_id,candidate.business_key,candidate.subject.subject_key,candidate.input_hash,JSON.stringify(intent),candidate.created_at]
-      );
-    } catch (error) {
-      if (/subject_key|offboarding_subject/i.test(error instanceof Error ? error.message : String(error))) {
-        throw new OffboardingCollisionError("Subject already has a different offboarding run");
-      }
-      throw error;
-    }
+    // The only identity here is `business_key`, which is the REQUEST. The
+    // subject was UNIQUE too until v0.3.1, which meant a person could be
+    // offboarded exactly once for the lifetime of the database; the error that
+    // used to be translated below is now unreachable because the constraint is
+    // gone. See 0029_v031_request_key.sql.
+    const inserted = await this.db.query(
+      `INSERT INTO outcome_offboarding_runs
+       (run_id,business_key,subject_key,input_hash,intent,created_at)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6::timestamptz)
+       ON CONFLICT (business_key) DO NOTHING RETURNING *`,
+      [candidate.run_id,candidate.business_key,candidate.subject.subject_key,candidate.input_hash,JSON.stringify(intent),candidate.created_at]
+    );
     if (inserted.rows[0]) return { run: rowToOffboarding(inserted.rows[0]), created: true };
     const existing = await this.findByBusinessKey(intent.business_key);
     if (!existing) throw new Error("Offboarding insert conflict winner missing");

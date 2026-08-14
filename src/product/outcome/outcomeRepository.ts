@@ -58,7 +58,10 @@ export interface OutcomeInstance {
   contract_version: number;
   agent_id: string | null;
   subject: Record<string, unknown>;
+  /** WHO this is about. Repeats across requests, deliberately. */
   subject_key: string;
+  /** WHICH request this is. Unique among live requests for the contract. */
+  request_key: string;
   mode: "shadow" | "canary" | "enforced";
   verdict: OutcomeVerdict;
   lifecycle: OutcomeLifecycle;
@@ -236,16 +239,35 @@ export class OutcomeRepository {
   /**
    * Open one concrete outcome.
    *
-   * `subject_key` is the caller's stable identity for it. A retrying caller
-   * gets the SAME instance back rather than a second offboarding for the same
-   * person, which is the outcome-layer equivalent of the atomic action
-   * identity guarantee.
+   * TWO KEYS, AND THEY ARE NOT THE SAME THING (v0.3.1 issue 9).
+   *
+   * `subject_key` says WHO this is about. It repeats, deliberately — "show me
+   * everything Nyst has established about Alice" is a question worth asking.
+   *
+   * `request_key` says which REQUEST this is, and is unique among LIVE requests.
+   * A retrying caller gets the same instance back; a genuinely new request for
+   * the same person, after the previous one finished, gets a new one.
+   *
+   * Before v0.3.1 the subject was the only key and it was unique forever, so a
+   * person could be offboarded exactly once. A contractor who returned and left
+   * again received the FIRST, already-settled instance with `created: false` —
+   * complete with its signed receipt — so every signal said the new offboarding
+   * had succeeded before it started.
    */
   async openInstance(scope: TenantScope, input: {
     outcome_contract_id: string;
     agent_id?: string | null;
     subject: Record<string, unknown>;
+    /** WHO this is about. Repeats across requests. */
     subject_key: string;
+    /**
+     * THIS request. Unique among live requests for the contract.
+     *
+     * Omit it and the subject is used, which is exactly the old behaviour: one
+     * live outcome per subject. Supply it when one subject can legitimately be
+     * the subject of more than one request over time.
+     */
+    request_key?: string;
     mode: "shadow" | "canary" | "enforced";
     now?: Date;
   }): Promise<{ instance: OutcomeInstance; created: boolean }> {
@@ -256,22 +278,46 @@ export class OutcomeRepository {
 
     const now = input.now ?? new Date();
     const deadline = new Date(now.getTime() + contract.timeout_seconds * 1000);
+    // Defaults to the subject, which is what the old behaviour effectively
+    // was. A caller that never cared about the distinction keeps exactly the
+    // idempotency it had: one live outcome per subject.
+    const requestKey = input.request_key ?? input.subject_key;
+
     const inserted = await this.db.query(
       `INSERT INTO nyst_outcome_instances(outcome_instance_id,outcome_contract_id,contract_version,
-         organization_id,project_id,environment_id,agent_id,subject,subject_key,mode,started_at,deadline_at,
+         organization_id,project_id,environment_id,agent_id,subject,subject_key,request_key,mode,started_at,deadline_at,
          coverage_denominator)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-       ON CONFLICT (environment_id,outcome_contract_id,subject_key) DO NOTHING
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       ON CONFLICT (environment_id,outcome_contract_id,request_key) WHERE completed_at IS NULL DO NOTHING
        RETURNING *`,
       [randomUUID(), contract.outcome_contract_id, contract.contract_version,
         scope.organization_id, scope.project_id, scope.environment_id, input.agent_id ?? null,
-        JSON.stringify(input.subject), input.subject_key, input.mode,
-        now.toISOString(), deadline.toISOString(), contract.required_invariants.length]);
+        JSON.stringify(input.subject), input.subject_key, requestKey, input.mode,
+        now.toISOString(), deadline.toISOString(), contract.required_invariants.length])
+      .catch((error: unknown) => {
+        // The OTHER live index: a different request for a subject that already
+        // has one open. Two offboardings racing on one person is a real hazard,
+        // so it is refused loudly rather than silently joined to the existing
+        // outcome — the caller asked for something Nyst is not going to do.
+        const constraint = String((error as { constraint?: unknown }).constraint ?? "");
+        if (constraint.includes("live_subject")) {
+          throw Object.assign(new Error(
+            `${input.subject_key} already has a live outcome under this contract. ` +
+            "Two concurrent outcomes for one subject would race; settle or cancel the open one first."),
+            { statusCode: 409 });
+        }
+        throw error;
+      });
     if (inserted.rows.length) return { instance: hydrateInstance(inserted.rows[0]!), created: true };
 
+    // A LIVE instance already exists for this request key. That is a repeat of
+    // the same request, so it is idempotent — unlike before v0.3.1, where a
+    // COMPLETED instance for the same subject was returned too, handing a
+    // December offboarding March's settled verdict.
     const existing = (await this.db.query(
-      `SELECT * FROM nyst_outcome_instances WHERE environment_id=$1 AND outcome_contract_id=$2 AND subject_key=$3`,
-      [scope.environment_id, contract.outcome_contract_id, input.subject_key])).rows[0]!;
+      `SELECT * FROM nyst_outcome_instances
+       WHERE environment_id=$1 AND outcome_contract_id=$2 AND request_key=$3 AND completed_at IS NULL`,
+      [scope.environment_id, contract.outcome_contract_id, requestKey])).rows[0]!;
     return { instance: hydrateInstance(existing), created: false };
   }
 
@@ -842,6 +888,7 @@ function hydrateInstance(row: Record<string, unknown>): OutcomeInstance {
     agent_id: row.agent_id ? String(row.agent_id) : null,
     subject: row.subject as Record<string, unknown>,
     subject_key: String(row.subject_key),
+    request_key: String(row.request_key ?? row.subject_key),
     mode: row.mode as "shadow" | "canary" | "enforced",
     verdict: row.verdict as OutcomeVerdict,
     lifecycle: row.lifecycle as OutcomeLifecycle,

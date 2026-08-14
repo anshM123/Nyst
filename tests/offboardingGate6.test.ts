@@ -206,13 +206,27 @@ describe("Gate 6 integrated offboarding coordinator", () => {
     );
   });
 
-  it("rejects a conflicting second run for the same subject", async () => {
+  /**
+   * CHANGED IN v0.3.1 (issue 9). This used to assert the opposite: that a
+   * second run for the same subject was REFUSED, under any business key.
+   *
+   * That made a person's identity a permanent idempotency key. Alice could be
+   * offboarded exactly once for the lifetime of the database — so a contractor
+   * who left, returned, and left again could not be offboarded the second time,
+   * and an offboarding that failed could never be retried under a new request.
+   *
+   * The request identity is `business_key`, and the test above still proves a
+   * conflicting intent under one business key is refused. The subject is not an
+   * identity for a request; it is who the request is about.
+   */
+  it("allows a second run for the same subject under a new business key", async () => {
     const h = makeOffboardingHarness();
-    await h.coordinator.execute(offboardingIntent());
-    await assert.rejects(
-      () => h.coordinator.execute(offboardingIntent({ business_key: "gate6-run-2" })),
-      OffboardingCollisionError
-    );
+    const first = await h.coordinator.execute(offboardingIntent());
+    const second = await h.coordinator.execute(offboardingIntent({ business_key: "gate6-run-2" }));
+
+    assert.notEqual(second.run.run_id, first.run.run_id,
+      "A REHIRED PERSON COULD NOT BE OFFBOARDED A SECOND TIME");
+    assert.equal(second.run.subject.subject_key, first.run.subject.subject_key);
   });
 
   it("recovers a crash after the Okta consequence from the persisted action", async () => {
