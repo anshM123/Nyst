@@ -87,6 +87,10 @@ export interface WorldFactInput {
   adapter_version: string;
 }
 
+/** The public shape of a receipt. The signature and payload travel together. */
+const RECEIPT_COLUMNS =
+  "outcome_receipt_id,outcome_instance_id,evaluation_sequence,verdict,payload,payload_hash,signature,key_id,issued_at";
+
 export class OutcomeRepository {
   constructor(private readonly db: ProductDb) {}
 
@@ -649,28 +653,64 @@ export class OutcomeRepository {
     const hash = canonicalHash(payload).replace(/^sha256:/, "");
     const signature = signer.sign(payload);
 
+    const sequence = instance.evaluation_sequence;
     const inserted = await this.db.query(
-      `INSERT INTO nyst_outcome_receipts(outcome_receipt_id,outcome_instance_id,environment_id,project_id,organization_id,
-         verdict,payload,payload_hash,signature,key_id)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       ON CONFLICT (outcome_instance_id) DO NOTHING
-       RETURNING outcome_receipt_id,verdict,payload,payload_hash,signature,key_id,issued_at`,
-      [randomUUID(), instanceId, scope.environment_id, scope.project_id, scope.organization_id,
+      `INSERT INTO nyst_outcome_receipts(outcome_receipt_id,outcome_instance_id,evaluation_sequence,
+         environment_id,project_id,organization_id,verdict,payload,payload_hash,signature,key_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (outcome_instance_id,evaluation_sequence) DO NOTHING
+       RETURNING ${RECEIPT_COLUMNS}`,
+      [randomUUID(), instanceId, sequence, scope.environment_id, scope.project_id, scope.organization_id,
         instance.verdict, JSON.stringify(payload), hash, signature.signature_b64, signature.key_id]);
     if (inserted.rows.length) return inserted.rows[0]!;
 
-    // A receipt already exists. It is immutable, so return the original rather
-    // than issuing a second statement about the same instant.
+    // A receipt already exists AT THIS EVALUATION. Nothing has been
+    // re-evaluated since, so there is nothing new to attest and the original —
+    // which is immutable — is the correct answer. This is idempotence, not the
+    // old behaviour of silently returning a statement about a different
+    // instant.
     return (await this.db.query(
-      `SELECT outcome_receipt_id,verdict,payload,payload_hash,signature,key_id,issued_at
-       FROM nyst_outcome_receipts WHERE outcome_instance_id=$1`, [instanceId])).rows[0]!;
+      `SELECT ${RECEIPT_COLUMNS} FROM nyst_outcome_receipts
+       WHERE outcome_instance_id=$1 AND evaluation_sequence=$2`, [instanceId, sequence])).rows[0]!;
   }
 
-  async receipt(scope: TenantScope, instanceId: string): Promise<Record<string, unknown> | null> {
+  /**
+   * The receipt for an instance: the LATEST statement by default, or the one
+   * issued at a specific evaluation.
+   *
+   * Defaulting to the latest matters. Before v0.3.1 this returned the single
+   * permitted receipt, which was always the FIRST ever issued — so a caller
+   * asking for proof after a remediation received a signed statement of the
+   * verdict from before it.
+   */
+  async receipt(scope: TenantScope, instanceId: string, evaluationSequence?: number): Promise<Record<string, unknown> | null> {
+    if (evaluationSequence !== undefined) {
+      return (await this.db.query(
+        `SELECT ${RECEIPT_COLUMNS} FROM nyst_outcome_receipts
+         WHERE outcome_instance_id=$1 AND environment_id=$2 AND organization_id=$3 AND evaluation_sequence=$4`,
+        [instanceId, scope.environment_id, scope.organization_id, evaluationSequence])).rows[0] ?? null;
+    }
     return (await this.db.query(
-      `SELECT outcome_receipt_id,verdict,payload,payload_hash,signature,key_id,issued_at
-       FROM nyst_outcome_receipts WHERE outcome_instance_id=$1 AND environment_id=$2 AND organization_id=$3`,
+      `SELECT ${RECEIPT_COLUMNS} FROM nyst_outcome_receipts
+       WHERE outcome_instance_id=$1 AND environment_id=$2 AND organization_id=$3
+       ORDER BY evaluation_sequence DESC LIMIT 1`,
       [instanceId, scope.environment_id, scope.organization_id])).rows[0] ?? null;
+  }
+
+  /**
+   * Every receipt ever issued for an instance, newest first.
+   *
+   * The series is the point: "UNSATISFIED at 10:05, SATISFIED at 11:20, here
+   * are both signed statements" is a far stronger thing to hand an auditor than
+   * a single receipt asserting the current state with no account of how it got
+   * there.
+   */
+  async receipts(scope: TenantScope, instanceId: string): Promise<Record<string, unknown>[]> {
+    return (await this.db.query(
+      `SELECT ${RECEIPT_COLUMNS} FROM nyst_outcome_receipts
+       WHERE outcome_instance_id=$1 AND environment_id=$2 AND organization_id=$3
+       ORDER BY evaluation_sequence DESC`,
+      [instanceId, scope.environment_id, scope.organization_id])).rows;
   }
 }
 

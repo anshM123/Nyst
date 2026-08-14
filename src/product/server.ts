@@ -451,10 +451,35 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     return requireOutcomes(options).evaluations(principal, routeId(request));
   }, options.repository));
 
+  /**
+   * The receipt for an outcome.
+   *
+   * Defaults to the LATEST statement. `?evaluation_sequence=N` fetches the one
+   * issued at a specific evaluation — before v0.3.1 there could only ever be
+   * one receipt per instance, so a caller asking for proof after a remediation
+   * received a signed statement of the verdict from before it.
+   */
   app.get("/v1/outcomes/:id/receipt", api(async (principal, request, reply) => {
     requireScope(principal, "receipts:read");
-    const receipt = await requireOutcomes(options).receipt(principal, routeId(request));
+    const query = request.query as { evaluation_sequence?: unknown };
+    const sequence = query.evaluation_sequence === undefined ? undefined : Number(query.evaluation_sequence);
+    if (sequence !== undefined && (!Number.isInteger(sequence) || sequence < 0)) {
+      throw Object.assign(new Error("evaluation_sequence must be a non-negative integer"), { statusCode: 400 });
+    }
+    const receipt = await requireOutcomes(options).receipt(principal, routeId(request), sequence);
     return receipt === null ? notFound(reply, request) : receipt;
+  }, options.repository));
+
+  /**
+   * Every receipt ever issued for this outcome, newest first.
+   *
+   * "UNSATISFIED at 10:05, SATISFIED at 11:20, here are both signed
+   * statements" is a stronger thing to hand an auditor than one receipt
+   * asserting the current state with no account of how it got there.
+   */
+  app.get("/v1/outcomes/:id/receipts", api(async (principal, request) => {
+    requireScope(principal, "receipts:read");
+    return { receipts: await requireOutcomes(options).receipts(principal, routeId(request)) };
   }, options.repository));
 
   app.get("/v1/outcome-contracts", api(async (principal) => {
