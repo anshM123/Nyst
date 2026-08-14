@@ -105,8 +105,22 @@ export class OutcomeRepository {
     }
     assertInvariantsAreDeclarative([...input.required_invariants, ...(input.optional_invariants ?? [])]);
 
+    /**
+     * VERSION ALLOCATION IS A RACE (v0.3.1 issue 6, found alongside it).
+     *
+     * `coalesce(max(contract_version),0)+1` reads without a lock, so two
+     * operators activating a contract for the same spec at the same moment
+     * both compute the same next version and the second is rejected by
+     * `UNIQUE (environment_id, outcome_spec, contract_version)`.
+     *
+     * Retried rather than locked. A lock would have to be held across the
+     * whole insert, and contract creation is a rare deliberate act by a human
+     * — losing a race here costs one extra statement, whereas a lock would sit
+     * in the path of every version bump forever. Bounded, so a genuinely
+     * duplicated insert surfaces instead of spinning.
+     */
     const id = randomUUID();
-    const result = await this.db.query(
+    const result = await this.retryOnVersionCollision(() => this.db.query(
       `INSERT INTO nyst_outcome_contracts(outcome_contract_id,organization_id,project_id,environment_id,
          outcome_spec,outcome_spec_version,contract_version,agent_id,subject_schema,desired_outcome_statement,
          required_invariants,optional_invariants,evidence_requirements,freshness_seconds,capability_requirements,
@@ -121,7 +135,7 @@ export class OutcomeRepository {
         JSON.stringify(input.evidence_requirements ?? {}), input.freshness_seconds,
         JSON.stringify(input.capability_requirements ?? []), JSON.stringify(input.effect_dependencies ?? []),
         input.timeout_seconds, JSON.stringify(input.exception_policy ?? {}),
-        JSON.stringify(input.remediation_policy ?? {}), JSON.stringify(input.continuation_policy ?? {}), userId]);
+        JSON.stringify(input.remediation_policy ?? {}), JSON.stringify(input.continuation_policy ?? {}), userId]));
     const row = result.rows[0]!;
     return {
       ...input,
@@ -193,10 +207,7 @@ export class OutcomeRepository {
   }
 
   async contract(scope: TenantScope, contractId: string): Promise<OutcomeContract | null> {
-    const row = (await this.db.query(
-      `SELECT * FROM nyst_outcome_contracts WHERE outcome_contract_id=$1 AND environment_id=$2 AND organization_id=$3`,
-      [contractId, scope.environment_id, scope.organization_id])).rows[0];
-    return row ? hydrateContract(row) : null;
+    return contractOn(this.db, scope, contractId);
   }
 
   /** The newest ACTIVATED contract for a spec. Draft versions never bind. */
@@ -323,12 +334,7 @@ export class OutcomeRepository {
 
   /** Current, non-superseded facts for a set of subjects. */
   async currentFacts(scope: TenantScope, subjectRefs: readonly string[]): Promise<WorldFact[]> {
-    if (!subjectRefs.length) return [];
-    return (await this.db.query(
-      `SELECT * FROM nyst_world_facts
-       WHERE environment_id=$1 AND subject_ref = ANY($2::text[]) AND superseded_at IS NULL
-       ORDER BY observed_at DESC`,
-      [scope.environment_id, subjectRefs])).rows.map(hydrateFact);
+    return currentFactsOn(this.db, scope, subjectRefs);
   }
 
   /** Every observation ever recorded for one subject and property, newest first. */
@@ -349,62 +355,152 @@ export class OutcomeRepository {
    * instance — including the continuation disposition, which is deliberately
    * NOT just a restatement of the verdict.
    */
+  /**
+   * Evaluate an OutcomeInstance.
+   *
+   * CONCURRENCY (v0.3.1 issue 6). This used to read the sequence, INSERT at
+   * sequence+1, and then compare-and-swap the instance. The compare-and-swap
+   * was a correct optimistic guard — but it was the LAST statement, and the
+   * INSERT before it was the one that collided. Two evaluators reading the same
+   * sequence both inserted the same value, `UNIQUE (outcome_instance_id,
+   * evaluation_sequence)` rejected the second, and the guard meant to handle
+   * exactly that race never ran.
+   *
+   * Evaluation runs from the reobservation worker, evidence ingest, the API and
+   * a person pressing re-evaluate — concurrently by design. So it is now done
+   * under a row lock on the instance, taken BEFORE the facts are read.
+   *
+   * Locking rather than retrying is deliberate. Under a lock, the facts an
+   * evaluation reads and the sequence it writes come from the same serialized
+   * window, so the stored verdict always reflects the most recent evidence.
+   * An optimistic retry loop could still let an evaluator that read older facts
+   * win a later sequence, and "the newest evaluation used older evidence" is
+   * precisely the confusion the Outcome layer exists to remove.
+   *
+   * The lock is on ONE INSTANCE ROW. Different instances never contend.
+   */
   async evaluate(scope: TenantScope, instanceId: string, options: {
     held_capabilities?: readonly string[];
     now?: Date;
   } = {}): Promise<{ instance: OutcomeInstance; evaluation: OutcomeEvaluationResult }> {
-    const instance = await this.instance(scope, instanceId);
-    if (!instance) throw Object.assign(new Error("Unknown OutcomeInstance"), { statusCode: 404 });
-    const contract = await this.contract(scope, instance.outcome_contract_id);
-    if (!contract) throw new Error("The OutcomeInstance references a contract that no longer exists");
+    return this.inInstanceTransaction(instanceId, async (client) => {
+      // FOR UPDATE. Concurrent evaluators of this instance queue here, and
+      // each one reads the sequence and the facts left by its predecessor.
+      const locked = (await client.query(
+        `SELECT * FROM nyst_outcome_instances
+         WHERE outcome_instance_id=$1 AND environment_id=$2 AND organization_id=$3
+         FOR UPDATE`,
+        [instanceId, scope.environment_id, scope.organization_id])).rows[0];
+      if (!locked) throw Object.assign(new Error("Unknown OutcomeInstance"), { statusCode: 404 });
+      const instance = hydrateInstance(locked);
 
-    const now = options.now ?? new Date();
-    const subjectRefs = subjectReferences(instance.subject);
-    const required = resolveInvariants(contract.required_invariants, subjectRefs);
-    const optional = resolveInvariants(contract.optional_invariants, subjectRefs);
-    const facts = await this.currentFacts(scope, [...new Set([...required, ...optional].map((item) => item.subject_ref))]);
+      // Through `client`, NOT the pool. Requesting a second connection while
+      // holding one is how a bounded pool deadlocks: with enough concurrent
+      // evaluations every client is held by a transaction waiting for a client
+      // that will never be free. Every read inside this window uses the
+      // connection that already holds the lock.
+      const contract = await contractOn(client, scope, instance.outcome_contract_id);
+      if (!contract) throw new Error("The OutcomeInstance references a contract that no longer exists");
 
-    const evaluation = evaluateOutcome({
-      required, optional,
-      context: {
-        facts, held_capabilities: options.held_capabilities ?? [],
-        freshness_seconds: contract.freshness_seconds, now,
-      },
+      const now = options.now ?? new Date();
+      const subjectRefs = subjectReferences(instance.subject);
+      const required = resolveInvariants(contract.required_invariants, subjectRefs);
+      const optional = resolveInvariants(contract.optional_invariants, subjectRefs);
+      // Read through the locked client, so the facts belong to this window.
+      const facts = await currentFactsOn(client, scope,
+        [...new Set([...required, ...optional].map((item) => item.subject_ref))]);
+
+      const evaluation = evaluateOutcome({
+        required, optional,
+        context: {
+          facts, held_capabilities: options.held_capabilities ?? [],
+          freshness_seconds: contract.freshness_seconds, now,
+        },
+      });
+
+      const disposition = continuationFor(evaluation.verdict);
+      const timedOut = now.getTime() > new Date(instance.deadline_at).getTime();
+      const lifecycle: OutcomeLifecycle = timedOut && evaluation.verdict !== "satisfied" ? "timed_out"
+        : evaluation.verdict === "satisfied" ? "settled" : "open";
+
+      // Held under the lock, so it cannot collide.
+      const sequence = instance.evaluation_sequence + 1;
+      await client.query(
+        `INSERT INTO nyst_outcome_evaluations(outcome_evaluation_id,outcome_instance_id,environment_id,project_id,organization_id,
+           evaluation_sequence,status,verdict,detail,completed_at)
+         VALUES($1,$2,$3,$4,$5,$6,'completed',$7,$8,now())`,
+        [randomUUID(), instanceId, scope.environment_id, scope.project_id, scope.organization_id,
+          sequence, evaluation.verdict, JSON.stringify(evaluationDetail(evaluation))]);
+
+      const updated = await client.query(
+        `UPDATE nyst_outcome_instances
+           SET verdict=$2, lifecycle=$3, continuation_disposition=$4,
+               coverage_numerator=$5, coverage_denominator=$6,
+               evaluation_sequence=$7,
+               satisfied_at=CASE WHEN $2='satisfied' AND satisfied_at IS NULL THEN now() ELSE satisfied_at END,
+               completed_at=CASE WHEN $3 IN ('settled','timed_out','cancelled') THEN now() ELSE NULL END
+         WHERE outcome_instance_id=$1
+         RETURNING *`,
+        [instanceId, evaluation.verdict, lifecycle, disposition,
+          evaluation.coverage.numerator, evaluation.coverage.denominator, sequence]);
+
+      return { instance: hydrateInstance(updated.rows[0]!), evaluation };
     });
+  }
 
-    const disposition = continuationFor(evaluation.verdict);
-    const timedOut = now.getTime() > new Date(instance.deadline_at).getTime();
-    const lifecycle: OutcomeLifecycle = timedOut && evaluation.verdict !== "satisfied" ? "timed_out"
-      : evaluation.verdict === "satisfied" ? "settled" : "open";
-
-    const sequence = instance.evaluation_sequence + 1;
-    await this.db.query(
-      `INSERT INTO nyst_outcome_evaluations(outcome_evaluation_id,outcome_instance_id,environment_id,project_id,organization_id,
-         evaluation_sequence,status,verdict,detail,completed_at)
-       VALUES($1,$2,$3,$4,$5,$6,'completed',$7,$8,now())`,
-      [randomUUID(), instanceId, scope.environment_id, scope.project_id, scope.organization_id,
-        sequence, evaluation.verdict, JSON.stringify(evaluationDetail(evaluation))]);
-
-    const updated = await this.db.query(
-      `UPDATE nyst_outcome_instances
-         SET verdict=$2, lifecycle=$3, continuation_disposition=$4,
-             coverage_numerator=$5, coverage_denominator=$6,
-             evaluation_sequence=$7,
-             satisfied_at=CASE WHEN $2='satisfied' AND satisfied_at IS NULL THEN now() ELSE satisfied_at END,
-             completed_at=CASE WHEN $3 IN ('settled','timed_out','cancelled') THEN now() ELSE NULL END
-       WHERE outcome_instance_id=$1 AND evaluation_sequence=$8
-       RETURNING *`,
-      [instanceId, evaluation.verdict, lifecycle, disposition,
-        evaluation.coverage.numerator, evaluation.coverage.denominator, sequence, instance.evaluation_sequence]);
-
-    if (!updated.rows.length) {
-      // Someone else evaluated concurrently. Their verdict is at least as
-      // fresh as ours, so we do not overwrite it — a stale evaluator must
-      // never move an instance backwards.
-      const current = await this.instance(scope, instanceId);
-      return { instance: current!, evaluation };
+  /**
+   * Run `work` in a transaction, for operations that must serialize on one
+   * OutcomeInstance.
+   *
+   * A pool is not a connection: issuing BEGIN through `this.db` would start a
+   * transaction on whichever client the pool happened to hand out, and the
+   * statements after it could land on different ones. So a client is checked
+   * out explicitly and every statement in the window goes through it.
+   *
+   * Without a pool there is no way to hold a lock across statements, and
+   * pretending otherwise would produce exactly the silent interleaving this
+   * exists to prevent — so it refuses rather than degrading.
+   */
+  /**
+   * Retry a contract-version allocation that lost a race.
+   *
+   * Narrow on purpose: only a unique violation on the contract-version index is
+   * retried. Any other 23505 is a real duplicate and must surface — a retry
+   * loop that swallows every uniqueness error is how a genuine conflict turns
+   * into a silent overwrite.
+   */
+  private async retryOnVersionCollision<T>(work: () => Promise<T>, attempts = 5): Promise<T> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await work();
+      } catch (error) {
+        const code = (error as { code?: unknown }).code;
+        const constraint = String((error as { constraint?: unknown }).constraint ?? "");
+        const collided = code === "23505" && constraint.includes("outcome_spec");
+        if (!collided || attempt >= attempts) throw error;
+      }
     }
-    return { instance: hydrateInstance(updated.rows[0]!), evaluation };
+  }
+
+  private async inInstanceTransaction<T>(instanceId: string, work: (client: ProductDb) => Promise<T>): Promise<T> {
+    const pool = this.db as ProductDb & { connect?: () => Promise<ProductDb & { release(): void }> };
+    if (typeof pool.connect !== "function") {
+      throw new Error(
+        "Evaluating an OutcomeInstance requires a connection pool that can open a transaction. " +
+        `Instance ${instanceId} could not be evaluated safely on a single-statement interface.`);
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const value = await work(client);
+      await client.query("COMMIT");
+      return value;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async evaluations(scope: TenantScope, instanceId: string): Promise<Record<string, unknown>[]> {
@@ -627,6 +723,34 @@ function hydrateInstance(row: Record<string, unknown>): OutcomeInstance {
     satisfied_at: row.satisfied_at ? new Date(String(row.satisfied_at)).toISOString() : null,
     completed_at: row.completed_at ? new Date(String(row.completed_at)).toISOString() : null,
   };
+}
+
+/** An OutcomeContract, read through a caller-supplied client. See currentFactsOn. */
+async function contractOn(db: ProductDb, scope: TenantScope, contractId: string): Promise<OutcomeContract | null> {
+  const row = (await db.query(
+    `SELECT * FROM nyst_outcome_contracts WHERE outcome_contract_id=$1 AND environment_id=$2 AND organization_id=$3`,
+    [contractId, scope.environment_id, scope.organization_id])).rows[0];
+  return row ? hydrateContract(row) : null;
+}
+
+/**
+ * The current facts for a set of subjects, read through a CALLER-SUPPLIED
+ * client.
+ *
+ * Taking the client as a parameter is the point: during evaluation this must
+ * run on the same connection that holds the instance lock, so the facts an
+ * evaluation reasons about and the sequence it writes come from one serialized
+ * window. Reading through the pool instead would let a second connection see a
+ * different snapshot, which is how "the newest evaluation used older evidence"
+ * happens.
+ */
+async function currentFactsOn(db: ProductDb, scope: TenantScope, subjectRefs: readonly string[]): Promise<WorldFact[]> {
+  if (!subjectRefs.length) return [];
+  return (await db.query(
+    `SELECT * FROM nyst_world_facts
+     WHERE environment_id=$1 AND subject_ref = ANY($2::text[]) AND superseded_at IS NULL
+     ORDER BY observed_at DESC`,
+    [scope.environment_id, subjectRefs])).rows.map(hydrateFact);
 }
 
 function hydrateFact(row: Record<string, unknown>): WorldFact {
