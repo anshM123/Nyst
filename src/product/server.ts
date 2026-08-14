@@ -18,6 +18,9 @@ import { protectionReportCsv } from "./protectionReport.js";
 import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
 import { authoritativeConsequenceMetadata } from "./effectSemantics.js";
+import type { GoogleAuth } from "./auth/googleAuth.js";
+import type { FederatedRepository } from "./auth/federatedRepository.js";
+import { TokenRejected, safeRedirect } from "./auth/federatedIdentity.js";
 import { shellPage } from "./dashboard.js";
 import { autonomyPage, failureLab2Page, outcomePage, outcomesPage, shadowReportPage } from "./outcomeViews.js";
 import { OUTCOME_FAULTS, runNystBench, runOutcomeFault, type OutcomeFault } from "./outcome/failureLab2.js";
@@ -105,6 +108,14 @@ export interface ProductServerOptions {
   shadow?: OutcomeShadow;
   /** Renders the public marketing home for an anonymous visitor at "/". */
   public_home?: () => string;
+  /**
+   * Google Sign-In. Absent when no Google project is configured, in which case
+   * the routes still exist and say so rather than 404ing — a Sign in with
+   * Google button that vanishes is harder to debug than one that explains.
+   */
+  google?: GoogleAuth;
+  /** Federated identity persistence. Required for Connected Accounts. */
+  federated?: FederatedRepository;
   /** Customer-pushed observations, for systems Nyst has no integration with. */
   evidence?: EvidenceIngest;
   /** Scoped signed reads performed inside the customer's own network. */
@@ -169,7 +180,8 @@ export async function buildProductServer(options: ProductServerOptions): Promise
    * credential, a credential reference, or a provider payload.
    */
   app.get("/v1/operational-health", api(async (principal,request)=>{requireAnyScope(principal,["actions:read","integrations:read"]);const health=await options.repository.operationalHealth();const query=request.query as {format?:unknown};if(String(query.format??"json")==="prometheus")return healthMetricsText(health);return health;},options.repository));
-  app.get("/login", async (_request, reply) => reply.type("text/html; charset=utf-8").send(loginPage()));
+  app.get("/login", async (_request, reply) => reply.type("text/html; charset=utf-8")
+    .send(loginPage({ google: options.google !== undefined })));
   app.post("/v1/auth/login", async (request, reply) => {
     const body = object(request.body); const organization = string(body.organization, 63); const email = string(body.email, 320); const password = string(body.password, 1024);
     // A malformed organization or email is not an error — it is simply not a
@@ -186,6 +198,112 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     reply.setCookie(SESSION_COOKIE, result.session, { path: "/", httpOnly: true, sameSite: "strict", secure: options.production === true, maxAge: 12 * 60 * 60 });
     return { csrf: result.csrf, expires_in: 12 * 60 * 60 };
   });
+  /* ---------------- GOOGLE SIGN-IN (v0.3.1 issue 3) ---------------- */
+
+  /**
+   * Begin. Persists a single-use state and nonce, then redirects to Google.
+   *
+   * `next` is normalized to a LOCAL path before it is stored and again by the
+   * database CHECK. An open redirect here would turn the login page into a
+   * phishing launcher on Nyst's own domain.
+   */
+  app.get("/auth/google/start", async (request, reply) => {
+    if (!options.google) {
+      return reply.code(503).type("text/html; charset=utf-8").send(genericPage(
+        "Google Sign-In is not configured",
+        "This deployment has no Google project configured, so Sign in with Google cannot be offered. "
+        + "Set NYST_GOOGLE_CLIENT_ID, NYST_GOOGLE_CLIENT_SECRET_REF and NYST_GOOGLE_REDIRECT_URI, or sign in with a password."));
+    }
+    const query = request.query as { next?: unknown };
+    // When an authenticated person hits this, it is a LINK rather than a
+    // sign-in, and the binding will be attached to their existing account.
+    const principal = await authenticate(request, options.repository);
+    const linking = principal?.kind === "session" ? principal.user_id : null;
+    const { url } = await options.google.authorizationUrl({
+      redirect_to: query.next === undefined ? null : String(query.next),
+      linking_user_id: linking,
+    });
+    return reply.redirect(url, 302);
+  });
+
+  /**
+   * The callback. Consumes the attempt atomically, verifies the ID token, and
+   * either mints a session or explains precisely why it will not.
+   */
+  app.get("/auth/google/callback", async (request, reply) => {
+    if (!options.google) return reply.code(503).type("text/html; charset=utf-8").send(genericPage(
+      "Google Sign-In is not configured", "No Google project is configured on this deployment."));
+    const query = request.query as { code?: unknown; state?: unknown; error?: unknown };
+
+    // Google reports its own refusals here. Show it rather than a blank page.
+    if (query.error !== undefined) {
+      return reply.code(400).type("text/html; charset=utf-8").send(genericPage(
+        "Google did not complete the sign-in",
+        `Google returned "${String(query.error).replace(/[<>&"]/g, "").slice(0, 120)}". Nothing was signed in.`));
+    }
+    if (typeof query.code !== "string" || typeof query.state !== "string") {
+      return reply.code(400).type("text/html; charset=utf-8").send(genericPage(
+        "Incomplete sign-in", "That callback was missing its authorization code or state. Start again from the sign-in page."));
+    }
+
+    let result;
+    try {
+      result = await options.google.completeCallback({ code: query.code, state: query.state });
+    } catch (error) {
+      // Every refusal names itself internally; externally they are one
+      // message, because distinguishing them tells an attacker which of their
+      // guesses was a real login attempt.
+      options.structured_log?.({
+        type: "google_signin_refused",
+        reason: error instanceof TokenRejected ? error.reason : "unexpected",
+        request_id: request.id,
+      });
+      return reply.code(401).type("text/html; charset=utf-8").send(genericPage(
+        "That sign-in could not be completed",
+        "The sign-in was refused. This happens if the link was already used, expired, or did not originate here. Start again from the sign-in page."));
+    }
+
+    switch (result.kind) {
+      case "signed_in":
+        reply.setCookie(SESSION_COOKIE, result.session, {
+          path: "/", httpOnly: true, sameSite: "lax",
+          secure: options.production === true, maxAge: 12 * 60 * 60,
+        });
+        return reply.redirect(safeRedirect(result.redirect_to), 302);
+      case "requires_existing_authentication":
+        return reply.code(409).type("text/html; charset=utf-8").send(genericPage(
+          "An account already uses that email address", result.message));
+      case "subject_belongs_to_another_user":
+        return reply.code(409).type("text/html; charset=utf-8").send(genericPage(
+          "That Google account is already connected", result.message));
+      case "no_account":
+        return reply.code(404).type("text/html; charset=utf-8").send(genericPage(
+          "No Nyst account for that Google identity",
+          "Nyst does not create an account automatically from a Google sign-in. Start in Shadow to create one, then connect Google from Settings."));
+    }
+  });
+
+  /* -------- Connected Accounts (backend for the later frontend) -------- */
+
+  app.get("/v1/auth/identities", api(async (principal) => {
+    sessionOnly(principal);
+    if (!options.federated) throw Object.assign(new Error("Federated identity is not enabled"), { statusCode: 503 });
+    return {
+      identities: await options.federated.connectedIdentities(principal.user_id),
+      google_configured: options.google !== undefined,
+    };
+  }, options.repository));
+
+  app.post("/v1/auth/identities/:id/disconnect", api(async (principal, request, reply) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    if (!options.federated) throw Object.assign(new Error("Federated identity is not enabled"), { statusCode: 503 });
+    const result = await options.federated.disconnectIdentity(principal.user_id, routeId(request));
+    if (result.ok) return { disconnected: true };
+    // A refusal to remove the last sign-in method is a 409, not a 404: the
+    // identity exists, and Nyst is declining to lock someone out.
+    return reply.code(409).send({ error: "cannot_disconnect", detail: result.reason, request_id: request.id });
+  }, options.repository));
+
   app.post("/v1/auth/logout", async (request, reply) => { const principal = await apiPrincipal(request, reply, options.repository); if (!principal) return; requireCsrf(request, principal); const session = request.cookies[SESSION_COOKIE]; if (session) await options.repository.deleteSession(session); reply.clearCookie(SESSION_COOKIE, { path: "/" }); return { ok: true }; });
 
 

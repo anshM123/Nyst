@@ -29,6 +29,8 @@ import { EvidenceIngest, RelayCoordinator } from "../dist/src/product/outcome/ev
 import { AuthorityRepository } from "../dist/src/product/authority/authorityRepository.js";
 import { registerPublicRoutes } from "../dist/src/public/publicRoutes.js";
 import { homePage } from "../dist/src/public/site.js";
+import { FederatedRepository } from "../dist/src/product/auth/federatedRepository.js";
+import { GoogleAuth, googleConfigFromEnv, httpGoogleTransport } from "../dist/src/product/auth/googleAuth.js";
 
 const config = loadConfig();
 
@@ -103,6 +105,32 @@ const preflight = async (provider: "github" | "okta" | "stripe", _secret: string
   }
 };
 
+/**
+ * GOOGLE SIGN-IN.
+ *
+ * Absent unless a Google project is actually configured. When it is absent the
+ * routes still exist and return a 503 explaining what is missing, rather than
+ * a 404 on a button the login page rendered.
+ *
+ * The client secret is a REFERENCE resolved through the same SecretProvider as
+ * every other credential, so the secret itself never appears in configuration
+ * or in a log line.
+ *
+ * NOT VERIFIED AGAINST A LIVE GOOGLE PROJECT.
+ * LIVE GOOGLE PROJECT CONFIGURATION REQUIRED.
+ */
+const federated = new FederatedRepository(pool);
+const googleConfig = googleConfigFromEnv();
+const google = googleConfig
+  ? new GoogleAuth(googleConfig, federated, httpGoogleTransport(), secrets)
+  : undefined;
+if (!google) {
+  structuredLog({
+    type: "google_signin_unconfigured",
+    detail: "Set NYST_GOOGLE_CLIENT_ID, NYST_GOOGLE_CLIENT_SECRET_REF and NYST_GOOGLE_REDIRECT_URI to enable Sign in with Google.",
+  });
+}
+
 const app = await buildProductServer({
   repository, effect_specs: product.descriptors, runtime: product.runtime, metrics,
   production: config.production, secrets, trust_proxy: config.trust_proxy,
@@ -120,6 +148,8 @@ const app = await buildProductServer({
   // a sign-in page they have no account for.
   public_home: homePage,
   signer,
+  federated,
+  ...(google ? { google } : {}),
 });
 
 // The public site shares the origin. It owns everything except "/", which the

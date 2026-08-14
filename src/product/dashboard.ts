@@ -143,7 +143,17 @@ function contextSwitcher(context: ShellContext): string {
 
 /* ------------------------------------------------------------------ login */
 
-export function loginPage(): string {
+/**
+ * The sign-in page.
+ *
+ * `google` is passed only when a Google project is actually configured. A
+ * "Sign in with Google" button that leads to a 503 is worse than no button, so
+ * an unconfigured deployment simply does not render one.
+ */
+export function loginPage(options: { google?: boolean } = {}): string {
+  const google = options.google === true
+    ? `<div class="login-alt"><a class="secondary login-google" href="/auth/google/start">Sign in with Google</a></div>`
+    : "";
   return page("Sign in", `<main class="login">
   <section class="login-brand">
     <img src="/brand/nyst-domain-wordmark.png" alt="nyst.ai">
@@ -159,7 +169,7 @@ export function loginPage(): string {
       <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
       <button class="primary">Continue</button>
       <p id="login-error" role="alert"></p>
-    </form>
+    </form>${google}
   </section>
 </main>`, "/assets/login.js");
 }
