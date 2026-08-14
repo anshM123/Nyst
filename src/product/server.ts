@@ -19,6 +19,7 @@ import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
 import { authoritativeConsequenceMetadata } from "./effectSemantics.js";
 import { evaluateProcessReadiness } from "./readiness.js";
+import { authorizeConsequence, AuthorityUnavailable } from "./authority/authorizeConsequence.js";
 import type { GoogleAuth } from "./auth/googleAuth.js";
 import type { FederatedRepository } from "./auth/federatedRepository.js";
 import { TokenRejected, safeRedirect } from "./auth/federatedIdentity.js";
@@ -907,7 +908,74 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     // hang a Human Review on. The durable intervention written by admitConsequence
     // IS the operator-facing artefact, and Needs Attention surfaces it beside
     // action-backed reviews. Inventing an action here would be fabricating truth.
-    if (!admission.admitted) throw Object.assign(new Error(admission.reason), { statusCode: 409, nyst_blocked_by: admission.blocked_by }); const started=Date.now(); const result = await options.commit({ effect, businessKey: namespacedKey, displayBusinessKey: businessKey, input: withCredentialReference(body.input, availability.credential_ref), credential_ref: availability.credential_ref, policy_version_id: policy.policy_version_id, environment_mode: execution.mode === "canary" ? "canary" : "enforced", agent_id: agentId }, principal); options.metrics?.observe("action_commit_latency_ms",Date.now()-started); await options.repository.linkAdmission(admission.admission_id, result.action.action_id); await options.repository.recordResolutionTransition(result.action.action_id,result.resolution,"action_commit"); return sanitizeForProduct({ ...result, execution_mode: execution.mode, canary_rule_id: execution.canary_rule_id }); }, options.repository));
+    if (!admission.admitted) throw Object.assign(new Error(admission.reason), { statusCode: 409, nyst_blocked_by: admission.blocked_by });
+
+    /**
+     * AUTHORITY (v0.3.2 Phase 1). THE GATE THAT WAS NOT THERE.
+     *
+     * Until v0.3.2 this line did not exist, and `evaluateAuthority()` -- the
+     * complete eight-constraint evaluator this product is built around -- had
+     * ZERO production call sites. Admission above enforces Emergency Freeze and
+     * Blast Radius, which are real; neither is the Autonomy Line.
+     *
+     * So an Agent with NO Autonomy Line rule reached the provider, when the
+     * design says in as many words that "an undescribed Agent has no autonomy,
+     * not unlimited autonomy". Absent authority became full authority.
+     *
+     * It runs AFTER admission because it consumes admission's result rather
+     * than re-deriving Freeze and Blast Radius: one linearized SQL gate stays
+     * the single source of truth for those two. It runs BEFORE `options.commit`
+     * because after it there is a provider mutation, and an authority decision
+     * taken after the consequence is not a gate, it is a log line.
+     */
+    const authorityDecision = await authorizeConsequence(options.authority, principal, {
+      agent_id: agentId,
+      effect_name: effect,
+      amount_minor: consequence.amount_minor,
+      currency: consequence.currency,
+      /**
+       * THIS IS AN INITIAL DISPATCH, NOT A CONTINUATION.
+       *
+       * Layers 1 and 2 of the evaluator read `runtime_authority.continuation`
+       * and the policy's `automatic_continuation_allowed`. Those are
+       * CONTINUATION semantics: what Nyst may do AFTER an ambiguous result.
+       * Feeding a first dispatch through them blocks every action whenever
+       * auto-continuation is off -- which is the conservative default -- and it
+       * did: 29 previously-passing action tests failed the moment this was
+       * wired that way.
+       *
+       * So the continuation fields are stated as not-applicable here rather
+       * than derived from the continuation policy. Retry stays FORBIDDEN,
+       * because that floor is about execution and does apply. The layers that
+       * actually gate a first dispatch are 3-8: Freeze, Blast Radius, rollout,
+       * the Autonomy Line, outcome dependency and human exceptions -- and the
+       * Autonomy Line is the one that was missing entirely.
+       */
+      runtime_authority: {
+        primary: "continue", retry: "forbidden", continuation: "allowed", recovery: "none",
+        automatic_continuation_allowed: true,
+        automatic_compensation_allowed: false,
+        automatic_retry_allowed: false,
+        reductions: ["POLICY.RETRY_NEVER_AUTOMATIC"],
+      },
+      policy_version_id: policy.policy_version_id ?? null,
+      mode: execution.mode,
+      admission: { admitted: admission.admitted, blocked_by: admission.blocked_by, reason: admission.reason,
+        budget_id: admission.budget_id ?? null, freeze_id: admission.freeze_id ?? null },
+      reversible: true,
+      open_incident: false,
+    });
+    if (authorityDecision.disposition !== "allowed") {
+      // 409, and the primary reason verbatim: an operator reading this needs to
+      // know WHICH constraint held it, not that "something" did.
+      throw Object.assign(new Error(authorityDecision.primary_reason), {
+        statusCode: 409,
+        nyst_blocked_by: "authority",
+        nyst_disposition: authorityDecision.disposition,
+      });
+    }
+
+    const started=Date.now(); const result = await options.commit({ effect, businessKey: namespacedKey, displayBusinessKey: businessKey, input: withCredentialReference(body.input, availability.credential_ref), credential_ref: availability.credential_ref, policy_version_id: policy.policy_version_id, environment_mode: execution.mode === "canary" ? "canary" : "enforced", agent_id: agentId }, principal); options.metrics?.observe("action_commit_latency_ms",Date.now()-started); await options.repository.linkAdmission(admission.admission_id, result.action.action_id); await options.repository.recordResolutionTransition(result.action.action_id,result.resolution,"action_commit"); return sanitizeForProduct({ ...result, execution_mode: execution.mode, canary_rule_id: execution.canary_rule_id }); }, options.repository));
   app.get("/v1/actions/:id", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, request, sanitizeForProduct(await options.repository.actionDetail(principal, routeId(request))));}, options.repository));
   app.get("/v1/actions/:id/evidence", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, request, sanitizeForProduct(await options.repository.evidence(principal, routeId(request))));}, options.repository));
   app.get("/v1/actions/:id/resolutions", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, request, sanitizeForProduct(await options.repository.resolutions(principal, routeId(request))));}, options.repository));

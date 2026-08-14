@@ -1,0 +1,274 @@
+/**
+ * Nyst v0.3.2 — Phase 1. THE AUTHORITY LAYER MUST ACTUALLY GATE CONSEQUENCES.
+ *
+ * THE DEFECT, AND IT IS THE MOST SERIOUS ONE IN THIS PROJECT.
+ *
+ * `evaluateAuthority()` has ZERO production call sites. Not one. It is a
+ * complete, correct, well-tested eight-constraint evaluator that nothing in the
+ * request path ever calls. `evaluateAutonomyLine()` has exactly one caller —
+ * `evaluateAuthority` — so the entire Autonomy Line is dead code at runtime.
+ * `nyst_authority_decisions` is written only by a test, so a real deployment's
+ * decision history is permanently empty.
+ *
+ * What `POST /v1/actions` actually enforced: Emergency Freeze and Blast Radius,
+ * via `admitConsequence`. Both real, both good. Neither is the Autonomy Line.
+ *
+ * SO THE HEADLINE INVARIANT WAS INVERTED IN PRODUCTION.
+ *
+ * `autonomyLine.ts` states it plainly, and a v0.3.0 test asserts it:
+ *
+ *     "An undescribed Agent has no autonomy, not unlimited autonomy."
+ *
+ * In production, an Agent with no Autonomy Line rule reached the provider.
+ * Absent authority became FULL authority — the exact inversion of the design,
+ * in the one place where being wrong has consequences.
+ *
+ * WHY NO TEST CAUGHT IT.
+ *
+ * `v030Authority` calls `evaluateAuthority()` directly and never touches HTTP.
+ * The nine suites that drive `POST /v1/actions` never create an autonomy rule.
+ * And the structural test asserted there is no SECOND evaluator — which was
+ * true, and which is not the same as the one evaluator being used.
+ *
+ * That gap is what this file closes: every test here goes through the REAL
+ * ROUTE and counts REAL PROVIDER INVOCATIONS.
+ */
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { after, before, describe, it } from "node:test";
+import { Ed25519Signer } from "../src/core/signing.js";
+import { ProductRepository, type ProductDb } from "../src/product/productRepository.js";
+import { AuthorityRepository } from "../src/product/authority/authorityRepository.js";
+import { buildProductServer } from "../src/product/server.js";
+import { createPostgresStore } from "../src/store/postgresStore.js";
+import type { TenantScope } from "../src/product/types.js";
+
+const databaseUrl = process.env.DATABASE_URL;
+type Pool = ProductDb & { connect(): Promise<ProductDb & { release(): void }>; end(): Promise<void> };
+
+const PASSWORD = "Nyst v032 authority fixture 23!";
+
+describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip: databaseUrl ? false : "PostgreSQL is required" }, () => {
+  let pool: Pool;
+  let store: Awaited<ReturnType<typeof createPostgresStore>>;
+  let repository: ProductRepository;
+  let authority: AuthorityRepository;
+  let app: Awaited<ReturnType<typeof buildProductServer>>;
+  let tenant: TenantScope & { user_id: string };
+  let cookie: string;
+  let csrf: string;
+  let agentId: string;
+  const suffix = randomUUID().slice(0, 8);
+
+  /** Every provider dispatch that actually happened. The number that matters. */
+  let providerCalls: { effect: string; business_key: string }[] = [];
+  const EFFECT = "nyst.fake.mutate";
+  const DESCRIPTOR = {
+    effect_name: EFFECT, spec_version: "1.0.0", provider: "fake",
+    supported_topology: "fixture",
+  } as const;
+
+  before(async () => {
+    const pg = await import("pg") as unknown as { default: { Pool: new (o: { connectionString: string }) => Pool } };
+    pool = new pg.default.Pool({ connectionString: databaseUrl! });
+    store = await createPostgresStore(databaseUrl!);
+    repository = new ProductRepository(pool);
+    authority = new AuthorityRepository(pool);
+
+    tenant = await repository.createBootstrap({
+      organization: "Authority Co", organization_slug: `authority-${suffix}`,
+      project: "Prod", project_slug: "prodproject",
+      // ENFORCED: shadow refuses everything anyway, which would make this suite
+      // pass for entirely the wrong reason.
+      environment: "Production", environment_slug: "production", mode: "enforced",
+      email: `authority-${suffix}@test.test`, display_name: "Authority", password: PASSWORD,
+    });
+
+    app = await buildProductServer({
+      repository,
+      authority,
+      effect_specs: [DESCRIPTOR],
+      production: false,
+      signer: Ed25519Signer.ephemeral(`authority-${suffix}`),
+      // The provider. Counting invocations here is the whole point: a test that
+      // asserts a 409 without asserting ZERO dispatches proves nothing, because
+      // the refusal could have arrived after the mutation.
+      commit: async (input: { effect: string; businessKey: string }) => {
+        providerCalls.push({ effect: input.effect, business_key: input.businessKey });
+        return {
+          ok: true as const,
+          resolution: { resolution_id: randomUUID(), effect_name: input.effect },
+        };
+      },
+    } as never);
+
+    const login = await app.inject({
+      method: "POST", url: "/v1/auth/login", headers: { "content-type": "application/json" },
+      payload: { organization: `authority-${suffix}`, email: `authority-${suffix}@test.test`, password: PASSWORD },
+    });
+    cookie = String(login.headers["set-cookie"] ?? "").split(";")[0]!;
+    csrf = String((login.json() as { csrf?: unknown }).csrf ?? "");
+
+    // The EffectSpec must be ENABLED for this environment, or the route refuses
+    // before authority is ever consulted and the suite passes for the wrong
+    // reason -- which it did on the first run.
+    await repository.configureEffectSpec(tenant, DESCRIPTOR, true);
+    await repository.configureIntegration(tenant, "github", "env:NYST_GITHUB_TOKEN").catch(() => null);
+
+    const agent = await repository.createAgent(tenant, tenant.user_id, {
+      name: "Gated Agent", slug: `gated-${suffix}`, owner: "Authority",
+      description: "Exists to prove that an Agent with no rule has no autonomy.",
+      framework: "unspecified", tags: [],
+    });
+    agentId = String((agent as { agent_id?: unknown }).agent_id ?? agent);
+  });
+  after(async () => { await app.close(); await store.close(); await pool.end(); });
+
+  /** Attempt one consequential action through the REAL route. */
+  async function act(businessKey: string) {
+    providerCalls = [];
+    const response = await app.inject({
+      method: "POST", url: "/v1/actions",
+      headers: { cookie, "x-nyst-csrf": csrf, "content-type": "application/json" },
+      payload: { effect: EFFECT, businessKey, agent_id: agentId, input: {} },
+    });
+    return { response, dispatches: providerCalls.length };
+  }
+
+  /* ============================================ THE HEADLINE INVERSION */
+
+  it("THE DEFECT: an Agent with NO Autonomy Line rule does not reach the provider", async () => {
+    // Everything else is in order: enabled EffectSpec, valid policy, enforced
+    // environment, no freeze, budget headroom. The ONLY thing missing is a rule
+    // saying what this Agent may do.
+    const { response, dispatches } = await act(`no-rule-${suffix}`);
+
+    assert.equal(dispatches, 0,
+      "AN AGENT WITH NO AUTONOMY LINE RULE MUTATED A PROVIDER. " +
+      "Absent authority became FULL authority — the exact inversion of the documented invariant.");
+    assert.ok(response.statusCode === 409 || response.statusCode === 403,
+      `expected the action to be held or blocked, got ${response.statusCode}: ${response.body}`);
+    assert.match(response.body, /autonomy|no rule|asks a person|not unlimited/i,
+      "the refusal does not explain that the Agent has no Autonomy Line rule");
+  });
+
+  it("a durable AuthorityDecision is recorded for that refusal", async () => {
+    await act(`decision-${suffix}`);
+    const decisions = await authority.decisions(tenant, 10);
+    assert.ok(decisions.length > 0,
+      "nyst_authority_decisions is EMPTY after a real action — the /autonomy page has no history to show");
+    assert.ok(decisions.some((entry) => entry.disposition === "held" || entry.disposition === "blocked"));
+  });
+
+  it("and with an applicable rule, the same action proceeds", async () => {
+    await authority.createAutonomyRule(tenant, tenant.user_id, {
+      agent_id: agentId, effect_name: EFFECT,
+      disposition: "autonomous",
+      rationale: "This Agent is permitted to perform this reversible effect autonomously in tests.",
+    } as never);
+
+    const { response, dispatches } = await act(`with-rule-${suffix}`);
+    assert.equal(response.statusCode, 200,
+      `an authorized action was refused: ${response.body}`);
+    assert.equal(dispatches, 1, "an authorized action did not reach the provider");
+  });
+
+  /* ================================================ THE OTHER LAYERS */
+
+  it("disposition=human HOLDS, and dispatches nothing", async () => {
+    const held = await repository.createAgent(tenant, tenant.user_id, {
+      name: "Human Agent", slug: `human-${suffix}`, owner: "Authority",
+      description: "Requires a person.", framework: "unspecified", tags: [],
+    });
+    const heldId = String((held as { agent_id?: unknown }).agent_id ?? held);
+    await authority.createAutonomyRule(tenant, tenant.user_id, {
+      agent_id: heldId, effect_name: EFFECT, disposition: "human",
+      rationale: "A person decides every one of these until we have seen more of them.",
+    } as never);
+
+    providerCalls = [];
+    const response = await app.inject({
+      method: "POST", url: "/v1/actions",
+      headers: { cookie, "x-nyst-csrf": csrf, "content-type": "application/json" },
+      payload: { effect: EFFECT, businessKey: `human-${suffix}`, agent_id: heldId, input: {} },
+    });
+    assert.equal(providerCalls.length, 0, "a human-required Agent reached the provider");
+    assert.ok(response.statusCode >= 400);
+  });
+
+  it("disposition=disabled BLOCKS, and no exception can release it", async () => {
+    const off = await repository.createAgent(tenant, tenant.user_id, {
+      name: "Disabled Agent", slug: `disabled-${suffix}`, owner: "Authority",
+      description: "Switched off.", framework: "unspecified", tags: [],
+    });
+    const offId = String((off as { agent_id?: unknown }).agent_id ?? off);
+    await authority.createAutonomyRule(tenant, tenant.user_id, {
+      agent_id: offId, effect_name: EFFECT, disposition: "disabled",
+      rationale: "This Agent is switched off while we investigate an incident.",
+    } as never);
+
+    // Even WITH a live human exception, disabled must stay blocked: an
+    // exception may release a hold, never a block.
+    await authority.createException(tenant, tenant.user_id, {
+      kind: "human_approval", authorizes: "autonomous_execution",
+      agent_id: offId, effect_name: EFFECT,
+      actor_role: "operator",
+      reason: "Trying to release a blocked Agent, which must not work.",
+      expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+    } as never).catch(() => null);
+
+    providerCalls = [];
+    const response = await app.inject({
+      method: "POST", url: "/v1/actions",
+      headers: { cookie, "x-nyst-csrf": csrf, "content-type": "application/json" },
+      payload: { effect: EFFECT, businessKey: `disabled-${suffix}`, agent_id: offId, input: {} },
+    });
+    assert.equal(providerCalls.length, 0,
+      "A DISABLED AGENT REACHED THE PROVIDER — an exception released a BLOCK, which it may never do");
+    assert.ok(response.statusCode >= 400);
+  });
+
+  /* ===================================================== STRUCTURAL */
+
+  it("STRUCTURAL: the action route calls the canonical evaluator", async () => {
+    // The v0.3.0 structural test asserted there is no SECOND evaluator. True,
+    // and not the same as the one evaluator being used — which is precisely how
+    // this went unnoticed. This asserts USE.
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const source = readFileSync(join(import.meta.dirname, "..", "src/product/server.ts"), "utf8");
+    const route = source.slice(source.indexOf('app.post("/v1/actions"'));
+    const body = route.slice(0, route.indexOf('app.get("/v1/actions/:id"'));
+    assert.match(body, /evaluateAuthority|authorizeConsequence/,
+      "THE ACTION ROUTE DOES NOT CONSULT THE CANONICAL AUTHORITY EVALUATOR");
+  });
+
+  it("STRUCTURAL: a deployment without the Authority layer fails CLOSED", async () => {
+    // The wiring hazard: `authority` is an optional server option. If a missing
+    // Authority layer skipped the check instead of refusing, the same defect
+    // returns as a configuration flag.
+    providerCalls = [];
+    const bare = await buildProductServer({
+      repository,
+      effect_specs: [DESCRIPTOR],
+      production: false,
+      commit: async () => { providerCalls.push({ effect: EFFECT, business_key: "bare" }); return { ok: true as const }; },
+    } as never);
+    try {
+      const login = await bare.inject({
+        method: "POST", url: "/v1/auth/login", headers: { "content-type": "application/json" },
+        payload: { organization: `authority-${suffix}`, email: `authority-${suffix}@test.test`, password: PASSWORD },
+      });
+      const bareCookie = String(login.headers["set-cookie"] ?? "").split(";")[0]!;
+      const bareCsrf = String((login.json() as { csrf?: unknown }).csrf ?? "");
+      const response = await bare.inject({
+        method: "POST", url: "/v1/actions",
+        headers: { cookie: bareCookie, "x-nyst-csrf": bareCsrf, "content-type": "application/json" },
+        payload: { effect: EFFECT, businessKey: `bare-${suffix}`, agent_id: agentId, input: {} },
+      });
+      assert.equal(providerCalls.length, 0,
+        "A DEPLOYMENT WITH NO AUTHORITY LAYER DISPATCHED A CONSEQUENCE — the defect returned as a config flag");
+      assert.equal(response.statusCode, 503);
+    } finally { await bare.close(); }
+  });
+});
