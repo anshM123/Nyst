@@ -207,6 +207,36 @@ registerPublicRoutes(app, {
     ? { sales_contact_email: process.env.NYST_SALES_CONTACT_EMAIL }
     : {}),
   on_error: structuredLog,
+  /**
+   * Tell a human a lead arrived (v0.3.2 Phase 9).
+   *
+   * Called only AFTER the durable write, and its failure never fails the
+   * submission -- the lead is already stored, and telling someone to resubmit a
+   * message Nyst already has is both untrue and how leads get lost.
+   *
+   * Absent NYST_SALES_CONTACT_EMAIL or a mail transport, this is simply not
+   * wired: the submission still lands in the database, which is where it
+   * durably lives regardless.
+   */
+  ...(emailProvider && process.env.NYST_SALES_CONTACT_EMAIL ? {
+    notify_lead: async (lead) => {
+      await emailProvider.send({
+        to: process.env.NYST_SALES_CONTACT_EMAIL!,
+        subject: `Nyst ${lead.kind}: ${lead.company || lead.name} (${lead.reference})`,
+        text: [
+          `Reference: ${lead.reference}`,
+          `Name:      ${lead.name}`,
+          `Email:     ${lead.email}`,
+          `Company:   ${lead.company || "(not given)"}`,
+          ``,
+          lead.summary,
+          ``,
+          `--`,
+          `This email carries only what the visitor typed. No customer evidence, no receipts, no credentials.`,
+        ].join(String.fromCharCode(10)),
+      });
+    },
+  } : {}),
   password_reset: passwordResets,
   google_signup: {
     peek: (handle) => googleSignups.peek(handle),

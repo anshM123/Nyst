@@ -16,7 +16,7 @@ import { SITE_CSS, SITE_JS } from "./siteAssets.js";
 import {
   homePage, pricingPage, productPage, outcomesExplainedPage, integrationsPublicPage, securityPage, publicShell,
 } from "./site.js";
-import { configuratorPage, contactPage, recommendPlan, type QuoteInput } from "./configurator.js";
+import { configuratorPage, contactPage, recommendPlan, PRICING_CATALOG_VERSION, type QuoteInput } from "./configurator.js";
 import { forgotPasswordPage, resetPasswordPage, googleSignupPage } from "./site.js";
 import { signupPage } from "./site.js";
 import { escape } from "../product/dashboard.js";
@@ -51,6 +51,11 @@ export interface PublicRouteOptions {
    */
   record_quote?: (quote: {
     input: QuoteInput; recommended_plan: string; received_at: string; source_ip?: string | null;
+    /** EXACTLY what the visitor was shown, so a quote survives a price change. */
+    price_display?: string | null;
+    pricing_catalog_version?: string | null;
+    requires_conversation?: boolean | null;
+    uncovered?: readonly string[];
   }) => Promise<string>;
   /**
    * The address a visitor can write to directly.
@@ -60,6 +65,22 @@ export interface PublicRouteOptions {
    * at all rather than one that may bounce.
    */
   sales_contact_email?: string;
+  /**
+   * Notify a human that a lead arrived (v0.3.2 Phase 9).
+   *
+   * PERSIST FIRST, THEN NOTIFY -- always, and never the other way round. A
+   * notification failure must never lose a submission, so this is called AFTER
+   * the durable write and its failure is logged rather than shown. The visitor
+   * is told their message was received because it WAS.
+   */
+  notify_lead?: (lead: {
+    kind: "contact" | "quote";
+    reference: string;
+    name: string;
+    email: string;
+    company: string;
+    summary: string;
+  }) => Promise<void>;
   /** Reports a submission that could not be stored. Never shown to a visitor. */
   on_error?: (event: Record<string, unknown>) => void;
   /**
@@ -234,10 +255,23 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
     // calculator, and a storage failure is Nyst's problem, not theirs.
     if (options.record_quote) {
       try {
-        await options.record_quote({
+        const reference = await options.record_quote({
           input, recommended_plan: result.recommended_plan,
           received_at: new Date().toISOString(), source_ip: clientAddress(request),
+          // EXACTLY what the page displayed, so a quote stays reconstructable
+          // after the catalog changes (v0.3.2 Phase 9).
+          price_display: result.price_display,
+          pricing_catalog_version: PRICING_CATALOG_VERSION,
+          requires_conversation: result.requires_conversation,
+          uncovered: result.uncovered,
         });
+        if (options.notify_lead) {
+          await options.notify_lead({
+            kind: "quote", reference,
+            name: input.company || "Someone", email: input.email, company: input.company,
+            summary: `${result.recommended_plan} — ${result.price_display}`,
+          }).catch(() => undefined);
+        }
       } catch (error) {
         options.on_error?.({
           type: "quote_request_not_recorded",
@@ -527,6 +561,26 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
         error: "This message could not be delivered right now, so it has not been sent. Please email us directly instead.",
       }));
     }
+    /**
+     * NOTIFY AFTER PERSISTING, AND NEVER FAIL THE SUBMISSION FOR IT.
+     *
+     * The lead is already durable at this point. If the mail transport is down
+     * the submission is still accepted, because telling someone to resubmit a
+     * message Nyst already has is both untrue and how leads get lost.
+     */
+    if (options.notify_lead) {
+      await options.notify_lead({
+        kind: "contact", reference,
+        name: submission.name, email: submission.email, company: submission.company,
+        summary: submission.message.slice(0, 2000),
+      }).catch((error: unknown) => {
+        options.on_error?.({
+          type: "lead_notification_failed", kind: "contact", reference,
+          detail: error instanceof Error ? error.message : "unknown",
+        });
+      });
+    }
+
     return html(reply, contactPage(submission.topic, reference, context));
   });
 

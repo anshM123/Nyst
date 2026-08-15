@@ -32,6 +32,19 @@ export interface QuoteSubmission {
   recommended_plan: string;
   received_at: string;
   source_ip?: string | null;
+  /**
+   * EXACTLY what the visitor was shown (v0.3.2 Phase 9).
+   *
+   * A price is a SENTENCE on the page -- "$2,400/month, from" -- so the display
+   * string is stored verbatim rather than a number. Storing 240000 minor units
+   * loses the qualifier that made it honest, and a quote from March must stay
+   * reconstructable after the catalog changes in April.
+   */
+  price_display?: string | null;
+  pricing_catalog_version?: string | null;
+  requires_conversation?: boolean | null;
+  /** What Nyst said it would NOT cover. The half most likely to be disputed. */
+  uncovered?: readonly string[];
 }
 
 export interface StoredContact {
@@ -69,11 +82,14 @@ export class InboundRepository {
   async recordQuote(quote: QuoteSubmission): Promise<string> {
     const row = (await this.db.query(
       `INSERT INTO nyst_quote_requests
-         (quote_request_id,reference,input,recommended_plan,received_at,source_ip)
-       VALUES(gen_random_uuid(),$1,$2::jsonb,$3,$4,$5)
+         (quote_request_id,reference,input,recommended_plan,received_at,source_ip,
+          price_display,pricing_catalog_version,requires_conversation,uncovered)
+       VALUES(gen_random_uuid(),$1,$2::jsonb,$3,$4,$5,$6,$7,$8,$9::jsonb)
        RETURNING reference`,
       [reference("NYST-QUOTE"), JSON.stringify(quote.input), quote.recommended_plan,
-        quote.received_at, normalizeIp(quote.source_ip)])).rows[0]!;
+        quote.received_at, normalizeIp(quote.source_ip),
+        quote.price_display ?? null, quote.pricing_catalog_version ?? null,
+        quote.requires_conversation ?? null, JSON.stringify(quote.uncovered ?? [])])).rows[0]!;
     return String(row.reference);
   }
 
