@@ -106,50 +106,94 @@ export class ProductRepository {
    * Callers now say which they mean. Omitting it keeps the historical
    * behaviour for existing bootstrap callers.
    */
+  /**
+   * Create a workspace. ALL OF IT, OR NONE OF IT (v0.3.2 Phase 4).
+   *
+   * This used to be three separate statements on the pool: the organization /
+   * project / environment / user CTE, then the policy, then the default
+   * Autonomy Line rule. A failure after the first one -- a constraint, a
+   * dropped connection, a restart -- left a real organization with a real user
+   * who could sign in to a workspace with NO POLICY and NO AUTONOMY LINE.
+   *
+   * That is the worst shape a partial failure can take here, because it is
+   * invisible. The person gets an account, signs in, and the missing pieces
+   * only surface later as behaviour nobody can explain.
+   *
+   * One transaction now. Either the whole workspace exists or the signup failed
+   * and the caller can say so truthfully: nothing was created.
+   *
+   * A pool is required, because a transaction needs one connection held across
+   * statements. Without one this REFUSES rather than degrading to the old
+   * non-atomic behaviour -- silently writing a half-workspace is exactly what
+   * this exists to stop.
+   */
   async createBootstrap(input: { organization: string; organization_slug: string; project: string; project_slug: string; environment: string; environment_slug: string; email: string; display_name: string; password: string; mode?: EnvironmentMode }): Promise<TenantScope & { user_id: string }> {
     const organizationId = randomUUID(); const projectId = randomUUID(); const environmentId = randomUUID(); const userId = randomUUID();
     const email = normalizedEmail(input.email); const passwordHash = await hash(input.password, 12);
-    await this.db.query(`WITH organization AS (
-      INSERT INTO nyst_organizations(organization_id,slug,name) VALUES($1,$5,$6) RETURNING organization_id
-    ), project AS (
-      INSERT INTO nyst_projects(project_id,organization_id,slug,name) SELECT $2,organization_id,$7,$8 FROM organization RETURNING project_id,organization_id
-    ), environment AS (
-      INSERT INTO nyst_environments(environment_id,project_id,organization_id,slug,name,mode) SELECT $3,project_id,organization_id,$9,$10,$14 FROM project
-    ) INSERT INTO nyst_users(user_id,organization_id,email,display_name,password_hash) SELECT $4,organization_id,$11,$12,$13 FROM organization`,
-      [organizationId, projectId, environmentId, userId, slug(input.organization_slug), bounded(input.organization, 120, "organization"), slug(input.project_slug), bounded(input.project, 120, "project"), slug(input.environment_slug), bounded(input.environment, 120, "environment"), email, bounded(input.display_name, 120, "display name"), passwordHash, input.mode ?? "enforced"]);
-    await this.db.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by)
-      VALUES($1,$2,$3,$4,NULL,1,'automatic','never',false,false,300,$5)`, [randomUUID(), environmentId, projectId, organizationId, userId]);
-    /**
-     * THE DEFAULT AUTONOMY LINE RULE (v0.3.2 Phase 1).
-     *
-     * Once the Authority layer actually gates consequences, a workspace with no
-     * Autonomy Line rule can dispatch nothing at all — correctly, because "an
-     * undescribed Agent has no autonomy". But a brand-new workspace whose first
-     * action is refused with no way to discover why is not a usable product, so
-     * the bootstrap DESCRIBES a starting posture rather than leaving it absent.
-     *
-     * That distinction is the whole point. This is not "no rule, therefore
-     * anything goes". It is an explicit rule, visible on the Autonomy Line page,
-     * carrying a rationale the customer can read and tighten.
-     *
-     * `requires_reversible` is the conservative half. A reversible effect may
-     * proceed; anything IRREVERSIBLE still finds no applicable rule and falls
-     * through to "Nyst asks a person". Irreversible is where being wrong is
-     * permanent, so it is what stays with a human by default.
-     *
-     * HONEST TRADE-OFF: a stricter product would default to `human` and make
-     * every first action wait for approval. That is defensible and safer. This
-     * chooses usable-by-default for reversible effects, and the choice is
-     * stated here rather than buried in a migration.
-     */
-    await this.db.query(`INSERT INTO nyst_autonomy_rules(autonomy_rule_id,organization_id,project_id,environment_id,
-        requires_reversible,requires_no_open_incident,disposition,rationale,created_by)
-      VALUES($1,$2,$3,$4,true,true,'autonomous',$5,$6)`,
-      [randomUUID(), organizationId, projectId, environmentId,
-        "Default starting posture created with this workspace: an Agent may act autonomously on REVERSIBLE "
-        + "effects while no incident is open. Irreversible effects still ask a person. Tighten or replace this "
-        + "rule on the Autonomy Line page once you know what your Agents actually do.",
-        userId]);
+
+    const pool = this.db as ProductDb & { connect?: () => Promise<ProductDb & { release(): void }> };
+    if (typeof pool.connect !== "function") {
+      throw new Error(
+        "Creating a workspace requires a connection pool that can open a transaction. " +
+        "A workspace is created whole or not at all, and a half-created one lets someone sign in " +
+        "to an environment with no policy and no Autonomy Line.");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      await client.query(`WITH organization AS (
+        INSERT INTO nyst_organizations(organization_id,slug,name) VALUES($1,$5,$6) RETURNING organization_id
+      ), project AS (
+        INSERT INTO nyst_projects(project_id,organization_id,slug,name) SELECT $2,organization_id,$7,$8 FROM organization RETURNING project_id,organization_id
+      ), environment AS (
+        INSERT INTO nyst_environments(environment_id,project_id,organization_id,slug,name,mode) SELECT $3,project_id,organization_id,$9,$10,$14 FROM project
+      ) INSERT INTO nyst_users(user_id,organization_id,email,display_name,password_hash) SELECT $4,organization_id,$11,$12,$13 FROM organization`,
+        [organizationId, projectId, environmentId, userId, slug(input.organization_slug), bounded(input.organization, 120, "organization"), slug(input.project_slug), bounded(input.project, 120, "project"), slug(input.environment_slug), bounded(input.environment, 120, "environment"), email, bounded(input.display_name, 120, "display name"), passwordHash, input.mode ?? "enforced"]);
+
+      await client.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by)
+        VALUES($1,$2,$3,$4,NULL,1,'automatic','never',false,false,300,$5)`, [randomUUID(), environmentId, projectId, organizationId, userId]);
+
+      /**
+       * THE DEFAULT AUTONOMY LINE RULE (v0.3.2 Phase 1).
+       *
+       * Once the Authority layer actually gates consequences, a workspace with
+       * no Autonomy Line rule can dispatch nothing at all — correctly, because
+       * "an undescribed Agent has no autonomy". But a brand-new workspace whose
+       * first action is refused with no way to discover why is not a usable
+       * product, so the bootstrap DESCRIBES a starting posture rather than
+       * leaving it absent.
+       *
+       * That distinction is the whole point. This is not "no rule, therefore
+       * anything goes". It is an explicit rule, visible on the Autonomy Line
+       * page, carrying a rationale the customer can read and tighten.
+       *
+       * `requires_reversible` is the conservative half. A reversible effect may
+       * proceed; anything IRREVERSIBLE still finds no applicable rule and falls
+       * through to "Nyst asks a person". Irreversible is where being wrong is
+       * permanent, so it is what stays with a human by default.
+       *
+       * HONEST TRADE-OFF: a stricter product would default to `human` and make
+       * every first action wait for approval. That is defensible and safer.
+       * This chooses usable-by-default for reversible effects, and the choice is
+       * stated here rather than buried in a migration.
+       */
+      await client.query(`INSERT INTO nyst_autonomy_rules(autonomy_rule_id,organization_id,project_id,environment_id,
+          requires_reversible,requires_no_open_incident,disposition,rationale,created_by)
+        VALUES($1,$2,$3,$4,true,true,'autonomous',$5,$6)`,
+        [randomUUID(), organizationId, projectId, environmentId,
+          "Default starting posture created with this workspace: an Agent may act autonomously on REVERSIBLE "
+          + "effects while no incident is open. Irreversible effects still ask a person. Tighten or replace this "
+          + "rule on the Autonomy Line page once you know what your Agents actually do.",
+          userId]);
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
 
     return { organization_id: organizationId, project_id: projectId, environment_id: environmentId, user_id: userId };
   }
