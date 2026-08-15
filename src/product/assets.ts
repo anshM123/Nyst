@@ -61,15 +61,44 @@ export const APP_JS = `
     button.textContent = "Working…";
     try {
       await csrfReady;
-      const response = await fetch(url, {
+      // One Idempotency-Key for this button, reused across the retry below, so
+      // a retry can never become a second command.
+      const key = (button.dataset.idempotency ||= crypto.randomUUID());
+      const attempt = () => fetch(url, {
         method,
         headers: {
           "content-type": "application/json",
           "x-nyst-csrf": csrf(),
-          "idempotency-key": (button.dataset.idempotency ||= crypto.randomUUID()),
+          "idempotency-key": key,
         },
         body: body === undefined ? undefined : JSON.stringify(body),
       });
+
+      let response = await attempt();
+
+      /**
+       * A STALE CSRF TOKEN HEALS ITSELF ONCE.
+       *
+       * sessionStorage is per-tab and outlives a lot: a token minted in this
+       * tab can be superseded, and a deployment that changes how tokens are
+       * derived leaves every open tab holding a value the server no longer
+       * accepts. Before this, the only cure was signing out and back in, and
+       * the person was shown "CSRF rejected" with no hint that this was the
+       * remedy.
+       *
+       * Retried EXACTLY once, and only for 403, and only after obtaining a
+       * fresh token — so a genuine authorization failure still surfaces rather
+       * than looping.
+       */
+      if (response.status === 403) {
+        const refreshed = await fetch("/v1/auth/csrf", { credentials: "same-origin" })
+          .then((r) => r.ok ? r.json() : null).catch(() => null);
+        if (refreshed && refreshed.csrf && refreshed.csrf !== csrf()) {
+          sessionStorage.setItem("nyst_csrf", refreshed.csrf);
+          response = await attempt();
+        }
+      }
+
       const payload = await response.json().catch(() => ({}));
       // Prefer the server's stated reason. An error CODE tells an operator
       // nothing they can act on; "no webhook endpoint is configured" does.

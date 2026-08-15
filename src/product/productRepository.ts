@@ -250,9 +250,29 @@ export class ProductRepository {
     return { kind: "session", user_id: String(row.user_id), api_key_id: null, agent_id: null, organization_id: String(row.organization_id), project_id: String(row.project_id), environment_id: String(row.environment_id), scopes: ["*"], csrf_hash: String(row.csrf_hash) };
   }
 
+  /**
+   * The CSRF token for a session. STABLE, not freshly minted.
+   *
+   * THE DEFECT THIS FIXES. This used to be `randomBytes(24)` — a NEW token on
+   * every call — behind a GET endpoint the page calls whenever sessionStorage
+   * is empty. So opening the app in a second tab rotated the token and silently
+   * invalidated the FIRST tab: every button there answered "CSRF rejected"
+   * until the person signed out and back in. A GET that rotates security state
+   * is a bug by construction, and it breaks the most ordinary thing a person
+   * does with a web application.
+   *
+   * It is now DERIVED from the session, so the endpoint is idempotent and every
+   * tab of one session agrees. The derivation is a keyed digest of a value the
+   * attacker cannot read: the session cookie is httpOnly, so script on another
+   * origin cannot read it, and the same-origin policy stops them reading this
+   * response — which are exactly the two properties a synchronizer token needs.
+   *
+   * A leaked session cookie already defeats CSRF entirely, so binding the token
+   * to it costs nothing that was not already lost in that scenario.
+   */
   async refreshSessionCsrf(session: string): Promise<string | null> {
     if (!/^[A-Za-z0-9_-]{40,100}$/.test(session)) return null;
-    const csrf = randomBytes(24).toString("base64url");
+    const csrf = digest(`nyst.csrf.v1|${session}`).slice(0, 43);
     const result = await this.db.query(
       `UPDATE nyst_sessions s SET csrf_hash=$2,last_seen_at=now()
        FROM nyst_users u

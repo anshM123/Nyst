@@ -804,6 +804,63 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
     assert.equal((enabled.json() as { enabled?: boolean }).enabled, true);
   });
 
+  /**
+   * FOUND ON THE DEPLOYED SITE, fifth round: "CSRF rejected".
+   *
+   * `/v1/auth/csrf` minted `randomBytes(24)` on every call — a NEW token each
+   * time — behind a GET the page issues whenever sessionStorage is empty. So
+   * opening the app in a second tab rotated the token and silently invalidated
+   * the FIRST tab. Every button there answered "CSRF rejected" until the person
+   * signed out and back in, and nothing told them that was the cure.
+   *
+   * A GET that rotates security state is a defect by construction. I noticed
+   * this while reviewing the commit that introduced it and did not act on it.
+   */
+  it("THE DEFECT: the CSRF endpoint is idempotent, so a second tab does not break the first", async () => {
+    const first = await app.inject({ method: "GET", url: "/v1/auth/csrf", headers: { cookie } });
+    const second = await app.inject({ method: "GET", url: "/v1/auth/csrf", headers: { cookie } });
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 200);
+    const a = (first.json() as { csrf?: string }).csrf;
+    const b = (second.json() as { csrf?: string }).csrf;
+    assert.ok(a && b);
+    assert.equal(a, b,
+      "THE CSRF ENDPOINT ROTATES ON READ. A second tab invalidates the first, and every button there "
+      + "fails with 'CSRF rejected' until the person signs out and back in.");
+
+    // And the token the FIRST caller holds must still be accepted afterwards.
+    const still = await app.inject({
+      method: "GET", url: "/v1/environment/promotion", headers: { cookie, "x-nyst-csrf": a! },
+    });
+    assert.equal(still.statusCode, 200);
+  });
+
+  it("the token from the endpoint is the one the routes accept", async () => {
+    const issued = (await app.inject({ method: "GET", url: "/v1/auth/csrf", headers: { cookie } }).then((r) => r.json())) as { csrf: string };
+    const response = await app.inject({
+      method: "PUT", url: "/v1/environment/mode",
+      headers: { cookie, "x-nyst-csrf": issued.csrf, "content-type": "application/json" },
+      payload: { mode: "shadow", reason: "Checking the hydrated token is accepted." },
+    });
+    assert.notEqual(response.statusCode, 403,
+      "a token this endpoint issued was rejected by a state-changing route");
+    // Keep the fixture's session usable for the rest of the suite.
+    csrf = issued.csrf;
+  });
+
+  it("a stale CSRF token heals itself instead of demanding a sign-out", () => {
+    // The client half. Without this, a deployment that changes how tokens are
+    // derived leaves every open tab permanently broken.
+    assert.match(APP_JS, /response\.status === 403/,
+      "the client does not detect a rejected CSRF token");
+    assert.match(APP_JS, /sessionStorage\.setItem\("nyst_csrf", refreshed\.csrf\)/,
+      "the client does not store the refreshed token");
+    // Exactly once, and the Idempotency-Key is reused, so a retry can never
+    // become a second command.
+    assert.match(APP_JS, /const key = \(button\.dataset\.idempotency/,
+      "the retry does not reuse the Idempotency-Key, so it could create a second command");
+  });
+
   it("connecting requires CSRF, like every other state-changing request", async () => {
     const response = await app.inject({
       method: "POST", url: "/v1/integrations/github/credential",
