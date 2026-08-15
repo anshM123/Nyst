@@ -65,4 +65,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 # SIGTERM reaches PID 1 directly in exec form, which is what the graceful
 # shutdown handlers in scripts/startProduct.ts are waiting for.
-CMD ["node", "--experimental-strip-types", "scripts/startProduct.ts"]
+# Free Render services cannot use the gated Pre-Deploy Command. Apply the
+# idempotent schema migrations before starting the web process instead.
+CMD ["sh", "-c", "node --experimental-strip-types scripts/migrate.ts && exec node --experimental-strip-types scripts/startProduct.ts"]
