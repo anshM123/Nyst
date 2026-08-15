@@ -10,6 +10,7 @@
  * Production startup FAILS CLOSED on unsafe configuration — see
  * src/product/config.ts for the exact rules.
  */
+import { randomUUID } from "node:crypto";
 import { Ed25519Signer } from "../dist/src/core/signing.js";
 import { LocalSystemClock } from "../dist/src/core/clock.js";
 import { verifyResolution } from "../dist/src/engine/resolver.js";
@@ -30,6 +31,7 @@ import { AuthorityRepository } from "../dist/src/product/authority/authorityRepo
 import { registerPublicRoutes } from "../dist/src/public/publicRoutes.js";
 import { InboundRepository } from "../dist/src/public/inboundRepository.js";
 import { PasswordResetService } from "../dist/src/product/auth/passwordReset.js";
+import { GoogleSignupService } from "../dist/src/product/auth/googleSignup.js";
 import { smtpSettingsFromEnv } from "../dist/src/product/email.js";
 import { SmtpEmailProvider } from "../dist/src/product/smtpEmail.js";
 import { homePage } from "../dist/src/public/site.js";
@@ -124,6 +126,16 @@ const preflight = async (provider: "github" | "okta" | "stripe", _secret: string
  * LIVE GOOGLE PROJECT CONFIGURATION REQUIRED.
  */
 const federated = new FederatedRepository(pool);
+
+/**
+ * Google SIGNUP, as distinct from Google LOGIN.
+ *
+ * A brand-new Google identity used to hit a 404 telling it to go and sign up --
+ * from the signup page. This carries the verified identity across the
+ * workspace-name form and creates the workspace atomically.
+ */
+const googleSignups = new GoogleSignupService(pool);
+
 const googleConfig = googleConfigFromEnv();
 const google = googleConfig
   ? new GoogleAuth(googleConfig, federated, httpGoogleTransport(), secrets)
@@ -153,6 +165,7 @@ const app = await buildProductServer({
   public_home: homePage,
   signer,
   federated,
+  google_signup: googleSignups,
   ...(google ? { google } : {}),
 });
 
@@ -195,6 +208,56 @@ registerPublicRoutes(app, {
     : {}),
   on_error: structuredLog,
   password_reset: passwordResets,
+  google_signup: {
+    peek: (handle) => googleSignups.peek(handle),
+    /**
+     * Create the workspace and bind the Google identity ATOMICALLY.
+     *
+     * The handoff is consumed first, so two submissions of one form cannot
+     * create two workspaces. If the workspace creation then fails, the handoff
+     * is already spent -- deliberately: a failed signup should start again from
+     * Google rather than replay a half-used identity.
+     */
+    complete: async (handle, input) => {
+      const identity = await googleSignups.consume(handle);
+      if (!identity) return { ok: false, reason: "That Google sign-in has expired. Start again." };
+      try {
+        const created = await repository.createBootstrap({
+          organization: input.organization,
+          organization_slug: input.organization_slug,
+          project: "Platform", project_slug: "platform",
+          environment: "Shadow", environment_slug: "shadow", mode: "shadow",
+          email: identity.email, display_name: input.display_name,
+          // A Google account signs in with Google. A random password exists
+          // only because the column requires one, and nobody is ever told it;
+          // password reset is the supported route to adding a local credential.
+          password: randomUUID() + randomUUID(),
+        });
+        await federated.bindIdentity({
+          user_id: created.user_id, organization_id: created.organization_id,
+          provider: "google", provider_subject: identity.provider_subject,
+          email_at_link: identity.email, email_verified_at_link: identity.email_verified,
+        });
+        await repository.createAgent(created, created.user_id, {
+          name: "First Agent", slug: "first-agent", owner: input.display_name,
+          description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
+          framework: "unspecified", tags: [],
+        }).catch(() => null);
+
+        const session = await federated.createSession(created.user_id);
+        if (!session) return { ok: false, reason: "The workspace was created but the session could not be started. Sign in with Google again." };
+        structuredLog({ type: "google_signup_created", organization_slug: input.organization_slug });
+        return { ok: true, session: session.session };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        if (/duplicate key|unique/i.test(message)) {
+          return { ok: false, reason: `The short name "${input.organization_slug}" is already taken. Pick another.` };
+        }
+        structuredLog({ type: "google_signup_failed", detail: message });
+        return { ok: false, reason: "The workspace could not be created. Nothing was created, and you can try again." };
+      }
+    },
+  },
   /**
    * A real Shadow trial.
    *

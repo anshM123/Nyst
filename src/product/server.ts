@@ -116,6 +116,16 @@ export interface ProductServerOptions {
    * Google button that vanishes is harder to debug than one that explains.
    */
   google?: GoogleAuth;
+  /**
+   * Completes a Google SIGNUP for an identity Nyst has never seen (Phase 5).
+   *
+   * Absent, the callback still explains itself rather than 404ing -- but a
+   * brand-new Google user has nowhere to go, which is the dead end this exists
+   * to close.
+   */
+  google_signup?: {
+    begin(identity: { provider_subject: string; email: string; email_verified: boolean; display_name: string | null }): Promise<string>;
+  };
   /** Federated identity persistence. Required for Connected Accounts. */
   federated?: FederatedRepository;
   /** Customer-pushed observations, for systems Nyst has no integration with. */
@@ -319,10 +329,34 @@ export async function buildProductServer(options: ProductServerOptions): Promise
       case "subject_belongs_to_another_user":
         return reply.code(409).type("text/html; charset=utf-8").send(genericPage(
           "That Google account is already connected", result.message));
-      case "no_account":
-        return reply.code(404).type("text/html; charset=utf-8").send(genericPage(
-          "No Nyst account for that Google identity",
-          "Nyst does not create an account automatically from a Google sign-in. Start in Shadow to create one, then connect Google from Settings."));
+      case "no_account": {
+        /**
+         * GOOGLE SIGNUP (v0.3.2 Phase 5).
+         *
+         * This used to be a 404 saying "Nyst does not create an account
+         * automatically". Accurate, and a dead end: someone who clicked
+         * "Continue with Google" on the SIGNUP page was told to go and sign up.
+         *
+         * The reason for the original refusal was sound -- a workspace needs a
+         * NAME, and inventing one from a Google profile produces "john-gmail"
+         * as an organization identifier. So the flow now asks for the one thing
+         * it cannot infer, carrying the VERIFIED Google identity across in a
+         * signed, short-lived, single-use handoff rather than trusting anything
+         * the browser sends back.
+         */
+        if (!options.google_signup) {
+          return reply.code(404).type("text/html; charset=utf-8").send(genericPage(
+            "No Nyst account for that Google identity",
+            "This deployment cannot create accounts, so a Google sign-in has nowhere to go. Contact us and we will set one up."));
+        }
+        const handoff = await options.google_signup.begin({
+          provider_subject: String(result.claims.sub),
+          email: String(result.claims.email ?? ""),
+          email_verified: result.claims.email_verified === true,
+          display_name: displayNameFromClaims(result.claims as unknown as Record<string, unknown>),
+        });
+        return reply.redirect(`/signup/google?handoff=${encodeURIComponent(handoff)}`, 302);
+      }
     }
   });
 
@@ -1133,6 +1167,18 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.post("/v1/api-keys", api(async (principal, request) => { if (principal.kind !== "session") throw Object.assign(new Error("Session required"), { statusCode: 403 }); requireCsrf(request, principal); const body = object(request.body); const scopes=strings(body.scopes,16); if(scopes.some(scope=>!API_SCOPES.has(scope)))throw Object.assign(new Error("Unsupported API key scope"),{statusCode:400}); const idempotent = await options.repository.idempotent(principal, "api_key.create", idempotencyKey(request), body, async () => options.repository.createApiKey(principal, string(body.name, 120), scopes, null, body.agent_id===undefined||body.agent_id===null?null:string(body.agent_id,36))); return idempotent.value;},options.repository));
   app.delete("/v1/api-keys/:id", api(async (principal, request) => { if (principal.kind !== "session") throw Object.assign(new Error("Session required"), { statusCode: 403 }); requireCsrf(request, principal); return { revoked: await options.repository.revokeApiKey(principal, routeId(request)) }; }, options.repository));
   return app;
+}
+
+/**
+ * A display name from a verified ID token, if it carries one.
+ *
+ * `name` is an optional OIDC profile claim, so it is read defensively rather
+ * than typed into IdTokenClaims -- nothing about identity depends on it, and it
+ * is only ever a prefilled form value the person can change.
+ */
+function displayNameFromClaims(claims: Record<string, unknown>): string | null {
+  const name = claims.name;
+  return typeof name === "string" && name.trim().length > 0 && name.length <= 120 ? name.trim() : null;
 }
 
 function pageHandler(handler: (principal: ProductPrincipal, request: FastifyRequest, reply: FastifyReply) => Promise<string | FastifyReply>, repository: ProductRepository) { return async (request: FastifyRequest, reply: FastifyReply) => { const principal = await authenticate(request, repository); if (!principal) return reply.redirect("/login");if(principal.kind!=="session")return reply.code(403).type("text/html; charset=utf-8").send(genericPage("Session required","Dashboard pages require a browser session; API keys are limited to versioned API endpoints.")); const value = await handler(principal, request, reply); if (typeof value === "string") { const context=await repository.context(principal); return reply.type("text/html; charset=utf-8").send(value.replace("<!--NYST_CONTEXT-->",contextSwitcher(context))); } return value; }; }

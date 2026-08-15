@@ -17,7 +17,7 @@ import {
   homePage, pricingPage, productPage, outcomesExplainedPage, integrationsPublicPage, securityPage, publicShell,
 } from "./site.js";
 import { configuratorPage, contactPage, recommendPlan, type QuoteInput } from "./configurator.js";
-import { forgotPasswordPage, resetPasswordPage } from "./site.js";
+import { forgotPasswordPage, resetPasswordPage, googleSignupPage } from "./site.js";
 import { signupPage } from "./site.js";
 import { escape } from "../product/dashboard.js";
 
@@ -73,6 +73,17 @@ export interface PublicRouteOptions {
       Promise<{ accepted: boolean; delivery_unavailable: boolean }>;
     inspect(token: string): Promise<{ valid: boolean }>;
     completeReset(token: string, password: string): Promise<{ ok: true } | { ok: false; reason: string }>;
+  };
+  /**
+   * Finish a Google signup for an identity Nyst has never seen (Phase 5).
+   *
+   * Absent, /signup/google explains that this deployment cannot create
+   * accounts rather than 404ing a redirect the callback just issued.
+   */
+  google_signup?: {
+    peek(handle: string): Promise<{ provider_subject: string; email: string; email_verified: boolean; display_name: string | null } | null>;
+    complete(handle: string, input: { organization: string; organization_slug: string; display_name: string }):
+      Promise<{ ok: true; session: string } | { ok: false; reason: string }>;
   };
   /**
    * Create a real Shadow trial account.
@@ -280,6 +291,83 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
     // signup form: signing in is where a session is established, and doing it
     // in two places is two places to get it wrong.
     return reply.redirect("/login?created=1");
+  });
+
+  /* -------------------------------------------------- google signup */
+
+  /**
+   * The page a brand-new Google identity lands on.
+   *
+   * GET does not consume the handoff: a refresh must not send the person back
+   * to Google.
+   */
+  app.get("/signup/google", async (request, reply) => {
+    const query = request.query as { handoff?: unknown };
+    const handoff = bounded(query.handoff, 128);
+    if (!options.google_signup) {
+      return reply.code(503).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: SIGNUP_UNAVAILABLE, error: null,
+      }));
+    }
+    const pending = await options.google_signup.peek(handoff);
+    if (!pending) {
+      return reply.code(410).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: null,
+        error: "That Google sign-in has expired. Start again and it will only take a moment.",
+      }));
+    }
+    return html(reply, googleSignupPage({
+      handoff, email: pending.email, display_name: pending.display_name,
+      suggested_slug: suggestSlug(pending.email),
+    }));
+  });
+
+  app.post("/signup/google", async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const handoff = bounded(body.handoff, 128);
+    const submitted = {
+      organization: bounded(body.organization, 120),
+      organization_slug: bounded(body.organization_slug, 63).toLowerCase(),
+      display_name: bounded(body.display_name, 120),
+    };
+
+    if (!options.google_signup) {
+      return reply.code(503).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: SIGNUP_UNAVAILABLE, error: null,
+      }));
+    }
+    const pending = await options.google_signup.peek(handoff);
+    if (!pending) {
+      return reply.code(410).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: null,
+        error: "That Google sign-in has expired. Start again and it will only take a moment.",
+      }));
+    }
+
+    const render = (error: string) => reply.code(400).type("text/html; charset=utf-8").send(googleSignupPage({
+      handoff, email: pending.email, display_name: pending.display_name,
+      suggested_slug: suggestSlug(pending.email), error, submitted,
+    }));
+
+    // The SAME validation the password signup uses, minus the password: a
+    // Google account has Google as its way in, and inventing a password here
+    // would create a second credential nobody asked for.
+    if (submitted.organization.length < 2) return render("Give the workspace a name.");
+    if (!/^[a-z0-9-]{3,63}$/.test(submitted.organization_slug)) {
+      return render("The short name may use lowercase letters, numbers and hyphens, and must be at least three characters.");
+    }
+    if (submitted.display_name.length < 1) return render("Tell us your name.");
+
+    const created = await options.google_signup.complete(handoff, submitted);
+    if (!created.ok) return render(created.reason);
+
+    // Signed in immediately. Unlike the password flow there is nothing left to
+    // prove -- Google already established who this is, moments ago.
+    reply.setCookie("nyst_session", created.session, {
+      path: "/", httpOnly: true, sameSite: "lax",
+      secure: request.protocol === "https", maxAge: 12 * 60 * 60,
+    });
+    return reply.redirect("/", 302);
   });
 
   /* ------------------------------------------------ password recovery */
@@ -600,4 +688,19 @@ function parseQuote(body: unknown): QuoteInput {
     email: bounded(record.email, 320),
     notes: bounded(record.notes, 2000),
   };
+}
+
+/**
+ * A starting point for the workspace short name.
+ *
+ * Only ever a PREFILL. The person can change it, and the field is required
+ * precisely so nobody ends up with `john-gmail` as a permanent public
+ * identifier because a form guessed for them.
+ */
+function suggestSlug(email: string): string {
+  const domain = email.slice(email.indexOf("@") + 1).split(".")[0] ?? "";
+  const cleaned = domain.toLowerCase().replace(/[^a-z0-9-]/g, "");
+  const generic = ["gmail", "googlemail", "outlook", "hotmail", "yahoo", "icloud", "proton", "protonmail"];
+  if (!cleaned || cleaned.length < 3 || generic.includes(cleaned)) return "";
+  return cleaned.slice(0, 63);
 }

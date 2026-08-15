@@ -551,3 +551,58 @@ export function resetPasswordPage(input: {
     <p class="small">This will sign out every device currently signed in to this account.</p>
   </section>`);
 }
+
+/**
+ * Finish a Google signup.
+ *
+ * Asks for the ONE thing a Google profile cannot supply: what to call the
+ * workspace. Everything else is already verified, and the page says so plainly
+ * rather than asking the person to retype an email Google has confirmed.
+ *
+ * There is no password field. Someone signing up with Google has Google as
+ * their way in; inventing a password here would create a second credential
+ * nobody asked for and a recovery path nobody expects.
+ */
+export function googleSignupPage(input: {
+  handoff: string;
+  email: string;
+  display_name: string | null;
+  suggested_slug: string;
+  error?: string | null;
+  submitted?: { organization?: string; organization_slug?: string; display_name?: string };
+}): string {
+  const value = (field: "organization" | "organization_slug" | "display_name", fallback = "") =>
+    escape(String(input.submitted?.[field] ?? fallback));
+
+  return publicShell("Finish setting up", "/signup", `
+  <section class="page-head-public">
+    <p class="eyebrow">Shadow trial</p>
+    <h1>Finish setting up</h1>
+    <p class="lede">Google confirmed <strong>${escape(input.email)}</strong>. Nyst needs one more thing:
+      what to call your workspace.</p>
+  </section>
+
+  ${input.error ? `<section class="band band-quiet"><h2>That did not work.</h2>
+    <p class="lede">${escape(input.error)}</p></section>` : ""}
+
+  <section class="configure">
+    <form method="post" action="/signup/google" class="steps">
+      <input type="hidden" name="handoff" value="${escape(input.handoff)}">
+      <fieldset class="step">
+        <legend>Your workspace</legend>
+        <label>Organization name <input type="text" name="organization" maxlength="120" required autofocus
+          value="${value("organization")}"></label>
+        <label>Short name
+          <input type="text" name="organization_slug" maxlength="63" required pattern="[a-z0-9-]{3,63}"
+            value="${value("organization_slug", input.suggested_slug)}">
+          <span class="small">Lowercase letters, numbers and hyphens. You type this to sign in, and it cannot be changed later.</span>
+        </label>
+        <label>Your name <input type="text" name="display_name" maxlength="120" required
+          value="${value("display_name", input.display_name ?? "")}"></label>
+      </fieldset>
+      <div class="step-actions"><button type="submit" class="button primary">Create workspace</button></div>
+    </form>
+    <p class="small">Your workspace starts in <strong>Shadow</strong>: Nyst observes and evaluates, and
+      controls nothing until you deliberately change that.</p>
+  </section>`);
+}
