@@ -22,9 +22,12 @@ COPY packages/sdk/package.json ./packages/sdk/
 RUN npm ci --no-audit --no-fund
 
 COPY tsconfig.json ./
+COPY tsconfig.scripts.json tsconfig.api.json ./
 COPY packages/sdk/tsconfig.json ./packages/sdk/
 COPY packages/sdk/src ./packages/sdk/src
 COPY src ./src
+COPY scripts ./scripts
+COPY api ./api
 COPY tests ./tests
 RUN npm run build
 
