@@ -583,6 +583,133 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
     } finally { await bare.close(); }
   });
 
+  /* ============================ THE PREFLIGHT USES THE TENANT'S CREDENTIAL */
+
+  /**
+   * FOUND ON THE DEPLOYED SITE, second round.
+   *
+   * The operator stored a real GitHub PAT. Configured: YES. Credential
+   * available: YES. Preflight verified: NO, forever, with nothing they could
+   * do about it — because the probe hardcoded
+   *
+   *     ref = "env:NYST_GITHUB_TOKEN"
+   *
+   * and ignored the credential it was handed. The v0.3.2 Phase 2 multi-tenancy
+   * defect, surviving in the one component whose job is verifying credentials.
+   * Third appearance of the same shape.
+   *
+   * This asserts the probe receives THIS TENANT's secret, by value.
+   */
+  it("THE DEFECT: the preflight probe receives the tenant's own credential", async () => {
+    const seen: string[] = [];
+    const probed = await buildProductServer({
+      repository, authority: new AuthorityRepository(pool), entitlements,
+      tenant_credentials: credentials, effect_specs: [], production: false,
+      integration_preflight: async (_provider: string, secret: string) => {
+        seen.push(secret);
+        return { ok: true as const, account_identity: "fixture", verified_capabilities: [], mutated: false };
+      },
+    } as never);
+    try {
+      const login = await probed.inject({
+        method: "POST", url: "/v1/auth/login", headers: { "content-type": "application/json" },
+        payload: { organization: `wf-${suffix}`, email: `wf-${suffix}@test.test`, password: PASSWORD },
+      });
+      const c = String(login.headers["set-cookie"] ?? "").split(";")[0]!;
+      const x = String((login.json() as { csrf?: unknown }).csrf ?? "");
+      const headers = { cookie: c, "x-nyst-csrf": x, "content-type": "application/json" };
+
+      const distinctive = `ghp_${"PreflightSeesThisExactValue00000000"}`;
+      await probed.inject({
+        method: "POST", url: "/v1/integrations/github/credential", headers,
+        payload: { credential: distinctive },
+      });
+      await probed.inject({ method: "POST", url: "/v1/integrations/github/preflight", headers, payload: {} });
+
+      assert.ok(seen.length > 0, "the preflight probe was never invoked");
+      assert.ok(seen.includes(distinctive),
+        "THE PREFLIGHT DID NOT RECEIVE THE TENANT'S CREDENTIAL. It is resolving something else — which is how "
+        + "a stored, decryptable, correct customer token stayed permanently unverified.");
+    } finally { await probed.close(); }
+  });
+
+  it("a preflight failure explains itself instead of naming a fixture", async () => {
+    // The old probe threw "GitHub fixture topology is unsupported" — a sentence
+    // about the operator's acceptance test, meaningless to a customer.
+    const failing = await buildProductServer({
+      repository, authority: new AuthorityRepository(pool), entitlements,
+      tenant_credentials: credentials, effect_specs: [], production: false,
+      integration_preflight: async () => ({
+        ok: false as const, failure_category: "authentication_failed" as const,
+        detail: "GitHub rejected this credential (401). Check that the token is valid and not expired.",
+      }),
+    } as never);
+    try {
+      const login = await failing.inject({
+        method: "POST", url: "/v1/auth/login", headers: { "content-type": "application/json" },
+        payload: { organization: `wf-${suffix}`, email: `wf-${suffix}@test.test`, password: PASSWORD },
+      });
+      const headers = {
+        cookie: String(login.headers["set-cookie"] ?? "").split(";")[0]!,
+        "x-nyst-csrf": String((login.json() as { csrf?: unknown }).csrf ?? ""),
+        "content-type": "application/json",
+      };
+      await failing.inject({
+        method: "POST", url: "/v1/integrations/github/credential", headers,
+        payload: { credential: FIXTURE_GITHUB },
+      });
+      const response = await failing.inject({
+        method: "POST", url: "/v1/integrations/github/preflight", headers, payload: {} });
+      assert.equal(response.statusCode, 200, response.body);
+      assert.doesNotMatch(response.body, /fixture topology/i,
+        "a customer is shown an error about the operator's test fixtures");
+      assert.match(response.body, /rejected this credential|not expired/i,
+        "the failure does not say what is actually wrong with the credential");
+    } finally { await failing.close(); }
+  });
+
+  it("STRUCTURAL: no probe resolves a hardcoded operator credential reference", () => {
+    // The exact line that caused this. A probe that reaches for env:NYST_*_TOKEN
+    // is single-tenant by construction, whatever else it does.
+    const factory = readFileSync(join(root, "src/product/providerRuntimeFactory.ts"), "utf8");
+    const start = factory.indexOf("const preflight");
+    const probe = factory.slice(start, factory.indexOf("return { runtime,", start));
+    assert.doesNotMatch(probe, /ref\s*=\s*"env:NYST_[A-Z_]+"/,
+      "THE PREFLIGHT HARDCODES AN OPERATOR CREDENTIAL REFERENCE, so a customer's own credential is ignored");
+    assert.doesNotMatch(probe, /requiredFixture\(/,
+      "the preflight still demands operator fixture environment variables, which no customer can supply");
+  });
+
+  /* ================================= THE ENABLE CONTROL THAT DID NOT EXIST */
+
+  it("THE DEFECT: an EffectSpec can be enabled from the interface", () => {
+    // PUT /v1/effect-specs/:effect existed from the beginning with NOTHING in
+    // the UI calling it. Readiness reported "Enabled: NO / Enabled EffectSpecs:
+    // none" and offered no way to change it, so the only route was curl.
+    assert.match(APP_JS, /dataset\.effectSpec/,
+      "nothing in the shipped script enables an EffectSpec");
+    assert.match(APP_JS, /\/v1\/effect-specs\//,
+      "the handler does not call the enablement route");
+    const dashboard = readFileSync(join(root, "src/product/dashboard.ts"), "utf8");
+    assert.match(dashboard, /data-effect-spec="/,
+      "the Integrations page renders no control to enable an EffectSpec");
+  });
+
+  it("enabling an EffectSpec over HTTP flips readiness for that provider", async () => {
+    const specs = await app.inject({ method: "GET", url: "/v1/effect-specs", headers: { cookie } });
+    if (specs.statusCode !== 200) return; // no registry in this fixture server
+    const list = specs.json() as Array<{ effect_name?: string; provider?: string }>;
+    const target = list.find((spec) => typeof spec.effect_name === "string");
+    if (!target?.effect_name) return;
+
+    const enabled = await app.inject({
+      method: "PUT", url: `/v1/effect-specs/${encodeURIComponent(target.effect_name)}`,
+      headers: auth(), payload: { enabled: true },
+    });
+    assert.equal(enabled.statusCode, 200, enabled.body);
+    assert.equal((enabled.json() as { enabled?: boolean }).enabled, true);
+  });
+
   it("connecting requires CSRF, like every other state-changing request", async () => {
     const response = await app.inject({
       method: "POST", url: "/v1/integrations/github/credential",

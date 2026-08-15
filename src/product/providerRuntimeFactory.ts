@@ -138,27 +138,113 @@ export function createProductProviderRuntime(
         throw Object.assign(new Error("No provider runtime is registered for this EffectSpec"), { statusCode: 503 });
     }
   };
-  const preflight:ProductIntegrationPreflight=async provider=>{
+  /**
+   * THE CONNECTION PREFLIGHT (rewritten in v0.3.3).
+   *
+   * WHAT WAS WRONG, AND IT MADE THE WHOLE FEATURE UNREACHABLE.
+   *
+   * This probe hardcoded `ref = "env:NYST_GITHUB_TOKEN"` and IGNORED the
+   * credential it was handed. So a customer's own token could be stored,
+   * encrypted and resolved correctly — and the one thing that verifies a
+   * credential went looking for the OPERATOR's environment variable instead.
+   * `Configured: YES`, `Credential available: YES`, `Preflight verified: NO`,
+   * forever, with nothing the customer could do about it.
+   *
+   * That is the v0.3.2 Phase 2 multi-tenancy defect surviving in the verifier,
+   * which is the third place this same shape has turned up.
+   *
+   * It was also the wrong QUESTION. It demanded three operator fixture
+   * variables and then required a PRIVATE repository in which a NAMED
+   * principal was a DIRECT collaborator, throwing "GitHub fixture topology is
+   * unsupported" otherwise. That is an acceptance test for one deployment, not
+   * a connection check any customer could pass.
+   *
+   * WHAT IT ASKS NOW: does this credential authenticate, who does it belong to,
+   * and what does the provider say it may do. Nothing else. Those are the
+   * questions "is this connection working" actually means, and none of them
+   * needs configuration beyond the credential itself.
+   *
+   * `secret` is the value `runIntegrationPreflight` resolved from THIS
+   * TENANT's own credential reference. Every call below goes through a
+   * throwaway client bound to that one value, so a preflight cannot reach any
+   * other tenant's credential and cannot silently fall back to the operator's.
+   */
+  const preflight:ProductIntegrationPreflight=async(provider,secret)=>{
+    // A credential source over one literal value. The reference passed to the
+    // client is a label; nothing resolves it, because the value is already in
+    // hand and belongs to exactly one tenant.
+    const only=(value:string)=>({ async resolve(){ return value; } });
+    const ref="tenant:preflight";
+
     if(provider==="github"){
-      const owner=requiredFixture("NYST_GITHUB_OWNER"),repository=requiredFixture("NYST_GITHUB_REPOSITORY"),principal=requiredFixture("NYST_GITHUB_PRINCIPAL"),ref="env:NYST_GITHUB_TOKEN";
-      const organization=await githubClient.getOrganization(owner,ref),repo=await githubClient.getRepository(owner,repository,ref),user=await githubClient.getUser(principal,ref),member=await githubClient.checkOrganizationMember(owner,principal,ref),collaborators=await githubClient.listDirectCollaborators(owner,repository,ref),permission=await githubClient.getPermission(owner,repository,principal,ref);
-      if(organization.status!==200||repo.status!==200||user.status!==200||member.status!==204||collaborators.status!==200||permission.status!==200||!organization.data||!repo.data||!user.data||member.data!==true||!collaborators.data||!permission.data)throw new Error("GitHub read-only preflight failed");
-      const direct=collaborators.data.find(item=>item.id===user.data!.id);if(!repo.data.private||!direct)throw new Error("GitHub fixture topology is unsupported");
-      // Capabilities this read-only preflight ACTUALLY proved by performing
-      // the read. github:collaborator:write is deliberately absent: proving it
-      // would require a mutation, which invariant I20 forbids. It becomes
-      // AUTHORIZED only from GitHub's own scope metadata, or from an explicit
-      // operator attestation labelled as a claim.
-      return {status:"ready",provider,provider_mutation_performed:false,verified_capabilities:["github:organization:read","github:repository:read"],repository:{owner:repo.data.owner,name:repo.data.name,id:repo.data.id,private:repo.data.private},principal:{login:user.data.login,id:user.data.id,organization_member:true,direct_collaborator:true,role_name:direct.role_name,effective_permission:permission.data.permission}};
+      const client=new GitHubRestClient(only(secret),{clock,...(options.github_transport?{transport:options.github_transport}:{})});
+      const user=await client.getAuthenticatedUser(ref);
+      if(user.status===401||user.status===403){
+        throw new Error(`GitHub rejected this credential (${user.status}). Check that the token is valid and not expired.`);
+      }
+      if(user.status!==200||!user.data)throw new Error(`GitHub read-only preflight failed (HTTP ${user.status})`);
+
+      /**
+       * VERIFIED versus AUTHORIZED, and the line is not decorative.
+       *
+       * `github:user:read` was PROVED — this request read something and it
+       * worked. Everything derived from the scope header was merely STATED by
+       * GitHub, and a write capability can never be proved by a read-only
+       * probe without performing the write invariant I20 forbids.
+       *
+       * Fine-grained tokens send no scope header at all, and absence means
+       * "not stated", never "not granted".
+       */
+      const stated=(user.headers?.oauth_scopes??"").split(",").map(s=>s.trim()).filter(Boolean);
+      const authorized:string[]=[];
+      if(stated.includes("repo")||stated.includes("public_repo"))authorized.push("github:repository:read");
+      if(stated.includes("read:org")||stated.includes("admin:org"))authorized.push("github:organization:read");
+      return {
+        status:"ready",provider,provider_mutation_performed:false,
+        verified_capabilities:["github:user:read"],
+        authorized_capabilities:authorized,
+        scopes_stated_by_provider:stated,
+        // Fine-grained tokens publish no scope list. Say that, rather than
+        // letting an empty array read as "this token can do nothing".
+        scope_metadata_available:stated.length>0,
+        principal:{login:user.data.login,id:user.data.id},
+      };
     }
+
     if(provider==="okta"){
-      const origin=requiredFixtureAny(["NYST_OKTA_ORG_URL","OKTA_ORG_URL"]),userId=requiredFixtureAny(["NYST_OKTA_TEST_USER_ID","OKTA_TEST_USER_ID"]);const user=await oktaClient.getUser(origin,userId,OKTA_CREDENTIAL_REF),roles=await oktaClient.listUserRoles(origin,userId,OKTA_CREDENTIAL_REF);
-      if(user.status!==200||roles.status!==200||!user.data||!roles.data||user.data.id!==userId)throw new Error("Okta read-only preflight failed");
-      // okta:user:lifecycle is a write capability and cannot be proved by a
+      /**
+       * Okta needs one piece of NON-SECRET configuration Nyst cannot guess:
+       * the customer's own org URL. It is not a credential, so it does not
+       * belong in the credential store, and until there is a field for it the
+       * environment variable stays — but the failure now NAMES it instead of
+       * throwing an opaque fixture error.
+       */
+      const origin=process.env.NYST_OKTA_ORG_URL??process.env.OKTA_ORG_URL;
+      if(!origin||/[\r\n\0]/.test(origin)){
+        throw Object.assign(new Error(
+          "Okta needs your organization URL (for example https://example.okta.com) before its credential can be "
+          + "checked. Set NYST_OKTA_ORG_URL. It is configuration, not a secret."),{statusCode:503});
+      }
+      const client=new OktaRestClient(only(secret),{clock,...(options.okta_transport?{transport:options.okta_transport}:{})});
+      // `/api/v1/users/me` needs no fixture user: it describes the credential.
+      const user=await client.getUser(origin,"me",ref);
+      if(user.status===401||user.status===403){
+        throw new Error(`Okta rejected this credential (${user.status}). Check that the API token is valid and not expired.`);
+      }
+      if(user.status!==200||!user.data)throw new Error(`Okta read-only preflight failed (HTTP ${user.status})`);
+      // okta:user:lifecycle is a WRITE capability and cannot be proved by a
       // read-only preflight. See the GitHub note above.
-      return {status:"ready",provider,provider_mutation_performed:false,verified_capabilities:["okta:user:read"],tenant:new URL(origin).hostname,user:{id:user.data.id,login:user.data.login,status:user.data.status,source_type:user.data.source_type,admin_role_count:roles.data.length}};
+      return {status:"ready",provider,provider_mutation_performed:false,
+        verified_capabilities:["okta:user:read"],tenant:new URL(origin).hostname,
+        user:{id:user.data.id,login:user.data.login,status:user.data.status}};
     }
-    const account=await stripeClient.getAccount(STRIPE_CREDENTIAL_REF);if(account.status!==200||!account.data)throw new Error("Stripe read-only preflight failed");
+
+    const client=new StripeRestClient(only(secret),{clock,...(options.stripe_transport?{transport:options.stripe_transport}:{})});
+    const account=await client.getAccount(ref);
+    if(account.status===401||account.status===403){
+      throw new Error(`Stripe rejected this credential (${account.status}). Check that the key is valid and not revoked.`);
+    }
+    if(account.status!==200||!account.data)throw new Error(`Stripe read-only preflight failed (HTTP ${account.status})`);
     // Reading the account proves the key authenticates. It proves nothing
     // about charge/refund/capture permissions: Stripe restricted keys publish
     // no scope list, so those capabilities stay AVAILABLE until an operator
@@ -168,7 +254,14 @@ export function createProductProviderRuntime(
   return { runtime, descriptors, commit, offboarding:new OffboardingCoordinator(store,runtime,okta,github,clock), preflight };
 }
 
-function requiredFixture(name:string):string{const value=process.env[name];if(!value||/[\r\n\0]/.test(value))throw new Error(`Required non-secret fixture configuration is unavailable: ${name}`);return value;}
-function requiredFixtureAny(names:readonly string[]):string{for(const name of names){const value=process.env[name];if(value&&!/[\r\n\0]/.test(value))return value}throw new Error(`Required non-secret fixture configuration is unavailable: ${names.join(" or ")}`);}
 
-export type ProductIntegrationPreflight = (provider: "github" | "okta" | "stripe") => Promise<Record<string, unknown>>;
+/**
+ * `secret` is THIS TENANT's resolved credential (v0.3.3).
+ *
+ * It used to be absent from the signature, so the probe had nowhere to get a
+ * credential from except a hardcoded operator environment variable — which is
+ * exactly what it did, and why no customer-supplied credential could ever be
+ * verified. Taking it as a required argument means a probe that forgets to use
+ * it does not compile.
+ */
+export type ProductIntegrationPreflight = (provider: "github" | "okta" | "stripe", secret: string) => Promise<Record<string, unknown>>;

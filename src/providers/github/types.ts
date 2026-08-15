@@ -84,6 +84,18 @@ export interface GitHubSafeHeaders {
   retry_after: string | null;
   rate_limit_remaining: string | null;
   rate_limit_reset: string | null;
+  /**
+   * `X-OAuth-Scopes` — what GitHub says this credential is allowed to do.
+   *
+   * The provider's OWN statement about the token, which is the only way a
+   * read-only preflight can learn about a WRITE capability: proving one by
+   * performing a write is exactly what invariant I20 forbids. A capability
+   * learned here is therefore AUTHORIZED, never VERIFIED.
+   *
+   * Absent for fine-grained tokens, which do not return this header. Absence
+   * means "not stated", never "not granted".
+   */
+  oauth_scopes?: string | null;
 }
 
 export interface GitHubApiResponse<T> {

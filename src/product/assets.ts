@@ -122,6 +122,19 @@ export const APP_JS = `
       return;
     }
 
+    /**
+     * Enable or disable one EffectSpec for this environment.
+     *
+     * The route existed from the beginning; nothing in the interface called it,
+     * so readiness could say "Enabled: NO" with no way to act on it.
+     */
+    if (button.dataset.effectSpec) {
+      const enable = button.dataset.enabled !== "true";
+      const result = await send(button, "PUT", "/v1/effect-specs/" + encodeURIComponent(button.dataset.effectSpec), { enabled: enable });
+      if (result) location.reload();
+      return;
+    }
+
     if (button.dataset.preflight) {
       const result = await send(button, "POST", "/v1/integrations/" + button.dataset.preflight + "/preflight", {});
       if (result) location.reload();

@@ -13,13 +13,13 @@ verified, with the reason.
 | | |
 | --- | --- |
 | Version | **0.3.3 — launch RC** |
-| Automated tests | **1155 passing, 0 failing, 0 skipped** |
+| Automated tests | **1160 passing, 0 failing, 0 skipped** |
 | Test suites | 138 |
 | Migrations | 37, applied cleanly from an empty database |
 | Runtime dependencies | 4 — `fastify`, `@fastify/cookie`, `bcryptjs`, `pg` |
 | Secret scan | No credential-shaped value in source, tests, docs, migrations, brand assets, the packed SDK tarball, or the Docker build context |
 
-Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1155**.
+Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1160**.
 
 ---
 
@@ -92,6 +92,61 @@ page **no longer renders a paste-your-token box on a deployment that cannot
 store one** — showing it meant a customer typed a real secret into a field
 whose only possible outcome was a failure. Surfaced messages are now written to
 survive the handler's 200-character truncation, with elaboration in `remedy`.
+
+### Found by deploying it, third round: the preflight ignored the credential
+
+The operator stored a real GitHub PAT. `Configured: YES`, `Credential
+available: YES`, `Preflight verified: **NO**` — permanently, with nothing they
+could do about it. The probe read:
+
+```js
+const owner = requiredFixture("NYST_GITHUB_OWNER"), …, ref = "env:NYST_GITHUB_TOKEN";
+```
+
+**It hardcoded the operator's environment variable and ignored the credential it
+was handed.** The v0.3.2 Phase 2 multi-tenancy defect, surviving in the one
+component whose entire job is verifying credentials — the third appearance of
+this shape, and the comment above it in `startProduct.ts` had rationalised it:
+*"the resolved secret handed in here is intentionally unused."*
+
+It was also the wrong **question**. It demanded three operator fixture
+variables and then required a *private* repository in which a *named* principal
+was a *direct collaborator*, throwing `GitHub fixture topology is unsupported`
+otherwise. An acceptance test for one deployment, presented as a connection
+check.
+
+The probe now asks what "is this connection working" actually means: does this
+credential authenticate, whose is it, and what does the provider say it may do.
+`GET /user` for GitHub, `/users/me` for Okta, `getAccount` for Stripe — none
+needs configuration beyond the credential. Three things enforce it:
+
+- `secret` is now a **required** parameter of `ProductIntegrationPreflight`, so
+  a probe that forgets to use it does not compile.
+- Each call runs through a throwaway client bound to that one value, so a
+  preflight cannot reach another tenant's credential or fall back to the
+  operator's.
+- A **structural test** fails the build if any probe contains
+  `ref = "env:NYST_*"` or calls `requiredFixture(`.
+
+**VERIFIED versus AUTHORIZED is preserved.** `github:user:read` was *proved* by
+performing the read. Anything derived from the `X-OAuth-Scopes` header was
+merely *stated* by GitHub, and is reported separately — a write capability can
+never be proved by a read-only probe without performing the mutation invariant
+I20 forbids. Fine-grained tokens send no scope header, and the response says
+`scope_metadata_available: false` rather than letting an empty list read as
+"this token can do nothing".
+
+Two smaller fixes in the same pass:
+
+- **`PUT /v1/effect-specs/:effect` had no control in the interface.** Readiness
+  said `Enabled: NO / Enabled EffectSpecs: none` and offered no way to change
+  it; the only route was curl. There is now an Enable button, and a test that
+  the route is called from the shipped script.
+- **A 401 was classified `credential_unavailable`.** The word-match on
+  "credential" ran before the status-code check, so "GitHub rejected this
+  credential (401)" was reported as *Nyst could not find a credential* rather
+  than *the provider looked at it and said no* — two different problems with
+  two different fixes. Status codes are now checked first.
 
 ### Honest limitations of this release
 
@@ -388,7 +443,7 @@ provider-shaped clients and fault injection.
 
 **Nyst v0.3.2 is not LAUNCH READY**, and this document will say so until it is.
 
-What is true: the architecture is complete across all three layers, 1155 tests
+What is true: the architecture is complete across all three layers, 1160 tests
 pass with nothing skipped, every known defect has a regression test that failed
 first, and every boundary above is stated rather than hidden.
 

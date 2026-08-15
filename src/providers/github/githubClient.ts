@@ -99,6 +99,27 @@ export class GitHubRestClient {
     return { ...response, data: response.status === 200 ? parseRepository(response.data) : null };
   }
 
+  /**
+   * WHO IS THIS CREDENTIAL? (v0.3.3)
+   *
+   * `GET /user` — the one GitHub call that needs NO configuration at all. It
+   * answers the only question a connection preflight should ask: does this
+   * token work, and whose is it.
+   *
+   * This exists because the preflight it replaces demanded three operator
+   * environment variables and then required a PRIVATE repository in which a
+   * NAMED principal was a DIRECT collaborator — a test fixture wearing a
+   * preflight's clothes. No customer could ever satisfy it, so no
+   * customer-supplied credential could ever reach "verified".
+   *
+   * Read-only and unambiguously so: it cannot mutate anything, which keeps
+   * invariant I20 true by construction rather than by inspection.
+   */
+  async getAuthenticatedUser(credentialRef: string): Promise<GitHubApiResponse<GitHubPrincipalIdentity>> {
+    const response = await this.request("GET", "/user", credentialRef, null);
+    return { ...response, data: response.status === 200 ? parseUser(response.data) : null };
+  }
+
   async getUser(login: string, credentialRef: string): Promise<GitHubApiResponse<GitHubPrincipalIdentity>> {
     const response = await this.request("GET", `/users/${this.login(login)}`, credentialRef, null);
     return { ...response, data: response.status === 200 ? parseUser(response.data) : null };
@@ -391,6 +412,7 @@ function safeHeaders(headers: Readonly<Record<string, string>>): GitHubSafeHeade
     retry_after: get("retry-after"),
     rate_limit_remaining: get("x-ratelimit-remaining"),
     rate_limit_reset: get("x-ratelimit-reset"),
+    oauth_scopes: get("x-oauth-scopes"),
   };
 }
 

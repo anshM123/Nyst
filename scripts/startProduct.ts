@@ -128,14 +128,25 @@ const evidenceIngest = new EvidenceIngest(pool, outcomeRepository, secrets);
 /**
  * Adapt the provider read-only preflight to the readiness probe contract.
  *
- * The provider clients resolve their own credential reference internally and
- * never return it, so the resolved secret handed in here is intentionally
- * unused. `provider_mutation_performed` is surfaced verbatim so a probe that
- * ever reported a mutation would be rejected rather than recorded (I20).
+ * THE SECRET IS THE POINT (corrected in v0.3.3).
+ *
+ * This comment used to read "the resolved secret handed in here is
+ * intentionally unused", because the clients resolved their own reference
+ * internally — and the reference they resolved was a hardcoded operator
+ * environment variable. So a customer's own credential was passed to this
+ * function and thrown away, and no customer-supplied credential could ever be
+ * verified. The rationalisation was written down and believed for two
+ * releases.
+ *
+ * The secret is now forwarded, and the probe signature requires it, so a
+ * version of this that forgets again does not compile.
+ *
+ * `provider_mutation_performed` is surfaced verbatim so a probe that ever
+ * reported a mutation would be rejected rather than recorded (I20).
  */
-const preflight = async (provider: "github" | "okta" | "stripe", _secret: string) => {
+const preflight = async (provider: "github" | "okta" | "stripe", secret: string) => {
   try {
-    const result = await product.preflight(provider) as Record<string, unknown>;
+    const result = await product.preflight(provider, secret) as Record<string, unknown>;
     // Optional fields are OMITTED rather than set to undefined: with
     // exactOptionalPropertyTypes an explicit undefined is a different thing
     // from an absent key, and the probe contract means "not observed".
@@ -455,9 +466,20 @@ function identityOf(result: Record<string, unknown>): string | undefined {
 }
 function classify(error: unknown): "credential_unavailable" | "authentication_failed" | "insufficient_permission" | "resource_missing" | "unsupported_topology" | "provider_unavailable" {
   const message = error instanceof Error ? error.message : String(error);
-  if (/unavailable: NYST_|credential/i.test(message)) return "credential_unavailable";
+  /**
+   * STATUS CODES ARE CHECKED FIRST (v0.3.3).
+   *
+   * The `credential` word-match used to come first, so "GitHub rejected this
+   * credential (401)" was classified `credential_unavailable` — "Nyst could not
+   * find a credential" — when the truth was "the provider looked at it and said
+   * no". Those send an operator to two completely different places: one is a
+   * configuration problem, the other is an expired token.
+   *
+   * A provider's own status code is the stronger evidence, so it wins.
+   */
   if (/401|unauthor|authentication/i.test(message)) return "authentication_failed";
   if (/403|permission|forbidden/i.test(message)) return "insufficient_permission";
+  if (/unavailable: NYST_|credential/i.test(message)) return "credential_unavailable";
   if (/404|not found/i.test(message)) return "resource_missing";
   if (/topology|unsupported/i.test(message)) return "unsupported_topology";
   return "provider_unavailable";

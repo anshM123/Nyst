@@ -805,12 +805,20 @@ export function integrationsPage(readiness: readonly Record<string, unknown>[], 
 
   <section class="section">
     <div class="section-head"><div><p class="eyebrow">Per environment</p><h2>EffectSpec enablement</h2></div></div>
+    <p class="lede">An EffectSpec is one kind of consequential action Nyst understands. Nothing is enabled by
+      default — an environment controls exactly what you turn on here, and readiness stays Not ready until at
+      least one is enabled for the provider.</p>
     ${specs.length ? `<div class="table-scroll"><table>
-      <thead><tr><th scope="col">EffectSpec</th><th scope="col">Version</th><th scope="col">Provider</th><th scope="col">Enabled</th><th scope="col">Status</th></tr></thead>
+      <thead><tr><th scope="col">EffectSpec</th><th scope="col">Version</th><th scope="col">Provider</th><th scope="col">Enabled</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Action</span></th></tr></thead>
       <tbody>${specs.map((spec) => `<tr>
         <td>${escape(String(spec.effect_name))}</td><td class="mono small">${escape(String(spec.spec_version))}</td>
         <td>${escape(String(spec.provider))}</td><td>${spec.enabled ? "yes" : "no"}</td>
         <td><span class="badge ${spec.ready ? "resolved" : "neutral"}">${escape(String(spec.status ?? ""))}</span></td>
+        <!-- THE CONTROL THAT WAS MISSING (v0.3.3). PUT /v1/effect-specs/:effect
+             existed from the start with nothing in the UI calling it, so the
+             only way to enable an EffectSpec was curl. Readiness said "Enabled:
+             NO / Enabled EffectSpecs: none" and offered no way to change it. -->
+        <td><button data-effect-spec="${escape(String(spec.effect_name))}" data-enabled="${spec.enabled ? "true" : "false"}">${spec.enabled ? "Disable" : "Enable"}</button></td>
       </tr>`).join("")}</tbody></table></div>` : `<div class="panel panel-pad"><p class="empty">No EffectSpecs registered.</p></div>`}
   </section>`, context);
 }
