@@ -13,13 +13,13 @@ verified, with the reason.
 | | |
 | --- | --- |
 | Version | **0.3.3 — launch RC** |
-| Automated tests | **1152 passing, 0 failing, 0 skipped** |
+| Automated tests | **1155 passing, 0 failing, 0 skipped** |
 | Test suites | 138 |
 | Migrations | 37, applied cleanly from an empty database |
 | Runtime dependencies | 4 — `fastify`, `@fastify/cookie`, `bcryptjs`, `pg` |
 | Secret scan | No credential-shaped value in source, tests, docs, migrations, brand assets, the packed SDK tarball, or the Docker build context |
 
-Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1152**.
+Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1155**.
 
 ---
 
@@ -59,6 +59,39 @@ stops resolving with no cache window, storing supersedes rather than
 accumulating, a missing key **refuses to construct** rather than storing
 plaintext, and the credential appears on **none** of 13 authenticated pages nor
 in the server log — checked against a running server, not only in unit tests.
+
+### Found by deploying it, after the first v0.3.3 commit
+
+**Every deliberate 503 in the codebase was reaching operators as
+`internal_error`.** The error handler read:
+
+```ts
+const status = candidate >= 400 && candidate < 500 ? candidate : 500;
+if (status === 500) return reply.send({ error: "internal_error" });
+```
+
+503 is not inside 400–499, so it collapsed to 500 and its message was discarded
+as if it were an unvetted stack trace — which is exactly the defect that
+handler's own comment claims to have fixed, fixed only for 4xx.
+
+It surfaced when an operator deployed without `NYST_CREDENTIAL_KEY`, pasted a
+token, and was told `internal_error` for a configuration problem they could
+have fixed in thirty seconds. The blast radius was every `statusCode: 503`
+guard: "No SecretProvider is configured", the readiness and preflight guards,
+the credential store.
+
+Fixed with an explicit allowlist of statuses Nyst sets *deliberately*. **The
+security property is unchanged and is now tested directly:** a message is
+surfaced only when Nyst chose the status; a genuine unexpected throw still
+returns nothing but a request id. There is a test that throws a message
+containing a fake SQL string and asserts it never reaches the client.
+
+Two related fixes: a 503 now answers `error: "not_configured"` rather than
+`"invalid_request"` (nothing was wrong with the request), and the Integrations
+page **no longer renders a paste-your-token box on a deployment that cannot
+store one** — showing it meant a customer typed a real secret into a field
+whose only possible outcome was a failure. Surfaced messages are now written to
+survive the handler's 200-character truncation, with elaboration in `remedy`.
 
 ### Honest limitations of this release
 
@@ -355,7 +388,7 @@ provider-shaped clients and fault injection.
 
 **Nyst v0.3.2 is not LAUNCH READY**, and this document will say so until it is.
 
-What is true: the architecture is complete across all three layers, 1152 tests
+What is true: the architecture is complete across all three layers, 1155 tests
 pass with nothing skipped, every known defect has a regression test that failed
 first, and every boundary above is stated rather than hidden.
 

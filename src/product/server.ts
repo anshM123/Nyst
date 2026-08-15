@@ -209,7 +209,32 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.setErrorHandler((error: unknown, request, reply) => {
     options.metrics?.increment("provider_or_request_errors");
     const candidate = error && typeof error === "object" && "statusCode" in error ? Number((error as { statusCode?: unknown }).statusCode) : 500;
-    const status = candidate >= 400 && candidate < 500 ? candidate : 500;
+    /**
+     * 503 IS A DELIBERATE REFUSAL, NOT AN UNEXPECTED FAILURE (v0.3.3).
+     *
+     * This read `candidate >= 400 && candidate < 500 ? candidate : 500`, so
+     * every `throw Object.assign(new Error(...), { statusCode: 503 })` in the
+     * codebase collapsed to `internal_error` and its message was discarded as
+     * if it were an unvetted stack trace.
+     *
+     * FOUND ON THE DEPLOYED SITE: an operator without NYST_CREDENTIAL_KEY
+     * pasted a token and was told "internal_error" for a configuration problem
+     * they could have fixed in thirty seconds. The same was true of every
+     * "no SecretProvider is configured" guard in readiness and preflight.
+     *
+     * That is precisely the defect the comment above claims to have fixed, and
+     * it was fixed only for 4xx. A 503 in this codebase always means "Nyst is
+     * not set up to do this and here is what is missing" — it is chosen, not
+     * caught, so it carries its reason.
+     *
+     * The security property is unchanged. A message is surfaced only when NYST
+     * SET THE STATUS ITSELF. An unexpected throw has no statusCode, lands on
+     * 500, and still says nothing beyond a request id.
+     */
+    const DELIBERATE_SERVER_STATUSES = new Set([503]);
+    const status = (candidate >= 400 && candidate < 500) || DELIBERATE_SERVER_STATUSES.has(candidate)
+      ? candidate
+      : 500;
     if (status === 500) return reply.code(500).send({ error: "internal_error", request_id: request.id });
     const message = error instanceof Error ? error.message.replace(/[\r\n]+/g, " ").slice(0, 200) : "";
     /**
@@ -224,7 +249,9 @@ export async function buildProductServer(options: ProductServerOptions): Promise
      */
     const detail = error as { nyst_blocked_by?: unknown; nyst_remedy?: unknown; nyst_disposition?: unknown };
     reply.code(status).send({
-      error: "invalid_request",
+      // "invalid_request" is a lie about a 503: nothing is wrong with the
+      // request, the deployment is missing configuration.
+      error: status === 503 ? "not_configured" : "invalid_request",
       ...(message ? { detail: message } : {}),
       ...(typeof detail.nyst_blocked_by === "string" ? { blocked_by: detail.nyst_blocked_by } : {}),
       ...(typeof detail.nyst_remedy === "string" ? { remedy: detail.nyst_remedy } : {}),
@@ -708,7 +735,7 @@ export async function buildProductServer(options: ProductServerOptions): Promise
         : null;
       return { ...item, credential_fingerprint: stored?.fingerprint ?? null };
     }));
-    return integrationsPage(withCredentials as unknown as Record<string, unknown>[], await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true, secretsFor(principal) ?? null), await pageContext(principal));
+    return integrationsPage(withCredentials as unknown as Record<string, unknown>[], await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true, secretsFor(principal) ?? null), await pageContext(principal), Boolean(options.tenant_credentials));
   }, options.repository));
   /* ---------------- OUTCOMES (Phases 18-32) ---------------- */
 
@@ -1423,12 +1450,21 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     const provider = assertProvider(String((request.params as { provider?: unknown }).provider ?? ""));
     const store = options.tenant_credentials;
     if (!store) {
+      // WRITTEN TO SURVIVE TRUNCATION. The error handler caps a surfaced
+      // message at 200 characters, so the reason and the variable name come
+      // first and the elaboration goes in `nyst_remedy`. A message whose most
+      // important sentence is at the end arrives as half a sentence.
       throw Object.assign(
         new Error(
-          "This deployment cannot accept customer-supplied credentials because no credential encryption "
-          + "key is configured. Set NYST_CREDENTIAL_KEY, or configure this integration with a secrets-manager "
-          + "reference instead. Nyst will not store a credential it cannot encrypt."),
-        { statusCode: 503 });
+          "No credential encryption key is configured, so Nyst refuses rather than storing your token as "
+          + "plaintext. Set NYST_CREDENTIAL_KEY to 32 random bytes, base64-encoded."),
+        {
+          statusCode: 503,
+          nyst_blocked_by: "deployment_configuration",
+          nyst_remedy:
+            "Run `openssl rand -base64 32`, set it as NYST_CREDENTIAL_KEY, and restart. Alternatively "
+            + "configure this integration with an operator-managed reference such as env:NAME or vault:path.",
+        });
     }
     const raw = object(request.body).credential;
     if (typeof raw !== "string") {

@@ -488,6 +488,101 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
     assert.throws(() => new TenantCredentialStore(pool, Buffer.alloc(8).toString("base64")), /32 bytes|too short/i);
   });
 
+  /**
+   * FOUND ON THE DEPLOYED SITE, and it is not a credential bug.
+   *
+   * The operator set up Render without NYST_CREDENTIAL_KEY, pasted a token, and
+   * got `internal_error`. The route did exactly the right thing — it threw 503
+   * with a paragraph naming the missing variable. The ERROR HANDLER threw that
+   * paragraph away:
+   *
+   *     const status = candidate >= 400 && candidate < 500 ? candidate : 500;
+   *     if (status === 500) return reply.send({ error: "internal_error" });
+   *
+   * 503 is not inside 400..499, so it collapsed to 500 and the message was
+   * discarded as if it were an unvetted stack trace.
+   *
+   * THE BLAST RADIUS IS EVERY 503 IN THE CODEBASE. "No SecretProvider is
+   * configured", "No credential store is configured", every readiness and
+   * preflight guard — all of them have been reaching operators as
+   * `internal_error`, which is both alarming and useless. That is the exact
+   * defect the handler's own comment claims to have fixed for 4xx.
+   *
+   * The security property is unchanged: a message is surfaced only when NYST
+   * set the status deliberately. An unexpected throw still says nothing.
+   */
+  it("THE DEFECT: a deliberate 503 keeps its message instead of becoming internal_error", async () => {
+    // A server built WITHOUT a credential store: exactly the deployed setup.
+    const bare = await buildProductServer({
+      repository, authority: new AuthorityRepository(pool), entitlements,
+      effect_specs: [], production: false,
+    } as never);
+    try {
+      const login = await bare.inject({
+        method: "POST", url: "/v1/auth/login", headers: { "content-type": "application/json" },
+        payload: { organization: `wf-${suffix}`, email: `wf-${suffix}@test.test`, password: PASSWORD },
+      });
+      const bareCookie = String(login.headers["set-cookie"] ?? "").split(";")[0]!;
+      const bareCsrf = String((login.json() as { csrf?: unknown }).csrf ?? "");
+
+      const response = await bare.inject({
+        method: "POST", url: "/v1/integrations/github/credential",
+        headers: { cookie: bareCookie, "x-nyst-csrf": bareCsrf, "content-type": "application/json" },
+        payload: { credential: FIXTURE_GITHUB },
+      });
+      assert.equal(response.statusCode, 503,
+        `A DELIBERATE 503 WAS COLLAPSED TO ${response.statusCode}. The operator is told "internal_error" `
+        + "for a configuration problem they could fix in thirty seconds.");
+      const body = response.json() as { error?: string; detail?: string };
+      assert.notEqual(body.error, "internal_error");
+      assert.match(String(body.detail), /NYST_CREDENTIAL_KEY/,
+        "the refusal does not name the variable that is missing, so it is not actionable");
+      assert.match(String(body.detail), /plaintext/i,
+        "the refusal does not say WHY it refuses rather than degrading");
+    } finally { await bare.close(); }
+  });
+
+  it("an UNEXPECTED failure still says nothing beyond a request id", async () => {
+    // The security property the collapse existed to protect. Only statuses NYST
+    // sets deliberately may carry a message; a genuine 500 must not.
+    const leaky = await buildProductServer({
+      repository, authority: new AuthorityRepository(pool), entitlements,
+      effect_specs: [], production: false,
+    } as never);
+    leaky.get("/v1/__boom", async () => { throw new Error("SELECT secret FROM internals -- do not leak me"); });
+    await leaky.ready();
+    try {
+      const response = await leaky.inject({ method: "GET", url: "/v1/__boom", headers: { cookie } });
+      assert.equal(response.statusCode, 500);
+      assert.doesNotMatch(response.body, /do not leak me/, "AN UNEXPECTED ERROR LEAKED ITS MESSAGE");
+      assert.equal((response.json() as { error?: string }).error, "internal_error");
+    } finally { await leaky.close(); }
+  });
+
+  it("a deployment that cannot hold credentials does not offer a box to paste one into", async () => {
+    // Showing the form anyway is worse than useless: the customer types a REAL
+    // secret into a field whose only possible outcome is a failure.
+    const bare = await buildProductServer({
+      repository, authority: new AuthorityRepository(pool), entitlements,
+      effect_specs: [], production: false, secrets: { async resolve() { throw new Error("none"); } },
+    } as never);
+    try {
+      const login = await bare.inject({
+        method: "POST", url: "/v1/auth/login", headers: { "content-type": "application/json" },
+        payload: { organization: `wf-${suffix}`, email: `wf-${suffix}@test.test`, password: PASSWORD },
+      });
+      const page = await bare.inject({
+        method: "GET", url: "/integrations",
+        headers: { cookie: String(login.headers["set-cookie"] ?? "").split(";")[0]! },
+      });
+      assert.equal(page.statusCode, 200);
+      assert.doesNotMatch(page.body, /data-connect-provider/,
+        "A PASTE-YOUR-TOKEN FORM IS SHOWN ON A DEPLOYMENT THAT CANNOT STORE ONE");
+      assert.match(page.body, /NYST_CREDENTIAL_KEY/,
+        "the page does not say why connecting is unavailable, so nobody can fix it");
+    } finally { await bare.close(); }
+  });
+
   it("connecting requires CSRF, like every other state-changing request", async () => {
     const response = await app.inject({
       method: "POST", url: "/v1/integrations/github/credential",

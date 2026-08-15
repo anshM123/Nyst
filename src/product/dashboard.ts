@@ -776,7 +776,7 @@ export function failureLabPage(runs: readonly Record<string, unknown>[], control
 
 /* ----------------------------------------------------------- integrations */
 
-export function integrationsPage(readiness: readonly Record<string, unknown>[], specs: readonly Record<string, unknown>[], context: ShellContext = {}): string {
+export function integrationsPage(readiness: readonly Record<string, unknown>[], specs: readonly Record<string, unknown>[], context: ShellContext = {}, canStoreCredentials = true): string {
   return shell("Integrations", "/integrations", `
   <div class="page-head">
     <p class="eyebrow">Connection readiness</p>
@@ -797,7 +797,7 @@ export function integrationsPage(readiness: readonly Record<string, unknown>[], 
       ${dimension("Capabilities sufficient", item.capabilities_sufficient === true, ((item.missing_capabilities as string[]) ?? []).length ? `Not granted: ${((item.missing_capabilities as string[]) ?? []).join(", ")}` : "Every capability the enabled EffectSpecs require was observed as granted.")}
     </ul>
     ${capabilityBlock(item)}
-    ${connectForm(item)}
+    ${connectForm(item, canStoreCredentials)}
     <div class="button-row gap-l">
       <button data-preflight="${escape(String(item.provider))}">Run read-only preflight</button>
     </div>
@@ -909,7 +909,7 @@ function promotionPanel(promotion: Record<string, unknown> | null): string {
  *  - It never renders the credential, and it names the reference — a reference
  *    is a NAME, and the operator needs to see which one is configured.
  */
-function connectForm(item: Record<string, unknown>): string {
+function connectForm(item: Record<string, unknown>, canStoreCredentials = true): string {
   const provider = String(item.provider);
   const guidance: Readonly<Record<string, { label: string; hint: string; scopes: string }>> = {
     github: {
@@ -930,6 +930,25 @@ function connectForm(item: Record<string, unknown>): string {
   };
   const help = guidance[provider];
   if (!help) return "";
+
+  /**
+   * NO KEY, NO BOX.
+   *
+   * Rendering the form anyway is worse than rendering nothing: the customer
+   * types a REAL credential into a field whose only possible outcome is a
+   * failure, and the secret has already been in a DOM node by the time they
+   * find out. Say what is missing instead.
+   */
+  if (!canStoreCredentials) {
+    return `<div class="panel panel-pad gap-l note-strong">
+      <p><strong>This deployment cannot accept customer-supplied credentials.</strong>
+      No credential encryption key is configured, and Nyst will not store a credential it cannot encrypt.</p>
+      <p class="small gap-m">The operator sets <span class="mono">NYST_CREDENTIAL_KEY</span> to 32 random bytes,
+      base64-encoded (<span class="mono">openssl rand -base64 32</span>) and restarts. Until then this provider
+      can only be configured with an operator-managed reference such as
+      <span class="mono">env:NYST_${escape(provider.toUpperCase())}_TOKEN</span>.</p>
+    </div>`;
+  }
   const fingerprint = typeof item.credential_fingerprint === "string" ? item.credential_fingerprint : null;
   const reference = typeof item.credential_ref === "string" ? item.credential_ref : null;
 
