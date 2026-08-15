@@ -250,6 +250,21 @@ export class ProductRepository {
     return { kind: "session", user_id: String(row.user_id), api_key_id: null, agent_id: null, organization_id: String(row.organization_id), project_id: String(row.project_id), environment_id: String(row.environment_id), scopes: ["*"], csrf_hash: String(row.csrf_hash) };
   }
 
+  async refreshSessionCsrf(session: string): Promise<string | null> {
+    if (!/^[A-Za-z0-9_-]{40,100}$/.test(session)) return null;
+    const csrf = randomBytes(24).toString("base64url");
+    const result = await this.db.query(
+      `UPDATE nyst_sessions s SET csrf_hash=$2,last_seen_at=now()
+       FROM nyst_users u
+       WHERE s.session_hash=$1 AND s.user_id=u.user_id
+         AND s.organization_id=u.organization_id AND s.expires_at>now()
+         AND u.disabled_at IS NULL
+       RETURNING s.session_hash`,
+      [digest(session), digest(csrf)],
+    );
+    return result.rows.length === 1 ? csrf : null;
+  }
+
   async deleteSession(session: string): Promise<void> { if (/^[A-Za-z0-9_-]{40,100}$/.test(session)) await this.db.query(`DELETE FROM nyst_sessions WHERE session_hash=$1`, [digest(session)]); }
 
   async context(scope: TenantScope): Promise<ProductContext> {
