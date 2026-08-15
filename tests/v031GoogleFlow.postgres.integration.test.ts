@@ -20,6 +20,7 @@ import { after, before, describe, it } from "node:test";
 import { Ed25519Signer } from "../src/core/signing.js";
 import { ProductRepository, type ProductDb } from "../src/product/productRepository.js";
 import { FederatedRepository } from "../src/product/auth/federatedRepository.js";
+import { GoogleSignupService } from "../src/product/auth/googleSignup.js";
 import { GoogleAuth, JwksCache, googleConfigFromEnv, type GoogleTransport } from "../src/product/auth/googleAuth.js";
 import { buildProductServer } from "../src/product/server.js";
 import { createProductProviderRuntime } from "../src/product/providerRuntimeFactory.js";
@@ -106,6 +107,7 @@ describe("Nyst v0.3.1 issue 3 — Google Sign-In through the real routes", { ski
     app = await buildProductServer({
       repository, effect_specs: product.descriptors, production: false, signer,
       google, federated,
+      google_signup: new GoogleSignupService(pool),
     });
   });
   after(async () => { await app.close(); await store.close(); await pool.end(); });
@@ -270,12 +272,30 @@ describe("Nyst v0.3.1 issue 3 — Google Sign-In through the real routes", { ski
       "a session was minted despite the refusal");
   });
 
-  it("NO ACCOUNT: an unknown Google identity is not silently given a workspace", async () => {
+  it("NO ACCOUNT: an unknown Google identity is not SILENTLY given a workspace", async () => {
+    /**
+     * CHANGED IN v0.3.2 (Phase 5). This used to assert a 404 saying "Nyst does
+     * not create an account automatically". The invariant was right and the
+     * behaviour was a dead end: someone who clicked Continue with Google on the
+     * SIGNUP page was told to go and sign up.
+     *
+     * The invariant still holds exactly as written -- nothing is created here.
+     * What changed is that the person is now sent to a form asking for the one
+     * thing a Google profile cannot supply: what to call the workspace.
+     */
     const state = await start();
     nextToken = () => mintToken({ nonce: nonceFor(state), sub: `sub-stranger-${suffix}`, email: `stranger-${suffix}@nowhere.test` });
     const response = await callback(state);
-    assert.equal(response.statusCode, 404);
-    assert.match(response.body, /does not create an account automatically/);
+
+    assert.equal(response.statusCode, 302);
+    assert.match(String(response.headers.location), /^\/signup\/google\?handoff=/,
+      "an unknown Google identity was not offered a way to create a workspace");
+    // NOTHING was created, and no session was minted.
+    assert.doesNotMatch(String(response.headers["set-cookie"] ?? ""), /nyst_session/,
+      "AN UNKNOWN GOOGLE IDENTITY WAS SILENTLY SIGNED IN");
+    const users = (await pool.query(
+      `SELECT 1 FROM nyst_users WHERE email=$1`, [`stranger-${suffix}@nowhere.test`])).rows;
+    assert.equal(users.length, 0, "AN UNKNOWN GOOGLE IDENTITY WAS SILENTLY GIVEN A WORKSPACE");
   });
 
   it("EXPLICIT LINK: an authenticated person connects Google, and it binds to their account", async () => {

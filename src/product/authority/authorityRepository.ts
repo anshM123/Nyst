@@ -75,6 +75,9 @@ export interface GrantValidation {
   reason: string | null;
 }
 
+/** Shape check before a database round trip. Not a security boundary. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export class AuthorityRepository {
   constructor(private readonly db: ProductDb) {}
 
@@ -241,10 +244,37 @@ export class AuthorityRepository {
     if (!instance) throw Object.assign(new Error("Unknown OutcomeInstance"), { statusCode: 404 });
 
     const verdict = String(instance.verdict) as OutcomeVerdict;
-    if (verdict !== "satisfied" && !input.exception_id) {
-      throw Object.assign(new Error(
-        `The outcome is ${verdict.toUpperCase()}. A ContinuationGrant on a non-satisfied outcome requires an explicit, attributed human exception.`,
-      ), { statusCode: 409 });
+    if (verdict !== "satisfied") {
+      /**
+       * THE EXCEPTION MUST BE REAL (v0.3.2 Phase 3).
+       *
+       * This used to be `!input.exception_id` and nothing else. Any UUID
+       * satisfied it -- randomUUID(), one belonging to another organization,
+       * one that expired yesterday, one that was revoked an hour ago, one
+       * authorizing something entirely different.
+       *
+       * The result was worse than an unchecked action. Nyst SIGNED a statement
+       * saying a named human authorized continuing past an outcome that is not
+       * satisfied, when no such authorization existed. An unchecked action is a
+       * gap; this manufactured false attribution to a person.
+       *
+       * So every dimension is checked, in the database, against the exception
+       * actually named -- and the reasons are specific, because the operator
+       * reading them is trying to work out which approval they should have
+       * obtained.
+       */
+      if (!input.exception_id) {
+        throw Object.assign(new Error(
+          `The outcome is ${verdict.toUpperCase()}. A ContinuationGrant on a non-satisfied outcome requires an explicit, attributed human exception.`,
+        ), { statusCode: 409 });
+      }
+      const problem = await this.exceptionCannotAuthorize(scope, input.exception_id, {
+        agent_id: input.agent_id ?? null,
+        effect_names: input.permitted_effects,
+        outcome_instance_id: input.outcome_instance_id,
+        verdict,
+      });
+      if (problem) throw Object.assign(new Error(problem), { statusCode: 409 });
     }
 
     const facts = (await this.db.query(
@@ -337,7 +367,88 @@ export class AuthorityRepository {
     if (!resources.includes(request.resource_ref)) {
       return no(`This grant covers ${resources.join(", ")}, and this consequence targets ${request.resource_ref}.`);
     }
+
+    /**
+     * THE EXCEPTION BEHIND THE GRANT MUST STILL BE LIVE (v0.3.2 Phase 3).
+     *
+     * A grant proves what Nyst ISSUED. It does not prove the authorization is
+     * still current. If the human who approved this withdraws the approval
+     * before the grant is consumed, the grant must stop authorizing -- signed
+     * once is not valid forever.
+     *
+     * The signature stays valid, and that is correct: revocation withdraws
+     * permission, it does not rewrite the historical record of what was issued.
+     */
+    if (row.exception_id) {
+      const problem = await this.exceptionCannotAuthorize(scope, String(row.exception_id), {
+        agent_id: request.agent_id,
+        effect_names: [request.effect_name],
+        outcome_instance_id: request.outcome_instance_id,
+        verdict: String(row.verdict) as OutcomeVerdict,
+      });
+      if (problem) return no(problem);
+    }
+
     return { valid: true, grant_id: grantId, reason: null };
+  }
+
+  /**
+   * Why this exception cannot authorize this continuation, or null if it can.
+   *
+   * Returns a SENTENCE rather than a boolean, because every caller shows it to
+   * an operator who is trying to work out which approval they actually need.
+   * "Invalid exception" would be true and useless.
+   *
+   * Checked in the database rather than in memory: the exception's scope
+   * columns are nullable-means-unscoped, and reproducing that logic here in
+   * JavaScript would be a second implementation of the matching rules that
+   * `liveExceptions` already owns.
+   */
+  private async exceptionCannotAuthorize(scope: TenantScope, exceptionId: string, request: {
+    agent_id: string | null;
+    effect_names: readonly string[];
+    outcome_instance_id: string;
+    verdict: OutcomeVerdict;
+  }): Promise<string | null> {
+    if (!UUID_PATTERN.test(exceptionId)) return "That exception reference is not a valid identifier.";
+
+    const row = (await this.db.query(
+      `SELECT exception_id,agent_id,effect_name,outcome_instance_id,authorizes,revoked_at,expires_at
+       FROM nyst_authority_exceptions
+       WHERE exception_id=$1 AND organization_id=$2 AND project_id=$3 AND environment_id=$4`,
+      [exceptionId, scope.organization_id, scope.project_id, scope.environment_id])).rows[0];
+
+    // Absent, or belonging to another tenant. Deliberately the same answer:
+    // distinguishing them would confirm that an exception exists elsewhere.
+    if (!row) return "No live human exception in this environment matches that reference.";
+    if (row.revoked_at) return "The human exception behind this grant has been revoked.";
+    if (new Date(String(row.expires_at)).getTime() <= Date.now()) {
+      return "The human exception behind this grant has expired.";
+    }
+
+    // `authorizes` is a closed set, and the values are not interchangeable. An
+    // approval to exceed an amount threshold is not an approval to continue
+    // past an unestablished outcome, and treating them as equivalent is how a
+    // narrow approval silently becomes a broad one.
+    const required = request.verdict === "indeterminate"
+      ? "continuation_despite_indeterminate_outcome"
+      : "continuation_despite_unsatisfied_outcome";
+    if (String(row.authorizes) !== required) {
+      return `That exception authorizes ${String(row.authorizes)}, not ${required}.`;
+    }
+
+    // Nullable scope columns mean "unscoped, so it applies". A NON-null column
+    // must match exactly.
+    if (row.agent_id !== null && String(row.agent_id) !== request.agent_id) {
+      return "That exception was granted for a different Agent.";
+    }
+    if (row.outcome_instance_id !== null && String(row.outcome_instance_id) !== request.outcome_instance_id) {
+      return "That exception was granted for a different outcome.";
+    }
+    if (row.effect_name !== null && !request.effect_names.includes(String(row.effect_name))) {
+      return `That exception covers ${String(row.effect_name)}, which this grant does not permit.`;
+    }
+    return null;
   }
 
   /** Consume a grant. One grant permits one consequence. */

@@ -8,6 +8,9 @@ import { GitHubRepositoryPermissionProvider } from "../providers/github/githubPr
 import { GitHubRepositoryPermissionService } from "../providers/github/githubService.js";
 import { createGitHubRepositoryPermissionSpec } from "../providers/github/githubSpec.js";
 import { EnvironmentGitHubCredentialSource, GITHUB_EFFECT_NAME, GITHUB_SPEC_VERSION, type GitHubCredentialSource, type GitHubTransport } from "../providers/github/types.js";
+import { scopedCredentialSource } from "./scopedCredentials.js";
+import type { SecretProvider } from "./secretProvider.js";
+import { requireTestStripeKey } from "../providers/stripe/types.js";
 import { OktaRestClient } from "../providers/okta/oktaClient.js";
 import { OktaUserSuspensionProvider } from "../providers/okta/oktaProvider.js";
 import { OktaUserSuspensionService } from "../providers/okta/oktaService.js";
@@ -36,6 +39,14 @@ export const REAL_PRODUCT_EFFECT_SPECS: readonly EffectSpecDescriptor[] = [
 export interface ProductProviderFactoryOptions {
   production: boolean;
   enable_development_fake?: boolean;
+  /**
+   * Resolves a tenant's own credential reference (v0.3.2 Phase 2).
+   *
+   * Supplied, every provider call resolves whatever reference that
+   * environment's IntegrationConnection recorded. Absent, the runtime falls
+   * back to the single-tenant environment sources.
+   */
+  secrets?: SecretProvider;
   github_transport?: GitHubTransport;
   okta_transport?: OktaTransport;
   stripe_transport?: StripeTransport;
@@ -61,9 +72,28 @@ export function createProductProviderRuntime(
   const captureSpec = createStripePaymentCaptureSpec();
   for (const spec of [githubSpec, oktaSpec, refundSpec, captureSpec]) registry.register(spec);
 
-  const githubClient = new GitHubRestClient(options.github_credentials ?? new EnvironmentGitHubCredentialSource(), { clock, ...(options.github_transport ? { transport: options.github_transport } : {}) });
-  const oktaClient = new OktaRestClient(options.okta_credentials ?? new EnvironmentOktaCredentialSource(), { clock, ...(options.okta_transport ? { transport: options.okta_transport } : {}) });
-  const stripeClient = new StripeRestClient(options.stripe_credentials ?? new EnvironmentStripeCredentialSource(), { clock, ...(options.stripe_transport ? { transport: options.stripe_transport } : {}) });
+  /**
+   * CREDENTIAL SOURCES ARE NOW TENANT-AGNOSTIC AND STATELESS (v0.3.2 Phase 2).
+   *
+   * Each Environment*CredentialSource resolved exactly one hardcoded variable
+   * and refused every other reference, which meant every customer on the
+   * deployment shared one provider credential.
+   *
+   * `scopedCredentialSource` resolves whatever reference the tenant's own
+   * IntegrationConnection recorded, through the SecretProvider. It holds no
+   * state and caches nothing, so no instance can carry one tenant's secret into
+   * another tenant's request -- and a rotated or revoked credential stops
+   * working immediately rather than at the end of some cache TTL.
+   *
+   * The Environment* sources remain the fallback for a deployment that supplies
+   * no SecretProvider, which is the single-tenant local case.
+   */
+  const scoped = (provider: string, validate?: (value: string) => void) =>
+    options.secrets ? scopedCredentialSource(options.secrets, provider, validate) : undefined;
+
+  const githubClient = new GitHubRestClient(options.github_credentials ?? scoped("github") ?? new EnvironmentGitHubCredentialSource(), { clock, ...(options.github_transport ? { transport: options.github_transport } : {}) });
+  const oktaClient = new OktaRestClient(options.okta_credentials ?? scoped("okta") ?? new EnvironmentOktaCredentialSource(), { clock, ...(options.okta_transport ? { transport: options.okta_transport } : {}) });
+  const stripeClient = new StripeRestClient(options.stripe_credentials ?? scoped("stripe", requireTestStripeKey) ?? new EnvironmentStripeCredentialSource(), { clock, ...(options.stripe_transport ? { transport: options.stripe_transport } : {}) });
   const providers: ProviderAdapter[] = [
     new GitHubRepositoryPermissionProvider(githubClient, clock),
     new OktaUserSuspensionProvider(oktaClient, clock),

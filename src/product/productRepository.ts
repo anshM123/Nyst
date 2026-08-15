@@ -25,10 +25,29 @@ export interface ProductDb {
 
 const SESSION_HOURS = 12;
 const ALLOWED_API_SCOPES = new Set(["actions:read", "actions:write", "receipts:read", "integrations:read"]);
+/**
+ * The CONVENTIONAL reference per provider (v0.3.2 Phase 2).
+ *
+ * A default for a single-tenant deployment and for `.env.example`. It is no
+ * longer a requirement: enforcing it made every environment share one
+ * credential, which is the definition of a single-tenant architecture.
+ */
 const EXPECTED_PROVIDER_REFS: Readonly<Record<string, string>> = { github: "env:NYST_GITHUB_TOKEN", okta: "env:NYST_OKTA_ACCESS_TOKEN", stripe: "env:NYST_STRIPE_CREDENTIAL" };
+void EXPECTED_PROVIDER_REFS;
 
 export class ProductRepository {
   constructor(private readonly db: ProductDb) {}
+
+  /**
+   * The connection this repository writes through.
+   *
+   * Exposed for ONE reason: so `buildProductServer` can construct the Authority
+   * layer itself rather than accepting it as an option a deployment might
+   * forget to pass. Until v0.3.2 `authority` was optional, and a server built
+   * without it dispatched consequences with no Autonomy Line check at all --
+   * the defect this accessor exists to make structurally impossible.
+   */
+  get database(): ProductDb { return this.db; }
   async health():Promise<void>{await this.db.query("SELECT 1")}
 
   /**
@@ -95,19 +114,114 @@ export class ProductRepository {
    * Callers now say which they mean. Omitting it keeps the historical
    * behaviour for existing bootstrap callers.
    */
-  async createBootstrap(input: { organization: string; organization_slug: string; project: string; project_slug: string; environment: string; environment_slug: string; email: string; display_name: string; password: string; mode?: EnvironmentMode }): Promise<TenantScope & { user_id: string }> {
+  /**
+   * Create a workspace. ALL OF IT, OR NONE OF IT (v0.3.2 Phase 4).
+   *
+   * This used to be three separate statements on the pool: the organization /
+   * project / environment / user CTE, then the policy, then the default
+   * Autonomy Line rule. A failure after the first one -- a constraint, a
+   * dropped connection, a restart -- left a real organization with a real user
+   * who could sign in to a workspace with NO POLICY and NO AUTONOMY LINE.
+   *
+   * That is the worst shape a partial failure can take here, because it is
+   * invisible. The person gets an account, signs in, and the missing pieces
+   * only surface later as behaviour nobody can explain.
+   *
+   * One transaction now. Either the whole workspace exists or the signup failed
+   * and the caller can say so truthfully: nothing was created.
+   *
+   * A pool is required, because a transaction needs one connection held across
+   * statements. Without one this REFUSES rather than degrading to the old
+   * non-atomic behaviour -- silently writing a half-workspace is exactly what
+   * this exists to stop.
+   */
+  async createBootstrap(input: { organization: string; organization_slug: string; project: string; project_slug: string; environment: string; environment_slug: string; email: string; display_name: string; password: string; mode?: EnvironmentMode; initial_agent?: { name: string; slug: string; owner: string; description?: string; framework?: string; tags?: readonly string[] }; federated_identity?: { provider: "google" | "oidc"; provider_subject: string; email_at_link: string; email_verified_at_link: boolean; provider_config_id?: string | null } }): Promise<TenantScope & { user_id: string }> {
     const organizationId = randomUUID(); const projectId = randomUUID(); const environmentId = randomUUID(); const userId = randomUUID();
     const email = normalizedEmail(input.email); const passwordHash = await hash(input.password, 12);
-    await this.db.query(`WITH organization AS (
-      INSERT INTO nyst_organizations(organization_id,slug,name) VALUES($1,$5,$6) RETURNING organization_id
-    ), project AS (
-      INSERT INTO nyst_projects(project_id,organization_id,slug,name) SELECT $2,organization_id,$7,$8 FROM organization RETURNING project_id,organization_id
-    ), environment AS (
-      INSERT INTO nyst_environments(environment_id,project_id,organization_id,slug,name,mode) SELECT $3,project_id,organization_id,$9,$10,$14 FROM project
-    ) INSERT INTO nyst_users(user_id,organization_id,email,display_name,password_hash) SELECT $4,organization_id,$11,$12,$13 FROM organization`,
-      [organizationId, projectId, environmentId, userId, slug(input.organization_slug), bounded(input.organization, 120, "organization"), slug(input.project_slug), bounded(input.project, 120, "project"), slug(input.environment_slug), bounded(input.environment, 120, "environment"), email, bounded(input.display_name, 120, "display name"), passwordHash, input.mode ?? "enforced"]);
-    await this.db.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by)
-      VALUES($1,$2,$3,$4,NULL,1,'automatic','never',false,false,300,$5)`, [randomUUID(), environmentId, projectId, organizationId, userId]);
+
+    const pool = this.db as ProductDb & { connect?: () => Promise<ProductDb & { release(): void }> };
+    if (typeof pool.connect !== "function") {
+      throw new Error(
+        "Creating a workspace requires a connection pool that can open a transaction. " +
+        "A workspace is created whole or not at all, and a half-created one lets someone sign in " +
+        "to an environment with no policy and no Autonomy Line.");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      await client.query(`WITH organization AS (
+        INSERT INTO nyst_organizations(organization_id,slug,name) VALUES($1,$5,$6) RETURNING organization_id
+      ), project AS (
+        INSERT INTO nyst_projects(project_id,organization_id,slug,name) SELECT $2,organization_id,$7,$8 FROM organization RETURNING project_id,organization_id
+      ), environment AS (
+        INSERT INTO nyst_environments(environment_id,project_id,organization_id,slug,name,mode) SELECT $3,project_id,organization_id,$9,$10,$14 FROM project
+      ) INSERT INTO nyst_users(user_id,organization_id,email,display_name,password_hash) SELECT $4,organization_id,$11,$12,$13 FROM organization`,
+        [organizationId, projectId, environmentId, userId, slug(input.organization_slug), bounded(input.organization, 120, "organization"), slug(input.project_slug), bounded(input.project, 120, "project"), slug(input.environment_slug), bounded(input.environment, 120, "environment"), email, bounded(input.display_name, 120, "display name"), passwordHash, input.mode ?? "enforced"]);
+
+      await client.query(`INSERT INTO nyst_policy_versions(policy_version_id,environment_id,project_id,organization_id,effect_name,version,execution_mode,retry_mode,auto_continuation,auto_compensation,reconcile_timeout_seconds,created_by)
+        VALUES($1,$2,$3,$4,NULL,1,'automatic','never',false,false,300,$5)`, [randomUUID(), environmentId, projectId, organizationId, userId]);
+
+      /**
+       * THE DEFAULT AUTONOMY LINE RULE (v0.3.2 Phase 1).
+       *
+       * Once the Authority layer actually gates consequences, a workspace with
+       * no Autonomy Line rule can dispatch nothing at all — correctly, because
+       * "an undescribed Agent has no autonomy". But a brand-new workspace whose
+       * first action is refused with no way to discover why is not a usable
+       * product, so the bootstrap DESCRIBES a starting posture rather than
+       * leaving it absent.
+       *
+       * That distinction is the whole point. This is not "no rule, therefore
+       * anything goes". It is an explicit rule, visible on the Autonomy Line
+       * page, carrying a rationale the customer can read and tighten.
+       *
+       * `requires_reversible` is the conservative half. A reversible effect may
+       * proceed; anything IRREVERSIBLE still finds no applicable rule and falls
+       * through to "Nyst asks a person". Irreversible is where being wrong is
+       * permanent, so it is what stays with a human by default.
+       *
+       * HONEST TRADE-OFF: a stricter product would default to `human` and make
+       * every first action wait for approval. That is defensible and safer.
+       * This chooses usable-by-default for reversible effects, and the choice is
+       * stated here rather than buried in a migration.
+       */
+      await client.query(`INSERT INTO nyst_autonomy_rules(autonomy_rule_id,organization_id,project_id,environment_id,
+          requires_reversible,requires_no_open_incident,disposition,rationale,created_by)
+        VALUES($1,$2,$3,$4,true,true,'autonomous',$5,$6)`,
+        [randomUUID(), organizationId, projectId, environmentId,
+          "Default starting posture created with this workspace: an Agent may act autonomously on REVERSIBLE "
+          + "effects while no incident is open. Irreversible effects still ask a person. Tighten or replace this "
+          + "rule on the Autonomy Line page once you know what your Agents actually do.",
+          userId]);
+
+      if (input.initial_agent) {
+        const agent = input.initial_agent;
+        const tags = (agent.tags ?? []).slice(0, 12).map((tag) => bounded(tag, 40, "agent tag"));
+        await client.query(`INSERT INTO nyst_agents(agent_id,organization_id,project_id,environment_id,slug,name,owner,description,framework,tags,created_by)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [randomUUID(), organizationId, projectId, environmentId, slug(agent.slug), bounded(agent.name, 120, "agent name"),
+            bounded(agent.owner, 120, "agent owner"), agent.description ? bounded(agent.description, 1000, "agent description") : "",
+            agent.framework ? bounded(agent.framework, 80, "agent framework") : "unspecified", JSON.stringify(tags), userId]);
+      }
+
+      if (input.federated_identity) {
+        const identity = input.federated_identity;
+        await client.query(`INSERT INTO nyst_federated_identities(federated_identity_id,user_id,organization_id,provider,provider_config_id,
+            provider_subject,email_at_link,email_verified_at_link,last_login_at)
+          VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,now())`,
+          [userId, organizationId, identity.provider, identity.provider_config_id ?? null, identity.provider_subject,
+            normalizedEmail(identity.email_at_link), identity.email_verified_at_link]);
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+
     return { organization_id: organizationId, project_id: projectId, environment_id: environmentId, user_id: userId };
   }
 
@@ -333,7 +447,25 @@ export class ProductRepository {
       WHERE organization_id=$1 AND project_id=$2 AND environment_id=$3 AND provider=$4 AND configured=true`, [scope.organization_id, scope.project_id, scope.environment_id, descriptor.provider]);
     const credentialRef = integration.rows[0]?.credential_ref;
     if (typeof credentialRef !== "string") throw Object.assign(new Error("Required provider integration is not configured"), { statusCode: 409 });
-    if (credentialRef !== EXPECTED_PROVIDER_REFS[descriptor.provider]) throw Object.assign(new Error("Configured credential topology is unsupported by this provider runtime"), { statusCode: 409 });
+    /**
+     * ANY VALID REFERENCE, NOT ONE HARDCODED CONSTANT (v0.3.2 Phase 2).
+     *
+     * This used to require credential_ref === EXPECTED_PROVIDER_REFS[provider],
+     * so every environment on the deployment had to name the SAME variable --
+     * which is another way of saying every customer shared one GitHub token.
+     * Fine for a single design partner, impossible for a hosted product.
+     *
+     * The shape is checked here; whether the secret behind it exists is
+     * answered by the SecretProvider at the moment of use, and by preflight
+     * before anything is admitted. Checking resolvability here would mean
+     * resolving a secret on every admission, which is both slower and a wider
+     * blast radius for a value that must live as briefly as possible.
+     */
+    if (!/^(env|vault|secret-manager):[A-Za-z0-9_./:-]{3,280}$/.test(credentialRef)) {
+      throw Object.assign(new Error(
+        "The configured credential reference is not a usable reference. It must name a secret — " +
+        "env:NAME, vault:path or secret-manager:name."), { statusCode: 409 });
+    }
     return { ...descriptor, enabled: true, credential_ref: credentialRef };
   }
 
@@ -521,8 +653,33 @@ export class ProductRepository {
     return { mode: normalizeMode(row.mode), is_demo: row.is_demo === true, onboarding_stage: Number(row.onboarding_stage ?? 0) };
   }
 
-  async setEnvironmentMode(scope: TenantScope, userId: string, mode: EnvironmentMode, reason: string): Promise<{ mode: EnvironmentMode }> {
+  /**
+   * Move an environment between Shadow, Canary and Enforced.
+   *
+   * COMMERCIAL ENTITLEMENT IS CHECKED HERE (v0.3.2 Phase 10), because this is
+   * the API a customer actually calls. Before v0.3.2 nothing checked it
+   * anywhere: the plan was never stored, so "Shadow Trial does not include
+   * Enforced" was true only of the pricing page and a trial user could POST
+   * straight here and get Enforced. Hiding the button is not enforcement.
+   *
+   * WHAT THIS CHECK IS NOT. It gates a COMMERCIAL feature and nothing else.
+   * Passing it means the customer is allowed to ASK for Enforced. Whether
+   * Enforced is SAFE is decided independently by readiness, policy, the
+   * Autonomy Line, Freeze, Blast Radius and Authority -- none of which look at
+   * the plan. Money decides what you may ask for, never what is safe.
+   *
+   * Moving back to SHADOW is never gated. A customer must always be able to
+   * stop controlling things, including one whose trial just expired.
+   */
+  async setEnvironmentMode(scope: TenantScope, userId: string, mode: EnvironmentMode, reason: string, entitlements?: { mayEnable(organizationId: string, feature: "enforced_mode" | "canary_mode"): Promise<{ decision: "allowed" | "refused"; reason: string; remedy: string | null }> }): Promise<{ mode: EnvironmentMode }> {
     if (!['shadow','canary','enforced'].includes(mode)) throw new Error("Unsupported environment mode");
+    if (entitlements && mode !== "shadow") {
+      const feature = mode === "enforced" ? "enforced_mode" as const : "canary_mode" as const;
+      const verdict = await entitlements.mayEnable(scope.organization_id, feature);
+      if (verdict.decision !== "allowed") {
+        throw Object.assign(new Error(verdict.reason), { statusCode: 402, nyst_blocked_by: "entitlement" });
+      }
+    }
     const result = await this.db.query(`WITH changed AS (
       UPDATE nyst_environments SET mode=$4 WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND mode<>$4
       RETURNING mode AS new_mode,(SELECT mode FROM nyst_environments WHERE environment_id=$1) AS previous_mode
@@ -787,7 +944,10 @@ export class ProductRepository {
         (SELECT coalesce(array_agg(effect_name ORDER BY effect_name),ARRAY[]::text[]) FROM nyst_environment_effect_specs
           WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND enabled AND split_part(effect_name,'.',1)=$4) enabled_effects
       FROM (SELECT 1) one
-      LEFT JOIN nyst_integrations i ON i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND i.provider=$4
+      -- disconnected_at IS NULL: a disconnected integration is not an
+      -- integration. Without this the row keeps answering and readiness
+      -- keeps saying ready for a connection the customer switched off.
+      LEFT JOIN nyst_integrations i ON i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND i.provider=$4 AND i.disconnected_at IS NULL
       LEFT JOIN LATERAL (SELECT status,performed_at,scope_result,account_identity,resource_result
         FROM nyst_integration_preflights
         WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4
@@ -918,10 +1078,59 @@ export class ProductRepository {
    * row carries a CHECK constraint fixing provider_mutation_performed=false,
    * and runPreflight throws if a probe self-reports a mutation.
    */
+  /**
+   * Stop Nyst using a provider connection (v0.3.2 Phase 11).
+   *
+   * WHAT THIS DOES: blocks NEW provider work, and invalidates readiness -- a
+   * disconnected integration is not ready, so nothing that requires it can be
+   * admitted.
+   *
+   * WHAT THIS DOES NOT DO, stated plainly because a control that looks like a
+   * kill switch and is not one is worse than none: it does not stop work
+   * ALREADY ADMITTED. The integration is consulted at admission, and the
+   * scheduler, recovery worker and provider clients read the environment
+   * directly. Emergency Freeze is the thing that stops in-flight consequence.
+   *
+   * HISTORY IS RETAINED. Evidence, receipts, WorldFacts and audit rows all
+   * survive. Disconnecting a provider today does not make yesterday's
+   * observations untrue -- it makes them STALE, so an outcome that depends on
+   * fresh evidence correctly becomes INDETERMINATE instead of quietly keeping
+   * a verdict nothing supports any more.
+   */
+  async disconnectIntegration(scope: TenantScope, userId: string, provider: string, reason: string): Promise<{ disconnected: boolean }> {
+    await this.requireTenantScope(scope);
+    if (!["github","okta","stripe"].includes(provider)) throw Object.assign(new Error("Unsupported integration provider"), { statusCode: 400 });
+    if (reason.trim().length < 5) {
+      throw Object.assign(new Error("Disconnecting an integration requires a reason a person can read"), { statusCode: 400 });
+    }
+    const result = await this.db.query(
+      `UPDATE nyst_integrations
+         SET disconnected_at=now(), disconnected_by=$5, disconnect_reason=$6, configured=false
+       WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4 AND disconnected_at IS NULL
+       RETURNING integration_id`,
+      [scope.environment_id, scope.project_id, scope.organization_id, provider, userId, reason.trim()]);
+    return { disconnected: result.rows.length === 1 };
+  }
+
+  /**
+   * Reconnect. A deliberate act that clears the disconnection entirely.
+   *
+   * It does NOT restore readiness: the credential must be preflighted again,
+   * because nothing here knows whether it still works. That is the same rule
+   * rotation follows.
+   */
+  async reconnectIntegration(scope: TenantScope, provider: string, credentialRef: string): Promise<Record<string, unknown>> {
+    await this.db.query(
+      `UPDATE nyst_integrations SET disconnected_at=NULL, disconnected_by=NULL, disconnect_reason=NULL
+       WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,
+      [scope.environment_id, scope.project_id, scope.organization_id, provider]);
+    return this.configureIntegration(scope, provider, credentialRef);
+  }
+
   async runIntegrationPreflight(scope:TenantScope,provider:string,secrets:SecretProvider,probe:PreflightProbe,now:Date=new Date()):Promise<Record<string,unknown>>{
     if(!["github","okta","stripe"].includes(provider))throw new Error("Unsupported integration provider");
     await this.requireTenantScope(scope);
-    const row=(await this.db.query(`SELECT credential_ref,configured FROM nyst_integrations WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,
+    const row=(await this.db.query(`SELECT credential_ref,configured FROM nyst_integrations WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4 AND disconnected_at IS NULL`,
       [scope.environment_id,scope.project_id,scope.organization_id,provider])).rows[0];
     const reference=row?.configured===true&&typeof row.credential_ref==="string"?row.credential_ref:null;
     const record=await runPreflight(provider,reference,secrets,probe,now);

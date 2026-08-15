@@ -16,7 +16,8 @@ import { SITE_CSS, SITE_JS } from "./siteAssets.js";
 import {
   homePage, pricingPage, productPage, outcomesExplainedPage, integrationsPublicPage, securityPage, publicShell,
 } from "./site.js";
-import { configuratorPage, contactPage, recommendPlan, type QuoteInput } from "./configurator.js";
+import { configuratorPage, contactPage, recommendPlan, PRICING_CATALOG_VERSION, type QuoteInput } from "./configurator.js";
+import { forgotPasswordPage, resetPasswordPage, googleSignupPage } from "./site.js";
 import { signupPage } from "./site.js";
 import { escape } from "../product/dashboard.js";
 
@@ -50,6 +51,11 @@ export interface PublicRouteOptions {
    */
   record_quote?: (quote: {
     input: QuoteInput; recommended_plan: string; received_at: string; source_ip?: string | null;
+    /** EXACTLY what the visitor was shown, so a quote survives a price change. */
+    price_display?: string | null;
+    pricing_catalog_version?: string | null;
+    requires_conversation?: boolean | null;
+    uncovered?: readonly string[];
   }) => Promise<string>;
   /**
    * The address a visitor can write to directly.
@@ -59,8 +65,47 @@ export interface PublicRouteOptions {
    * at all rather than one that may bounce.
    */
   sales_contact_email?: string;
+  /**
+   * Notify a human that a lead arrived (v0.3.2 Phase 9).
+   *
+   * PERSIST FIRST, THEN NOTIFY -- always, and never the other way round. A
+   * notification failure must never lose a submission, so this is called AFTER
+   * the durable write and its failure is logged rather than shown. The visitor
+   * is told their message was received because it WAS.
+   */
+  notify_lead?: (lead: {
+    kind: "contact" | "quote";
+    reference: string;
+    name: string;
+    email: string;
+    company: string;
+    summary: string;
+  }) => Promise<void>;
   /** Reports a submission that could not be stored. Never shown to a visitor. */
   on_error?: (event: Record<string, unknown>) => void;
+  /**
+   * Password recovery.
+   *
+   * Omit it and /forgot-password renders and explains that this deployment
+   * cannot reset passwords, rather than 404ing a link the sign-in page shows.
+   */
+  password_reset?: {
+    requestReset(input: { email: string; source_ip?: string | null; user_agent?: string | null }):
+      Promise<{ accepted: boolean; delivery_unavailable: boolean }>;
+    inspect(token: string): Promise<{ valid: boolean }>;
+    completeReset(token: string, password: string): Promise<{ ok: true } | { ok: false; reason: string }>;
+  };
+  /**
+   * Finish a Google signup for an identity Nyst has never seen (Phase 5).
+   *
+   * Absent, /signup/google explains that this deployment cannot create
+   * accounts rather than 404ing a redirect the callback just issued.
+   */
+  google_signup?: {
+    peek(handle: string): Promise<{ provider_subject: string; email: string; email_verified: boolean; display_name: string | null } | null>;
+    complete(handle: string, input: { organization: string; organization_slug: string; display_name: string }):
+      Promise<{ ok: true; session: string } | { ok: false; reason: string }>;
+  };
   /**
    * Create a real Shadow trial account.
    *
@@ -210,10 +255,23 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
     // calculator, and a storage failure is Nyst's problem, not theirs.
     if (options.record_quote) {
       try {
-        await options.record_quote({
+        const reference = await options.record_quote({
           input, recommended_plan: result.recommended_plan,
           received_at: new Date().toISOString(), source_ip: clientAddress(request),
+          // EXACTLY what the page displayed, so a quote stays reconstructable
+          // after the catalog changes (v0.3.2 Phase 9).
+          price_display: result.price_display,
+          pricing_catalog_version: PRICING_CATALOG_VERSION,
+          requires_conversation: result.requires_conversation,
+          uncovered: result.uncovered,
         });
+        if (options.notify_lead) {
+          await options.notify_lead({
+            kind: "quote", reference,
+            name: input.company || "Someone", email: input.email, company: input.company,
+            summary: `${result.recommended_plan} — ${result.price_display}`,
+          }).catch(() => undefined);
+        }
       } catch (error) {
         options.on_error?.({
           type: "quote_request_not_recorded",
@@ -267,6 +325,169 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
     // signup form: signing in is where a session is established, and doing it
     // in two places is two places to get it wrong.
     return reply.redirect("/login?created=1");
+  });
+
+  /* -------------------------------------------------- google signup */
+
+  /**
+   * The page a brand-new Google identity lands on.
+   *
+   * GET does not consume the handoff: a refresh must not send the person back
+   * to Google.
+   */
+  app.get("/signup/google", async (request, reply) => {
+    const query = request.query as { handoff?: unknown };
+    const handoff = bounded(query.handoff, 128);
+    if (!options.google_signup) {
+      return reply.code(503).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: SIGNUP_UNAVAILABLE, error: null,
+      }));
+    }
+    const pending = await options.google_signup.peek(handoff);
+    if (!pending) {
+      return reply.code(410).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: null,
+        error: "That Google sign-in has expired. Start again and it will only take a moment.",
+      }));
+    }
+    return html(reply, googleSignupPage({
+      handoff, email: pending.email, display_name: pending.display_name,
+      suggested_slug: suggestSlug(pending.email),
+    }));
+  });
+
+  app.post("/signup/google", async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const handoff = bounded(body.handoff, 128);
+    const submitted = {
+      organization: bounded(body.organization, 120),
+      organization_slug: bounded(body.organization_slug, 63).toLowerCase(),
+      display_name: bounded(body.display_name, 120),
+    };
+
+    if (!options.google_signup) {
+      return reply.code(503).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: SIGNUP_UNAVAILABLE, error: null,
+      }));
+    }
+    const pending = await options.google_signup.peek(handoff);
+    if (!pending) {
+      return reply.code(410).type("text/html; charset=utf-8").send(signupPage({
+        plan: null, unavailable_reason: null,
+        error: "That Google sign-in has expired. Start again and it will only take a moment.",
+      }));
+    }
+
+    const render = (error: string) => reply.code(400).type("text/html; charset=utf-8").send(googleSignupPage({
+      handoff, email: pending.email, display_name: pending.display_name,
+      suggested_slug: suggestSlug(pending.email), error, submitted,
+    }));
+
+    // The SAME validation the password signup uses, minus the password: a
+    // Google account has Google as its way in, and inventing a password here
+    // would create a second credential nobody asked for.
+    if (submitted.organization.length < 2) return render("Give the workspace a name.");
+    if (!/^[a-z0-9-]{3,63}$/.test(submitted.organization_slug)) {
+      return render("The short name may use lowercase letters, numbers and hyphens, and must be at least three characters.");
+    }
+    if (submitted.display_name.length < 1) return render("Tell us your name.");
+
+    const created = await options.google_signup.complete(handoff, submitted);
+    if (!created.ok) return render(created.reason);
+
+    // Signed in immediately. Unlike the password flow there is nothing left to
+    // prove -- Google already established who this is, moments ago.
+    reply.setCookie("nyst_session", created.session, {
+      path: "/", httpOnly: true, sameSite: "lax",
+      secure: request.protocol === "https", maxAge: 12 * 60 * 60,
+    });
+    return reply.redirect("/", 302);
+  });
+
+  /* ------------------------------------------------ password recovery */
+
+  /**
+   * THE RESPONSE NEVER REVEALS WHETHER AN ACCOUNT EXISTS.
+   *
+   * Same page, same words, same status, for a real address and an invented
+   * one. A form that distinguishes them enumerates the customer list for
+   * anyone who wants it, which is step one of every credential-stuffing run.
+   */
+  app.get("/forgot-password", async (_request, reply) =>
+    html(reply, forgotPasswordPage({ submitted: false })));
+
+  app.post("/forgot-password", async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const address = bounded(body.email, 320);
+
+    if (!options.password_reset) {
+      return reply.code(503).type("text/html; charset=utf-8").send(forgotPasswordPage({
+        submitted: true, delivery_unavailable: true,
+        sales_email: options.sales_contact_email ?? null,
+      }));
+    }
+
+    const outcome = await options.password_reset.requestReset({
+      email: address,
+      source_ip: clientAddress(request),
+      user_agent: bounded(request.headers["user-agent"], 400) || null,
+    }).catch((error: unknown) => {
+      // A failure here must ALSO be indistinguishable. Reporting it would say
+      // "something happened for this address", which is exactly the signal
+      // being withheld.
+      options.on_error?.({
+        type: "password_reset_request_failed",
+        detail: error instanceof Error ? error.message : "unknown",
+      });
+      return { accepted: true, delivery_unavailable: false };
+    });
+
+    return html(reply, forgotPasswordPage({
+      submitted: true,
+      delivery_unavailable: outcome.delivery_unavailable,
+      sales_email: options.sales_contact_email ?? null,
+    }));
+  });
+
+  /**
+   * GET does NOT consume the token.
+   *
+   * Mail clients and link scanners prefetch URLs. A GET that consumed the
+   * token would burn a person's reset before they ever saw the page, and they
+   * would have no idea why.
+   */
+  app.get("/reset-password", async (request, reply) => {
+    const query = request.query as { token?: unknown };
+    const token = bounded(query.token, 128);
+    if (!options.password_reset) {
+      return reply.code(503).type("text/html; charset=utf-8")
+        .send(resetPasswordPage({ token, valid: false }));
+    }
+    const { valid } = await options.password_reset.inspect(token);
+    return html(reply, resetPasswordPage({ token, valid }));
+  });
+
+  app.post("/reset-password", async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const token = bounded(body.token, 128);
+    const password = typeof body.password === "string" ? body.password : "";
+
+    if (!options.password_reset) {
+      return reply.code(503).type("text/html; charset=utf-8")
+        .send(resetPasswordPage({ token, valid: false }));
+    }
+
+    const result = await options.password_reset.completeReset(token, password);
+    if (result.ok) {
+      // Every session for this user is already gone -- the database trigger on
+      // nyst_users sees to that -- so there is nothing to sign out here.
+      return html(reply, resetPasswordPage({ token: "", valid: true, done: true }));
+    }
+    // A weak password must NOT burn the link, so the form comes back usable.
+    const stillValid = (await options.password_reset.inspect(token)).valid;
+    return reply.code(400).type("text/html; charset=utf-8").send(resetPasswordPage({
+      token, valid: stillValid, error: result.reason,
+    }));
   });
 
   app.get("/contact", async (request, reply) => {
@@ -340,6 +561,26 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
         error: "This message could not be delivered right now, so it has not been sent. Please email us directly instead.",
       }));
     }
+    /**
+     * NOTIFY AFTER PERSISTING, AND NEVER FAIL THE SUBMISSION FOR IT.
+     *
+     * The lead is already durable at this point. If the mail transport is down
+     * the submission is still accepted, because telling someone to resubmit a
+     * message Nyst already has is both untrue and how leads get lost.
+     */
+    if (options.notify_lead) {
+      await options.notify_lead({
+        kind: "contact", reference,
+        name: submission.name, email: submission.email, company: submission.company,
+        summary: submission.message.slice(0, 2000),
+      }).catch((error: unknown) => {
+        options.on_error?.({
+          type: "lead_notification_failed", kind: "contact", reference,
+          detail: error instanceof Error ? error.message : "unknown",
+        });
+      });
+    }
+
     return html(reply, contactPage(submission.topic, reference, context));
   });
 
@@ -501,4 +742,19 @@ function parseQuote(body: unknown): QuoteInput {
     email: bounded(record.email, 320),
     notes: bounded(record.notes, 2000),
   };
+}
+
+/**
+ * A starting point for the workspace short name.
+ *
+ * Only ever a PREFILL. The person can change it, and the field is required
+ * precisely so nobody ends up with `john-gmail` as a permanent public
+ * identifier because a form guessed for them.
+ */
+function suggestSlug(email: string): string {
+  const domain = email.slice(email.indexOf("@") + 1).split(".")[0] ?? "";
+  const cleaned = domain.toLowerCase().replace(/[^a-z0-9-]/g, "");
+  const generic = ["gmail", "googlemail", "outlook", "hotmail", "yahoo", "icloud", "proton", "protonmail"];
+  if (!cleaned || cleaned.length < 3 || generic.includes(cleaned)) return "";
+  return cleaned.slice(0, 63);
 }

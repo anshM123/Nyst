@@ -255,20 +255,35 @@ describe("Nyst v0.3.1 issue 11 — the provider connection backend", { skip: dat
 
   /* ========================================================= KNOWN GAP */
 
-  it("KNOWN GAP, STATED: there is no disconnect route, and the kill switch is elsewhere", async () => {
-    // Documented rather than half-built. A disconnect that removed the row
-    // would NOT stop in-flight work: the integration is consulted at admission
-    // only, and the scheduler, recovery worker and provider clients read the
-    // environment directly. A route that looked like a kill switch but was not
-    // one is more dangerous than its absence.
+  it("THE GAP IS NOW CLOSED: disconnect exists, and is honest about what it does NOT stop", async () => {
+    /**
+     * v0.3.1 asserted this route was ABSENT, deliberately: removing the row
+     * would not stop in-flight work, and a control that looks like a kill
+     * switch and is not one is worse than none.
+     *
+     * v0.3.2 Phase 11 builds it as what it honestly is. The response itself
+     * states the boundary, so a customer clicking Disconnect is told in the
+     * same breath that Emergency Freeze is the thing that stops work already
+     * admitted.
+     */
+    await configure("github", "env:NYST_GITHUB_TOKEN");
     const response = await app.inject({
       method: "DELETE", url: "/v1/integrations/github",
-      headers: { cookie, "x-nyst-csrf": csrf },
+      headers: { cookie, "x-nyst-csrf": csrf, "content-type": "application/json" },
+      payload: { reason: "Ending this engagement and rotating the token." },
     });
-    assert.equal(response.statusCode, 404,
-      "a disconnect route now exists — it must also stop in-flight actions, or it is not a kill switch");
+    assert.equal(response.statusCode, 200, `disconnect failed: ${response.body}`);
 
-    // What DOES stop work: disabling the EffectSpec, and Emergency Freeze.
+    const body = response.json() as Record<string, unknown>;
+    assert.equal(body.disconnected, true);
+    assert.match(String(body.does_not_stop), /already admitted/i,
+      "the disconnect response does not say what it fails to stop");
+    assert.match(String(body.does_not_stop), /freeze/i,
+      "the disconnect response does not point at the control that DOES stop in-flight work");
+    assert.match(String(body.retained), /evidence|receipt|audit/i,
+      "the disconnect response does not say that history is kept");
+
+    // And Emergency Freeze is still the real kill switch.
     assert.equal(typeof repository.setEnvironmentMode, "function");
   });
 });

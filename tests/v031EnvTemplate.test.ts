@@ -39,6 +39,10 @@ const template = readFileSync(join(root, ".env.example"), "utf8");
 const RESOLVED_DYNAMICALLY = new Map([
   ["DATABASE_URL", "read through the pg connection string, not by name"],
   ["NODE_ENV", "read by Node and by config.ts as a mode, not as configuration"],
+  ["NYST_SMTP_PASSWORD",
+    "named by the VALUE of NYST_SMTP_PASSWORD_REF and resolved through the "
+    + "SecretProvider at send time, exactly like the Google client secret below. "
+    + "The operator picks the name; the template only shows the conventional one."],
   ["NYST_GOOGLE_CLIENT_SECRET",
     "named by the VALUE of NYST_GOOGLE_CLIENT_SECRET_REF and resolved through "
     + "the SecretProvider at the moment of use. The operator chooses the name; "

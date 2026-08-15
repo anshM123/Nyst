@@ -10,6 +10,7 @@
  * Production startup FAILS CLOSED on unsafe configuration — see
  * src/product/config.ts for the exact rules.
  */
+import { randomUUID } from "node:crypto";
 import { Ed25519Signer } from "../dist/src/core/signing.js";
 import { LocalSystemClock } from "../dist/src/core/clock.js";
 import { verifyResolution } from "../dist/src/engine/resolver.js";
@@ -29,6 +30,10 @@ import { EvidenceIngest, RelayCoordinator } from "../dist/src/product/outcome/ev
 import { AuthorityRepository } from "../dist/src/product/authority/authorityRepository.js";
 import { registerPublicRoutes } from "../dist/src/public/publicRoutes.js";
 import { InboundRepository } from "../dist/src/public/inboundRepository.js";
+import { PasswordResetService } from "../dist/src/product/auth/passwordReset.js";
+import { GoogleSignupService } from "../dist/src/product/auth/googleSignup.js";
+import { smtpSettingsFromEnv } from "../dist/src/product/email.js";
+import { SmtpEmailProvider } from "../dist/src/product/smtpEmail.js";
 import { homePage } from "../dist/src/public/site.js";
 import { FederatedRepository } from "../dist/src/product/auth/federatedRepository.js";
 import { GoogleAuth, googleConfigFromEnv, httpGoogleTransport } from "../dist/src/product/auth/googleAuth.js";
@@ -121,6 +126,16 @@ const preflight = async (provider: "github" | "okta" | "stripe", _secret: string
  * LIVE GOOGLE PROJECT CONFIGURATION REQUIRED.
  */
 const federated = new FederatedRepository(pool);
+
+/**
+ * Google SIGNUP, as distinct from Google LOGIN.
+ *
+ * A brand-new Google identity used to hit a 404 telling it to go and sign up --
+ * from the signup page. This carries the verified identity across the
+ * workspace-name form and creates the workspace atomically.
+ */
+const googleSignups = new GoogleSignupService(pool);
+
 const googleConfig = googleConfigFromEnv();
 const google = googleConfig
   ? new GoogleAuth(googleConfig, federated, httpGoogleTransport(), secrets)
@@ -150,6 +165,7 @@ const app = await buildProductServer({
   public_home: homePage,
   signer,
   federated,
+  google_signup: googleSignups,
   ...(google ? { google } : {}),
 });
 
@@ -164,6 +180,24 @@ const app = await buildProductServer({
  */
 const inbound = new InboundRepository(pool);
 
+/**
+ * Outbound mail, and password recovery.
+ *
+ * Unconfigured is a legitimate state and every caller handles it: the reset
+ * page says plainly that this deployment cannot send email rather than
+ * pretending a link is on its way.
+ */
+const smtp = smtpSettingsFromEnv();
+const emailProvider = smtp ? new SmtpEmailProvider(smtp, secrets) : null;
+if (!smtp) {
+  structuredLog({
+    type: "email_transport_unconfigured",
+    detail: "Set NYST_SMTP_HOST and NYST_EMAIL_FROM to enable password reset and lead notification.",
+  });
+}
+const passwordResets = new PasswordResetService(
+  pool, emailProvider, process.env.NYST_PUBLIC_ORIGIN ?? `http://${config.host}:${config.port}`);
+
 registerPublicRoutes(app, {
   mount_root: false,
   record_contact: (submission) => inbound.recordContact(submission),
@@ -173,6 +207,86 @@ registerPublicRoutes(app, {
     ? { sales_contact_email: process.env.NYST_SALES_CONTACT_EMAIL }
     : {}),
   on_error: structuredLog,
+  /**
+   * Tell a human a lead arrived (v0.3.2 Phase 9).
+   *
+   * Called only AFTER the durable write, and its failure never fails the
+   * submission -- the lead is already stored, and telling someone to resubmit a
+   * message Nyst already has is both untrue and how leads get lost.
+   *
+   * Absent NYST_SALES_CONTACT_EMAIL or a mail transport, this is simply not
+   * wired: the submission still lands in the database, which is where it
+   * durably lives regardless.
+   */
+  ...(emailProvider && process.env.NYST_SALES_CONTACT_EMAIL ? {
+    notify_lead: async (lead) => {
+      await emailProvider.send({
+        to: process.env.NYST_SALES_CONTACT_EMAIL!,
+        subject: `Nyst ${lead.kind}: ${lead.company || lead.name} (${lead.reference})`,
+        text: [
+          `Reference: ${lead.reference}`,
+          `Name:      ${lead.name}`,
+          `Email:     ${lead.email}`,
+          `Company:   ${lead.company || "(not given)"}`,
+          ``,
+          lead.summary,
+          ``,
+          `--`,
+          `This email carries only what the visitor typed. No customer evidence, no receipts, no credentials.`,
+        ].join(String.fromCharCode(10)),
+      });
+    },
+  } : {}),
+  password_reset: passwordResets,
+  google_signup: {
+    peek: (handle) => googleSignups.peek(handle),
+    /**
+     * Create the workspace and bind the Google identity ATOMICALLY.
+     *
+     * The handoff is consumed first, so two submissions of one form cannot
+     * create two workspaces. If the workspace creation then fails, the handoff
+     * is already spent -- deliberately: a failed signup should start again from
+     * Google rather than replay a half-used identity.
+     */
+    complete: async (handle, input) => {
+      const identity = await googleSignups.consume(handle);
+      if (!identity) return { ok: false, reason: "That Google sign-in has expired. Start again." };
+      try {
+        const created = await repository.createBootstrap({
+          organization: input.organization,
+          organization_slug: input.organization_slug,
+          project: "Platform", project_slug: "platform",
+          environment: "Shadow", environment_slug: "shadow", mode: "shadow",
+          email: identity.email, display_name: input.display_name,
+          // A Google account signs in with Google. A random password exists
+          // only because the column requires one, and nobody is ever told it;
+          // password reset is the supported route to adding a local credential.
+          password: randomUUID() + randomUUID(),
+          initial_agent: {
+            name: "First Agent", slug: "first-agent", owner: input.display_name,
+            description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
+            framework: "unspecified", tags: [],
+          },
+          federated_identity: {
+            provider: "google", provider_subject: identity.provider_subject,
+            email_at_link: identity.email, email_verified_at_link: identity.email_verified,
+          },
+        });
+
+        const session = await federated.createSession(created.user_id);
+        if (!session) return { ok: false, reason: "The workspace was created but the session could not be started. Sign in with Google again." };
+        structuredLog({ type: "google_signup_created", organization_slug: input.organization_slug });
+        return { ok: true, session: session.session };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        if (/duplicate key|unique/i.test(message)) {
+          return { ok: false, reason: `The short name "${input.organization_slug}" is already taken. Pick another.` };
+        }
+        structuredLog({ type: "google_signup_failed", detail: message });
+        return { ok: false, reason: "The workspace could not be created. Nothing was created, and you can try again." };
+      }
+    },
+  },
   /**
    * A real Shadow trial.
    *
@@ -200,16 +314,12 @@ registerPublicRoutes(app, {
         email: input.email,
         display_name: input.display_name,
         password: input.password,
+        initial_agent: {
+          name: "First Agent", slug: "first-agent", owner: input.display_name,
+          description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
+          framework: "unspecified", tags: [],
+        },
       });
-      // The rest of the lifecycle, so a new account arrives somewhere real
-      // rather than at an empty shell. None of it grants authority: an Agent
-      // with no Autonomy Line rule has no autonomy, and a Shadow environment
-      // controls nothing regardless.
-      await repository.createAgent(created, created.user_id, {
-        name: "First Agent", slug: "first-agent", owner: input.display_name,
-        description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
-        framework: "unspecified", tags: [],
-      }).catch(() => null);
 
       structuredLog({ type: "signup_created", organization_slug: input.organization_slug, mode: "shadow" });
       return { ok: true as const };

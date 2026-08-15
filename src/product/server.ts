@@ -13,12 +13,14 @@ import { healthMetricsText } from "./operationalHealth.js";
 import { LAB_EFFECT } from "./failureLabEngine.js";
 
 /** Single source of the product version string. */
-export const NYST_VERSION = "0.3.1";
+export const NYST_VERSION = "0.3.2";
 import { protectionReportCsv } from "./protectionReport.js";
 import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
 import { authoritativeConsequenceMetadata } from "./effectSemantics.js";
 import { evaluateProcessReadiness } from "./readiness.js";
+import { authorizeConsequence } from "./authority/authorizeConsequence.js";
+import { AuthorityRepository } from "./authority/authorityRepository.js";
 import type { GoogleAuth } from "./auth/googleAuth.js";
 import type { FederatedRepository } from "./auth/federatedRepository.js";
 import { TokenRejected, safeRedirect } from "./auth/federatedIdentity.js";
@@ -30,7 +32,6 @@ import type { EvidenceIngest, RelayCoordinator, RelayOperation } from "./outcome
 import { RELAY_OPERATIONS } from "./outcome/evidenceIngest.js";
 import { subjectReferences as subjectReferencesFor } from "./outcome/outcomeRepository.js";
 import type { OutcomeRepository } from "./outcome/outcomeRepository.js";
-import type { AuthorityRepository } from "./authority/authorityRepository.js";
 import { sanitizeForProduct } from "./sanitize.js";
 import type { EffectSpecDescriptor, ProductCommitter, ProductContext, ProductPrincipal } from "./types.js";
 import type { InMemoryOperationalMetrics } from "./scheduler.js";
@@ -115,6 +116,16 @@ export interface ProductServerOptions {
    * Google button that vanishes is harder to debug than one that explains.
    */
   google?: GoogleAuth;
+  /**
+   * Completes a Google SIGNUP for an identity Nyst has never seen (Phase 5).
+   *
+   * Absent, the callback still explains itself rather than 404ing -- but a
+   * brand-new Google user has nowhere to go, which is the dead end this exists
+   * to close.
+   */
+  google_signup?: {
+    begin(identity: { provider_subject: string; email: string; email_verified: boolean; display_name: string | null }): Promise<string>;
+  };
   /** Federated identity persistence. Required for Connected Accounts. */
   federated?: FederatedRepository;
   /** Customer-pushed observations, for systems Nyst has no integration with. */
@@ -126,6 +137,24 @@ export interface ProductServerOptions {
 }
 
 export async function buildProductServer(options: ProductServerOptions): Promise<FastifyInstance> {
+  /**
+   * THE AUTHORITY LAYER IS NOT OPTIONAL (v0.3.2 Phase 1).
+   *
+   * It used to be, and a server built without it dispatched consequences with
+   * no Autonomy Line check whatsoever -- which is exactly how an Agent with no
+   * rule came to have unlimited authority in production.
+   *
+   * Making the option required would have been the obvious fix and the wrong
+   * one: it turns a safety property into something every call site has to
+   * remember, and twenty-one test files plus every future one become places it
+   * can be forgotten again. Constructing it here from the repository's own
+   * connection means there is no configuration in which it is absent.
+   *
+   * `options.authority` is still honoured when supplied, so a caller can pass a
+   * differently-scoped instance; it just cannot pass nothing.
+   */
+  const authorityLayer = options.authority ?? new AuthorityRepository(options.repository.database);
+
   const app = Fastify({
     logger: false, bodyLimit: 64 * 1024, requestIdHeader: false, genReqId: () => randomUUID(),
     trustProxy: options.trust_proxy === true,
@@ -300,10 +329,34 @@ export async function buildProductServer(options: ProductServerOptions): Promise
       case "subject_belongs_to_another_user":
         return reply.code(409).type("text/html; charset=utf-8").send(genericPage(
           "That Google account is already connected", result.message));
-      case "no_account":
-        return reply.code(404).type("text/html; charset=utf-8").send(genericPage(
-          "No Nyst account for that Google identity",
-          "Nyst does not create an account automatically from a Google sign-in. Start in Shadow to create one, then connect Google from Settings."));
+      case "no_account": {
+        /**
+         * GOOGLE SIGNUP (v0.3.2 Phase 5).
+         *
+         * This used to be a 404 saying "Nyst does not create an account
+         * automatically". Accurate, and a dead end: someone who clicked
+         * "Continue with Google" on the SIGNUP page was told to go and sign up.
+         *
+         * The reason for the original refusal was sound -- a workspace needs a
+         * NAME, and inventing one from a Google profile produces "john-gmail"
+         * as an organization identifier. So the flow now asks for the one thing
+         * it cannot infer, carrying the VERIFIED Google identity across in a
+         * signed, short-lived, single-use handoff rather than trusting anything
+         * the browser sends back.
+         */
+        if (!options.google_signup) {
+          return reply.code(404).type("text/html; charset=utf-8").send(genericPage(
+            "No Nyst account for that Google identity",
+            "This deployment cannot create accounts, so a Google sign-in has nowhere to go. Contact us and we will set one up."));
+        }
+        const handoff = await options.google_signup.begin({
+          provider_subject: String(result.claims.sub),
+          email: String(result.claims.email ?? ""),
+          email_verified: result.claims.email_verified === true,
+          display_name: displayNameFromClaims(result.claims as unknown as Record<string, unknown>),
+        });
+        return reply.redirect(`/signup/google?handoff=${encodeURIComponent(handoff)}`, 302);
+      }
     }
   });
 
@@ -907,7 +960,74 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     // hang a Human Review on. The durable intervention written by admitConsequence
     // IS the operator-facing artefact, and Needs Attention surfaces it beside
     // action-backed reviews. Inventing an action here would be fabricating truth.
-    if (!admission.admitted) throw Object.assign(new Error(admission.reason), { statusCode: 409, nyst_blocked_by: admission.blocked_by }); const started=Date.now(); const result = await options.commit({ effect, businessKey: namespacedKey, displayBusinessKey: businessKey, input: withCredentialReference(body.input, availability.credential_ref), credential_ref: availability.credential_ref, policy_version_id: policy.policy_version_id, environment_mode: execution.mode === "canary" ? "canary" : "enforced", agent_id: agentId }, principal); options.metrics?.observe("action_commit_latency_ms",Date.now()-started); await options.repository.linkAdmission(admission.admission_id, result.action.action_id); await options.repository.recordResolutionTransition(result.action.action_id,result.resolution,"action_commit"); return sanitizeForProduct({ ...result, execution_mode: execution.mode, canary_rule_id: execution.canary_rule_id }); }, options.repository));
+    if (!admission.admitted) throw Object.assign(new Error(admission.reason), { statusCode: 409, nyst_blocked_by: admission.blocked_by });
+
+    /**
+     * AUTHORITY (v0.3.2 Phase 1). THE GATE THAT WAS NOT THERE.
+     *
+     * Until v0.3.2 this line did not exist, and `evaluateAuthority()` -- the
+     * complete eight-constraint evaluator this product is built around -- had
+     * ZERO production call sites. Admission above enforces Emergency Freeze and
+     * Blast Radius, which are real; neither is the Autonomy Line.
+     *
+     * So an Agent with NO Autonomy Line rule reached the provider, when the
+     * design says in as many words that "an undescribed Agent has no autonomy,
+     * not unlimited autonomy". Absent authority became full authority.
+     *
+     * It runs AFTER admission because it consumes admission's result rather
+     * than re-deriving Freeze and Blast Radius: one linearized SQL gate stays
+     * the single source of truth for those two. It runs BEFORE `options.commit`
+     * because after it there is a provider mutation, and an authority decision
+     * taken after the consequence is not a gate, it is a log line.
+     */
+    const authorityDecision = await authorizeConsequence(authorityLayer, principal, {
+      agent_id: agentId,
+      effect_name: effect,
+      amount_minor: consequence.amount_minor,
+      currency: consequence.currency,
+      /**
+       * THIS IS AN INITIAL DISPATCH, NOT A CONTINUATION.
+       *
+       * Layers 1 and 2 of the evaluator read `runtime_authority.continuation`
+       * and the policy's `automatic_continuation_allowed`. Those are
+       * CONTINUATION semantics: what Nyst may do AFTER an ambiguous result.
+       * Feeding a first dispatch through them blocks every action whenever
+       * auto-continuation is off -- which is the conservative default -- and it
+       * did: 29 previously-passing action tests failed the moment this was
+       * wired that way.
+       *
+       * So the continuation fields are stated as not-applicable here rather
+       * than derived from the continuation policy. Retry stays FORBIDDEN,
+       * because that floor is about execution and does apply. The layers that
+       * actually gate a first dispatch are 3-8: Freeze, Blast Radius, rollout,
+       * the Autonomy Line, outcome dependency and human exceptions -- and the
+       * Autonomy Line is the one that was missing entirely.
+       */
+      runtime_authority: {
+        primary: "continue", retry: "forbidden", continuation: "allowed", recovery: "none",
+        automatic_continuation_allowed: true,
+        automatic_compensation_allowed: false,
+        automatic_retry_allowed: false,
+        reductions: ["POLICY.RETRY_NEVER_AUTOMATIC"],
+      },
+      policy_version_id: policy.policy_version_id ?? null,
+      mode: execution.mode,
+      admission: { admitted: admission.admitted, blocked_by: admission.blocked_by, reason: admission.reason,
+        budget_id: admission.budget_id ?? null, freeze_id: admission.freeze_id ?? null },
+      reversible: true,
+      open_incident: false,
+    });
+    if (authorityDecision.disposition !== "allowed") {
+      // 409, and the primary reason verbatim: an operator reading this needs to
+      // know WHICH constraint held it, not that "something" did.
+      throw Object.assign(new Error(authorityDecision.primary_reason), {
+        statusCode: 409,
+        nyst_blocked_by: "authority",
+        nyst_disposition: authorityDecision.disposition,
+      });
+    }
+
+    const started=Date.now(); const result = await options.commit({ effect, businessKey: namespacedKey, displayBusinessKey: businessKey, input: withCredentialReference(body.input, availability.credential_ref), credential_ref: availability.credential_ref, policy_version_id: policy.policy_version_id, environment_mode: execution.mode === "canary" ? "canary" : "enforced", agent_id: agentId }, principal); options.metrics?.observe("action_commit_latency_ms",Date.now()-started); await options.repository.linkAdmission(admission.admission_id, result.action.action_id); await options.repository.recordResolutionTransition(result.action.action_id,result.resolution,"action_commit"); return sanitizeForProduct({ ...result, execution_mode: execution.mode, canary_rule_id: execution.canary_rule_id }); }, options.repository));
   app.get("/v1/actions/:id", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, request, sanitizeForProduct(await options.repository.actionDetail(principal, routeId(request))));}, options.repository));
   app.get("/v1/actions/:id/evidence", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, request, sanitizeForProduct(await options.repository.evidence(principal, routeId(request))));}, options.repository));
   app.get("/v1/actions/:id/resolutions", api(async (principal, request, reply) => {requireScope(principal,"actions:read");return found(reply, request, sanitizeForProduct(await options.repository.resolutions(principal, routeId(request))));}, options.repository));
@@ -967,6 +1087,32 @@ export async function buildProductServer(options: ProductServerOptions): Promise
    * categorical outcome, and returns the six readiness dimensions. It never
    * mutates provider state and never returns the credential.
    */
+  /**
+   * Disconnect a provider (v0.3.2 Phase 11).
+   *
+   * Stops NEW provider work and invalidates readiness. It is NOT a kill switch
+   * for work already admitted -- Emergency Freeze is -- and the response says
+   * so, because a control a customer believes stops everything, and does not,
+   * is worse than no control.
+   *
+   * Historical evidence, receipts and audit are retained.
+   */
+  app.delete("/v1/integrations/:provider", api(async (principal, request) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const provider = String((request.params as { provider?: unknown }).provider ?? "");
+    if (provider !== "github" && provider !== "okta" && provider !== "stripe") {
+      throw Object.assign(new Error("Unsupported provider"), { statusCode: 400 });
+    }
+    const reason = string(object(request.body).reason, 1000);
+    const result = await options.repository.disconnectIntegration(principal, principal.user_id!, provider, reason);
+    return {
+      ...result,
+      stops: "New provider reads and mutations, and readiness for anything requiring this integration.",
+      does_not_stop: "Actions already admitted. Use Emergency Freeze to stop work that is in flight.",
+      retained: "Evidence, WorldFacts, receipts and audit are kept. Outcomes needing fresh evidence will become indeterminate as it goes stale.",
+    };
+  }, options.repository));
+
   app.post("/v1/integrations/:provider/preflight",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const provider=String((request.params as {provider?:unknown}).provider??"");if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});if(!options.integration_preflight)return {provider,status:"preflight_unavailable",read_only_preflight_performed:false,provider_mutation_performed:false,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};const preflight=await options.repository.runIntegrationPreflight(principal,provider,options.secrets,(secret)=>options.integration_preflight!(provider,secret));return {...preflight,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};},options.repository));
   // Retained path for existing integrations; same read-only behaviour.
   app.post("/v1/integrations/:provider/test",api(async(principal,request,reply)=>{reply.header("Deprecation","true");reply.header("Link","</v1/integrations/{provider}/preflight>; rel=\"successor-version\"");sessionOnly(principal);requireCsrf(request,principal);const provider=String((request.params as {provider?:unknown}).provider??"");if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const readiness=await options.repository.integrationReadiness(principal,provider,options.secrets);if(!readiness.credential_available||!options.integration_preflight)return {...readiness,read_only_preflight_performed:false,provider_mutation_performed:false};const preflight=await options.repository.runIntegrationPreflight(principal,provider,options.secrets,(secret)=>options.integration_preflight!(provider,secret));return {...preflight,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};},options.repository));
@@ -1021,6 +1167,18 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.post("/v1/api-keys", api(async (principal, request) => { if (principal.kind !== "session") throw Object.assign(new Error("Session required"), { statusCode: 403 }); requireCsrf(request, principal); const body = object(request.body); const scopes=strings(body.scopes,16); if(scopes.some(scope=>!API_SCOPES.has(scope)))throw Object.assign(new Error("Unsupported API key scope"),{statusCode:400}); const idempotent = await options.repository.idempotent(principal, "api_key.create", idempotencyKey(request), body, async () => options.repository.createApiKey(principal, string(body.name, 120), scopes, null, body.agent_id===undefined||body.agent_id===null?null:string(body.agent_id,36))); return idempotent.value;},options.repository));
   app.delete("/v1/api-keys/:id", api(async (principal, request) => { if (principal.kind !== "session") throw Object.assign(new Error("Session required"), { statusCode: 403 }); requireCsrf(request, principal); return { revoked: await options.repository.revokeApiKey(principal, routeId(request)) }; }, options.repository));
   return app;
+}
+
+/**
+ * A display name from a verified ID token, if it carries one.
+ *
+ * `name` is an optional OIDC profile claim, so it is read defensively rather
+ * than typed into IdTokenClaims -- nothing about identity depends on it, and it
+ * is only ever a prefilled form value the person can change.
+ */
+function displayNameFromClaims(claims: Record<string, unknown>): string | null {
+  const name = claims.name;
+  return typeof name === "string" && name.trim().length > 0 && name.length <= 120 ? name.trim() : null;
 }
 
 function pageHandler(handler: (principal: ProductPrincipal, request: FastifyRequest, reply: FastifyReply) => Promise<string | FastifyReply>, repository: ProductRepository) { return async (request: FastifyRequest, reply: FastifyReply) => { const principal = await authenticate(request, repository); if (!principal) return reply.redirect("/login");if(principal.kind!=="session")return reply.code(403).type("text/html; charset=utf-8").send(genericPage("Session required","Dashboard pages require a browser session; API keys are limited to versioned API endpoints.")); const value = await handler(principal, request, reply); if (typeof value === "string") { const context=await repository.context(principal); return reply.type("text/html; charset=utf-8").send(value.replace("<!--NYST_CONTEXT-->",contextSwitcher(context))); } return value; }; }

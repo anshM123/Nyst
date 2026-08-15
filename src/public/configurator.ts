@@ -41,6 +41,16 @@ export interface QuoteResult {
   uncovered: readonly string[];
 }
 
+/**
+ * The pricing catalog this build quotes from.
+ *
+ * Recorded with every quote request so a historical quote is attributable to
+ * the catalog that produced it. BUMP THIS whenever a price or an envelope
+ * boundary changes -- otherwise a quote from March and a quote from April are
+ * indistinguishable, and "you quoted me X" becomes unanswerable.
+ */
+export const PRICING_CATALOG_VERSION = "2026-08-v1";
+
 const PROVIDERS = ["github", "okta", "stripe", "aws", "other"] as const;
 const OUTCOME_PACKS = ["employee_offboarding"] as const;
 
