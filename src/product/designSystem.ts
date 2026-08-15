@@ -589,6 +589,14 @@ legend { font-size: .78rem; font-weight: 660; letter-spacing: .04em; text-transf
 }
 .connect-form .hint { font-weight: 400; color: var(--ink-muted); font-size: .78rem; }
 
+/* ==================================================== the key, once */
+.key-reveal { border: 2px solid var(--navy); }
+.key-secret {
+  width: 100%; font-family: var(--mono); font-size: .86rem;
+  padding: 10px 12px; margin: 10px 0;
+  border: 1px solid var(--rule-strong); border-radius: var(--radius); background: var(--cream);
+}
+
 /* ======================================================== promotion */
 .promotion { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 14px; }
 .promotion .target { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; }

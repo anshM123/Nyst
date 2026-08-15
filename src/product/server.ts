@@ -1560,7 +1560,26 @@ function displayNameFromClaims(claims: Record<string, unknown>): string | null {
 function pageHandler(handler: (principal: ProductPrincipal, request: FastifyRequest, reply: FastifyReply) => Promise<string | FastifyReply>, repository: ProductRepository) { return async (request: FastifyRequest, reply: FastifyReply) => { const principal = await authenticate(request, repository); if (!principal) return reply.redirect("/login");if(principal.kind!=="session")return reply.code(403).type("text/html; charset=utf-8").send(genericPage("Session required","Dashboard pages require a browser session; API keys are limited to versioned API endpoints.")); const value = await handler(principal, request, reply); if (typeof value === "string") { const context=await repository.context(principal); return reply.type("text/html; charset=utf-8").send(value.replace("<!--NYST_CONTEXT-->",contextSwitcher(context))); } return value; }; }
 function api(handler: (principal: ProductPrincipal, request: FastifyRequest, reply: FastifyReply) => Promise<unknown>, repository: ProductRepository) { return async (request: FastifyRequest, reply: FastifyReply) => { const principal = await apiPrincipal(request, reply, repository); if (!principal) return; return handler(principal, request, reply); }; }
 async function apiPrincipal(request: FastifyRequest, reply: FastifyReply, repository: ProductRepository): Promise<ProductPrincipal | null> { const principal = await authenticate(request, repository); if (!principal) { reply.code(401).send({ error: "unauthorized", request_id: request.id }); return null; } return principal; }
-async function authenticate(request: FastifyRequest, repository: ProductRepository): Promise<ProductPrincipal | null> { const auth = request.headers.authorization; if (auth?.startsWith("Nyst ")) return repository.authenticateApiKey(auth.slice(5)); const session = request.cookies[SESSION_COOKIE]; return session ? repository.authenticateSession(session) : null; }
+/**
+ * `Bearer` is accepted alongside `Nyst` (v0.3.3).
+ *
+ * The custom scheme was the only one accepted, and every HTTP client, SDK and
+ * copied-from-the-docs snippet in the world defaults to `Bearer`. So the first
+ * thing anybody tries returns 401 with no hint that the SCHEME is the problem
+ * rather than the key — a papercut that costs a new customer their first
+ * twenty minutes, right at the point where they are deciding whether this
+ * product works.
+ *
+ * This is not a weakening. The credential is identical and verified
+ * identically; only the label in front of it changed.
+ */
+async function authenticate(request: FastifyRequest, repository: ProductRepository): Promise<ProductPrincipal | null> {
+  const auth = request.headers.authorization;
+  if (auth?.startsWith("Nyst ")) return repository.authenticateApiKey(auth.slice(5));
+  if (auth?.startsWith("Bearer ")) return repository.authenticateApiKey(auth.slice(7));
+  const session = request.cookies[SESSION_COOKIE];
+  return session ? repository.authenticateSession(session) : null;
+}
 function requireCsrf(request: FastifyRequest, principal: ProductPrincipal): void { if (principal.kind === "api_key") return; const value = request.headers["x-nyst-csrf"]; if (typeof value !== "string" || !principal.csrf_hash || digest(value) !== principal.csrf_hash) throw Object.assign(new Error("CSRF rejected"), { statusCode: 403 }); }
 function requireScope(principal: ProductPrincipal, scope: string): void { if (!principal.scopes.includes("*") && !principal.scopes.includes(scope)) throw Object.assign(new Error("Scope denied"), { statusCode: 403 }); }
 function requireAnyScope(principal:ProductPrincipal,scopes:readonly string[]):void{if(!principal.scopes.includes("*")&&!scopes.some(scope=>principal.scopes.includes(scope)))throw Object.assign(new Error("Scope denied"),{statusCode:403});}

@@ -189,6 +189,37 @@ export const APP_JS = `
       return;
     }
 
+    /**
+     * CREATE AN API KEY, and show the secret exactly once.
+     *
+     * The one place in the product where Nyst deliberately displays a secret.
+     * It is shown ONCE because only a hash is stored, so it cannot be shown
+     * again — and the UI has to make that unmissable rather than let someone
+     * navigate away and lose it.
+     *
+     * It goes into a selectable field, never into a prompt() and never into
+     * the clipboard automatically: a silent clipboard write moves a credential
+     * somewhere the person did not ask for it.
+     */
+    if (button.dataset.createKey) {
+      const name = prompt("Name this key so you can tell it apart later, e.g. \\"offboarding bot\\":");
+      if (name === null) return;
+      if (name.trim().length < 3) { announce(button, "A key needs a name you will recognise later.", true); return; }
+      const result = await send(button, "POST", "/v1/api-keys", {
+        name: name.trim(), scopes: button.dataset.createKey.split(","),
+      });
+      if (!result || !result.key) return;
+      showKeyOnce(button, result.key);
+      return;
+    }
+
+    if (button.dataset.revokeKey) {
+      if (!confirm("Revoke this key? Anything using it stops working immediately. This cannot be undone.")) return;
+      const result = await send(button, "DELETE", "/v1/api-keys/" + button.dataset.revokeKey, {});
+      if (result) location.reload();
+      return;
+    }
+
     if (button.dataset.preflight) {
       const result = await send(button, "POST", "/v1/integrations/" + button.dataset.preflight + "/preflight", {});
       if (result) location.reload();
@@ -363,6 +394,43 @@ export const APP_JS = `
       + ". Seed " + text(result.seed) + ", so this run reproduces exactly. "
       + "SIMULATION: no provider was contacted and nothing was mutated.</p></div>";
     panel.scrollIntoView({ block: "nearest" });
+  }
+
+  /**
+   * The one and only time this value exists outside the customer's own storage.
+   *
+   * Deliberately NOT auto-copied and NOT in a prompt(): a silent clipboard
+   * write puts a credential somewhere nobody asked for it, and a prompt is
+   * dismissed by reflex. It is a selectable field with an explicit copy button,
+   * and the page does not reload until the person says they have it — a reload
+   * would destroy the only copy.
+   */
+  function showKeyOnce(button, secret) {
+    const panel = document.createElement("div");
+    panel.className = "panel panel-pad gap-m key-reveal";
+    const title = document.createElement("h3");
+    title.textContent = "Copy this now — it is not shown again";
+    const field = document.createElement("input");
+    field.readOnly = true; field.className = "key-secret"; field.value = secret;
+    const note = document.createElement("p");
+    note.className = "small";
+    note.textContent = "Nyst stores only a hash of this key. Nobody, including Nyst, can show it to you again. "
+      + "If you lose it, revoke it and create another.";
+    const row = document.createElement("div");
+    row.className = "button-row";
+    const copy = document.createElement("button");
+    copy.type = "button"; copy.textContent = "Copy";
+    copy.addEventListener("click", () => {
+      field.select();
+      navigator.clipboard?.writeText(secret).then(() => { copy.textContent = "Copied"; }).catch(() => undefined);
+    });
+    const done = document.createElement("button");
+    done.type = "button"; done.textContent = "I have saved it";
+    done.addEventListener("click", () => location.reload());
+    row.appendChild(copy); row.appendChild(done);
+    panel.appendChild(title); panel.appendChild(field); panel.appendChild(note); panel.appendChild(row);
+    button.parentElement.parentElement.appendChild(panel);
+    field.focus(); field.select();
   }
 
   /** Escape before insertion. Everything here comes from a response body. */

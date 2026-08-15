@@ -960,6 +960,108 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
       "the retry does not reuse the Idempotency-Key, so it could create a second command");
   });
 
+  /* ================================ THE API KEY NOBODY COULD CREATE */
+
+  /**
+   * EIGHTH INSTANCE. GET, POST and DELETE /v1/api-keys all existed from the
+   * beginning with NOTHING in the interface calling them. Settings listed keys
+   * and offered no way to make one, so the only route to a key was curl with a
+   * session cookie and a CSRF token — precisely the thing an API key exists to
+   * avoid. The feature was unreachable by the people who needed it most.
+   */
+  it("THE DEFECT: a key can be created from the interface", () => {
+    assert.match(APP_JS, /dataset\.createKey/, "nothing in the shipped script creates an API key");
+    assert.match(APP_JS, /"POST", "\/v1\/api-keys"/, "the handler does not call the creation route");
+    const dashboard = readFileSync(join(root, "src/product/dashboard.ts"), "utf8");
+    assert.match(dashboard, /data-create-key="/, "the Settings page renders no way to create a key");
+    assert.match(dashboard, /data-revoke-key="/, "a key can be created and never revoked");
+  });
+
+  it("the secret is shown ONCE and never auto-copied", () => {
+    // A silent clipboard write moves a credential somewhere nobody asked for
+    // it; a prompt() is dismissed by reflex and the only copy is gone.
+    assert.match(APP_JS, /showKeyOnce/, "the created secret is not surfaced at all");
+    const reveal = APP_JS.slice(APP_JS.indexOf("function showKeyOnce"));
+    assert.doesNotMatch(reveal.slice(0, reveal.indexOf("addEventListener")), /navigator\.clipboard/,
+      "the key is written to the clipboard without the person asking");
+    assert.match(reveal, /not shown again/i, "the UI does not warn that this is the only chance");
+  });
+
+  it("A KEY ACTUALLY WORKS: it dispatches without a cookie or a CSRF token", async () => {
+    const created = await app.inject({
+      method: "POST", url: "/v1/api-keys", headers: auth(),
+      payload: { name: "workflow fixture key", scopes: ["actions:read", "integrations:read"] },
+    });
+    assert.equal(created.statusCode, 200, created.body);
+    const key = (created.json() as { key?: string; prefix?: string }).key;
+    assert.ok(key && key.length > 20, "no secret was returned, so the key is unusable");
+
+    // The whole point: NO cookie, NO CSRF header.
+    //
+    // BOTH schemes, because the custom `Nyst` prefix used to be the only one
+    // accepted and every HTTP client, SDK and copied snippet defaults to
+    // `Bearer` — so the first thing anybody tried returned 401 with no hint
+    // that the scheme rather than the key was the problem.
+    for (const scheme of ["Nyst", "Bearer"]) {
+      const used: { statusCode: number; body: string } = await app.inject({
+        method: "GET", url: "/v1/environment", headers: { authorization: `${scheme} ${key}` },
+      });
+      assert.equal(used.statusCode, 200,
+        `A FRESHLY CREATED KEY WAS REJECTED WITH "${scheme}" (${used.statusCode}). The key path is the `
+        + `interface a real customer uses: ${used.body.slice(0, 160)}`);
+    }
+  });
+
+  it("a key is confined to the scopes it was granted", async () => {
+    const created = await app.inject({
+      method: "POST", url: "/v1/api-keys", headers: auth(),
+      payload: { name: "read only fixture", scopes: ["actions:read"] },
+    });
+    const key = (created.json() as { key: string }).key;
+    // actions:write was NOT granted, so a dispatch must be refused.
+    const refused = await app.inject({
+      method: "POST", url: "/v1/actions",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      payload: { effect: "anything", businessKey: "scope-test", input: {} },
+    });
+    assert.equal(refused.statusCode, 403,
+      `A READ-ONLY KEY DISPATCHED AN ACTION (${refused.statusCode}). Scopes are decoration.`);
+  });
+
+  it("a revoked key stops working immediately", async () => {
+    const created = await app.inject({
+      method: "POST", url: "/v1/api-keys", headers: auth(),
+      payload: { name: "revocation fixture", scopes: ["actions:read"] },
+    });
+    const body = created.json() as { key: string; api_key_id: string };
+    assert.equal((await app.inject({
+      method: "GET", url: "/v1/environment", headers: { authorization: `Bearer ${body.key}` },
+    })).statusCode, 200);
+
+    // Asserted, not assumed: a silent revocation failure would otherwise look
+    // exactly like a revoked key that still authenticates.
+    const revoked = await app.inject({ method: "DELETE", url: `/v1/api-keys/${body.api_key_id}`, headers: auth(), payload: {} });
+    assert.equal(revoked.statusCode, 200, `the revocation itself failed: ${revoked.body.slice(0, 200)}`);
+    assert.equal((revoked.json() as { revoked?: boolean }).revoked, true,
+      `the route reported no revocation: ${revoked.body.slice(0, 200)}`);
+    const after = await app.inject({
+      method: "GET", url: "/v1/environment", headers: { authorization: `Bearer ${body.key}` },
+    });
+    assert.notEqual(after.statusCode, 200, "A REVOKED KEY STILL WORKS");
+  });
+
+  it("the key secret is never listed back, only its prefix", async () => {
+    const created = await app.inject({
+      method: "POST", url: "/v1/api-keys", headers: auth(),
+      payload: { name: "listing fixture", scopes: ["actions:read"] },
+    });
+    const key = (created.json() as { key: string }).key;
+    for (const url of ["/v1/api-keys", "/settings"]) {
+      const page = await app.inject({ method: "GET", url, headers: { cookie } });
+      assert.ok(!page.body.includes(key), `${url} RENDERED THE KEY SECRET. Only a hash is stored; nothing may echo it.`);
+    }
+  });
+
   it("connecting requires CSRF, like every other state-changing request", async () => {
     const response = await app.inject({
       method: "POST", url: "/v1/integrations/github/credential",

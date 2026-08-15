@@ -1073,15 +1073,41 @@ export function settingsPage(info: Record<string, unknown> | null, control: Reco
 
   <section class="section">
     <div class="section-head"><div><h2>API keys</h2></div></div>
+    <p class="lede">How your software calls Nyst. A key carries only the scopes you grant it, and may be bound
+      to one Agent so that a leaked key cannot act as a different one.</p>
     ${keys.length ? `<div class="table-scroll"><table>
-      <thead><tr><th scope="col">Name</th><th scope="col">Prefix</th><th scope="col">Bound Agent</th><th scope="col">Scopes</th><th scope="col">Last used</th><th scope="col">Status</th></tr></thead>
+      <thead><tr><th scope="col">Name</th><th scope="col">Prefix</th><th scope="col">Bound Agent</th><th scope="col">Scopes</th><th scope="col">Last used</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Action</span></th></tr></thead>
       <tbody>${keys.map((key) => `<tr>
         <td>${escape(String(key.name))}</td><td class="mono small">${escape(String(key.prefix))}</td>
         <td>${escape(String(key.agent_name ?? "any Agent"))}</td>
         <td class="small">${escape(((key.scopes as string[]) ?? []).join(", "))}</td>
         <td class="small">${escape(String(key.last_used_at ?? "never"))}</td>
         <td>${key.revoked_at ? `<span class="badge blocked">revoked</span>` : `<span class="badge resolved">active</span>`}</td>
+        <td>${key.revoked_at ? "" : `<button data-revoke-key="${escape(String(key.api_key_id ?? ""))}">Revoke</button>`}</td>
       </tr>`).join("")}</tbody></table></div>` : `<div class="panel panel-pad"><p class="empty">No API keys.</p></div>`}
+
+    <!--
+      THE CONTROL THAT DID NOT EXIST (v0.3.3).
+
+      GET, POST and DELETE /v1/api-keys all existed from the beginning with
+      NOTHING in the interface calling them, so this page could list keys and
+      offered no way to make one. The only route to a key was curl with a
+      session cookie and a CSRF token — which is precisely the thing an API key
+      exists to avoid, so the feature was unreachable by the people who needed
+      it most.
+
+      Eighth instance of this shape in one release.
+    -->
+    <div class="panel panel-pad gap-m">
+      <h3>Create a key</h3>
+      <p class="small">The secret is shown ONCE, on creation, and never again — Nyst stores only a hash.
+        Copy it before you close the message.</p>
+      <div class="button-row gap-m">
+        <button data-create-key="actions:read,actions:write,receipts:read,integrations:read">Create a key for this environment</button>
+      </div>
+      <p class="small">Scoped to <span class="mono">actions:read actions:write receipts:read integrations:read</span>,
+        and to THIS project and environment. It cannot reach another.</p>
+    </div>
   </section>
 
   <section class="section">
