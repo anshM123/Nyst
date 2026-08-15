@@ -23,7 +23,20 @@ export interface GitHubPublicPermissionInput {
   repository: string;
   principal: string;
   desired_permission: GitHubPermission;
-  credential_ref: string;
+  /**
+   * OPTIONAL since v0.3.3, and normally omitted.
+   *
+   * This used to be required AND pinned to the literal `env:NYST_GITHUB_TOKEN`,
+   * which meant a caller had to name the OPERATOR's environment variable in
+   * every action payload. A customer whose credential lives under their own
+   * tenant reference could reach `Ready` and still have every dispatch refused
+   * at input validation — the seventh appearance of this same defect.
+   *
+   * The tenant's configured connection is the authority. When this is supplied
+   * it must MATCH that connection, which keeps it useful as an explicit
+   * assertion about which credential the caller believes is in play.
+   */
+  credential_ref?: string;
 }
 
 export interface GitHubResolvedPermissionInput {

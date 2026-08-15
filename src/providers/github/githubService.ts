@@ -26,10 +26,30 @@ export class GitHubRepositoryPermissionService {
     options: CommitOptions = {}
   ): Promise<CommitResult> {
     const input = normalizePublicGitHubInput(publicInput);
-    if (context.credential_ref !== null && context.credential_ref !== input.credential_ref) {
+    /**
+     * THE TENANT'S CONNECTION IS THE AUTHORITY (v0.3.3).
+     *
+     * `credential_ref` used to be REQUIRED in the payload and pinned to the
+     * literal `env:NYST_GITHUB_TOKEN`, so every caller had to name the
+     * operator's environment variable. A customer whose credential lives under
+     * their own `tenant:` reference could reach Ready and still have every
+     * dispatch refused at input validation.
+     *
+     * Omitting it is now normal and correct: the connection configured for this
+     * environment decides. Supplying it is still allowed and still CHECKED,
+     * because "I believe I am acting with credential X" is a useful assertion
+     * for a caller to make and a useful one for Nyst to refuse.
+     */
+    const credentialRef = input.credential_ref ?? context.credential_ref;
+    if (credentialRef === null || credentialRef === undefined) {
+      throw new GitHubPreconditionError(
+        "No GitHub credential is configured for this environment. Connect GitHub on the Integrations page.");
+    }
+    if (input.credential_ref !== undefined && context.credential_ref !== null
+      && context.credential_ref !== input.credential_ref) {
       throw new GitHubPreconditionError("Context credential reference does not match GitHub input");
     }
-    const snapshot = await readGitHubPermissionSnapshot(this.client, input);
+    const snapshot = await readGitHubPermissionSnapshot(this.client, { ...input, credential_ref: credentialRef });
     const direct = snapshot.direct_collaborator !== null;
     const goalPresent =
       effectiveRoleMatches(snapshot.permission.role_name, input.desired_permission) &&
@@ -62,14 +82,14 @@ export class GitHubRepositoryPermissionService {
         principal_node_id: snapshot.principal.node_id,
         desired_permission: input.desired_permission,
         mutation_permission: mutationPermission(input.desired_permission),
-        credential_ref: input.credential_ref,
+        credential_ref: credentialRef,
         operation,
         preflight_role_name: snapshot.permission.role_name,
         preflight_direct: direct,
         organization_member: true,
         consistency_deadline: consistencyDeadline,
       },
-      { ...context, credential_ref: input.credential_ref },
+      { ...context, credential_ref: credentialRef },
       options
     );
   }

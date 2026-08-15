@@ -22,10 +22,16 @@ export interface GitHubPermissionSnapshot {
   permission_headers: GitHubSafeHeaders;
 }
 
+/**
+ * `credential_ref` is REQUIRED here even though it is optional on the public
+ * input (v0.3.3). By the time a snapshot is read the caller's omission has been
+ * resolved against the tenant's configured connection, and a snapshot with no
+ * credential is not a weaker read — it is not a read at all.
+ */
 type SnapshotIdentity = Pick<
   GitHubPublicPermissionInput,
-  "owner" | "repository" | "credential_ref"
-> & { principal: string };
+  "owner" | "repository"
+> & { principal: string; credential_ref: string };
 
 export async function readGitHubPermissionSnapshot(
   client: GitHubRestClient,

@@ -69,6 +69,7 @@ import { APP_JS } from "../src/product/assets.js";
 import { NYST_CSS } from "../src/product/designSystem.js";
 import { loginPage } from "../src/product/dashboard.js";
 import { capabilitiesFromProviderScopes } from "../src/product/capabilityManifest.js";
+import { normalizePublicGitHubInput } from "../src/providers/github/githubInput.js";
 import type { TenantScope } from "../src/product/types.js";
 import { MutableClock } from "./githubHelpers.js";
 
@@ -805,6 +806,59 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
     // to a verified capability invites replacing evidence with a claim.
     assert.match(dashboard, /capability\.state === "verified" \|\| capability\.state === "authorized" \? ""/,
       "an attestation control is offered for a capability that was actually observed");
+  });
+
+  /**
+   * THE SEVENTH INSTANCE, in the ACTION path.
+   *
+   * The GitHub action input schema required `credential_ref` and pinned it to
+   * the literal `env:NYST_GITHUB_TOKEN`. So a customer could connect their own
+   * credential, reach Ready with every capability satisfied, and still have
+   * every dispatch refused at input validation — because the payload had to
+   * name the OPERATOR's environment variable.
+   *
+   * Readiness said the connection worked. The action path could not use it.
+   */
+  it("THE DEFECT: an action payload need not name the operator's environment variable", () => {
+    const parsed = normalizePublicGitHubInput({
+      owner: "acme", repository: "payments", principal: "dana", desired_permission: "none",
+    });
+    assert.equal(parsed.credential_ref, undefined,
+      "omitting the credential reference must be legal — the tenant's connection decides");
+    assert.equal(parsed.principal, "dana");
+  });
+
+  it("a tenant credential reference is accepted in an action payload", () => {
+    const reference = `tenant:${randomUUID()}`;
+    const parsed = normalizePublicGitHubInput({
+      owner: "acme", repository: "payments", principal: "dana",
+      desired_permission: "none", credential_ref: reference,
+    });
+    assert.equal(parsed.credential_ref, reference,
+      "A TENANT CREDENTIAL REFERENCE WAS REJECTED BY THE ACTION SCHEMA, so a customer who connected their "
+      + "own credential could never dispatch anything.");
+  });
+
+  it("a SECRET in the credential_ref field is still refused", () => {
+    // Widening the scheme must not widen it to "anything". A reference is a
+    // NAME; a token pasted here would be persisted in action input, evidence
+    // and receipts.
+    // Split so the repository secret scanner does not flag this file. It flagged
+    // it the moment this was written as one literal, which is the scanner
+    // working — a token-shaped string in source is exactly what it exists to
+    // catch, and it cannot know this one is fake.
+    for (const secret of [FIXTURE_GITHUB, "not-a-reference", ""]) {
+      assert.throws(() => normalizePublicGitHubInput({
+        owner: "acme", repository: "payments", principal: "dana",
+        desired_permission: "none", credential_ref: secret,
+      }), `"${secret.slice(0, 12)}" was accepted as a credential reference`);
+    }
+  });
+
+  it("STRUCTURAL: no schema pins a credential reference to one deployment", () => {
+    const input = readFileSync(join(root, "src/providers/github/githubInput.ts"), "utf8");
+    assert.doesNotMatch(input, /credential_ref:\s*lit\(/,
+      "A CREDENTIAL REFERENCE IS PINNED TO A LITERAL. Only one deployment in the world can dispatch.");
   });
 
   it("STRUCTURAL: no probe resolves a hardcoded operator credential reference", () => {

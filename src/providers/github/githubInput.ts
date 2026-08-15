@@ -1,4 +1,4 @@
-import { bool, en, lit, obj, str, type Schema } from "../../core/validate.js";
+import { bool, en, lit, obj, opt, str, type Schema } from "../../core/validate.js";
 import {
   GITHUB_PERMISSIONS,
   type GitHubPublicPermissionInput,
@@ -10,12 +10,20 @@ const REPOSITORY = /^[A-Za-z0-9._-]{1,100}$/;
 const DIGITS = /^\d+$/;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
+/**
+ * A reference NAMES a secret and is never one. Same four schemes the
+ * SecretProvider accepts, including `tenant:` for a credential the customer
+ * supplied through the UI.
+ */
+const CREDENTIAL_REFERENCE = /^(?:env|vault|secret-manager|tenant):[A-Za-z0-9_./:-]{3,280}$/;
+
 const PublicInputSchema: Schema<GitHubPublicPermissionInput> = obj({
   owner: str({ min: 1, max: 39, pattern: OWNER_OR_LOGIN }),
   repository: str({ min: 1, max: 100, pattern: REPOSITORY }),
   principal: str({ min: 1, max: 39, pattern: OWNER_OR_LOGIN }),
   desired_permission: en(GITHUB_PERMISSIONS),
-  credential_ref: lit("env:NYST_GITHUB_TOKEN"),
+  // Optional, and pinned to no particular deployment. See the type for why.
+  credential_ref: opt(str({ min: 5, max: 300, pattern: CREDENTIAL_REFERENCE })),
 });
 
 export const GitHubResolvedInputSchema: Schema<GitHubResolvedPermissionInput> = obj({
@@ -30,7 +38,9 @@ export const GitHubResolvedInputSchema: Schema<GitHubResolvedPermissionInput> = 
   principal_node_id: str({ min: 1, max: 500 }),
   desired_permission: en(GITHUB_PERMISSIONS),
   mutation_permission: en(["none", "pull", "triage", "push", "maintain", "admin"] as const),
-  credential_ref: lit("env:NYST_GITHUB_TOKEN"),
+  // Resolved by the service from the tenant's own connection. Any legal
+  // reference, never one deployment's environment variable.
+  credential_ref: str({ min: 5, max: 300, pattern: CREDENTIAL_REFERENCE }),
   operation: en(["observe_only", "set_permission", "remove_collaborator"] as const),
   preflight_role_name: str({ min: 1, max: 200 }),
   preflight_direct: bool(),
@@ -49,6 +59,7 @@ export function normalizePublicGitHubInput(value: unknown): GitHubPublicPermissi
     repository: parsed.repository.toLowerCase(),
     principal: parsed.principal.toLowerCase(),
     desired_permission: parsed.desired_permission,
-    credential_ref: parsed.credential_ref,
+    // Absent is the normal case: the tenant's configured connection decides.
+    ...(parsed.credential_ref === undefined ? {} : { credential_ref: parsed.credential_ref }),
   };
 }
