@@ -1053,6 +1053,32 @@ export async function buildProductServer(options: ProductServerOptions): Promise
    * categorical outcome, and returns the six readiness dimensions. It never
    * mutates provider state and never returns the credential.
    */
+  /**
+   * Disconnect a provider (v0.3.2 Phase 11).
+   *
+   * Stops NEW provider work and invalidates readiness. It is NOT a kill switch
+   * for work already admitted -- Emergency Freeze is -- and the response says
+   * so, because a control a customer believes stops everything, and does not,
+   * is worse than no control.
+   *
+   * Historical evidence, receipts and audit are retained.
+   */
+  app.delete("/v1/integrations/:provider", api(async (principal, request) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const provider = String((request.params as { provider?: unknown }).provider ?? "");
+    if (provider !== "github" && provider !== "okta" && provider !== "stripe") {
+      throw Object.assign(new Error("Unsupported provider"), { statusCode: 400 });
+    }
+    const reason = string(object(request.body).reason, 1000);
+    const result = await options.repository.disconnectIntegration(principal, principal.user_id!, provider, reason);
+    return {
+      ...result,
+      stops: "New provider reads and mutations, and readiness for anything requiring this integration.",
+      does_not_stop: "Actions already admitted. Use Emergency Freeze to stop work that is in flight.",
+      retained: "Evidence, WorldFacts, receipts and audit are kept. Outcomes needing fresh evidence will become indeterminate as it goes stale.",
+    };
+  }, options.repository));
+
   app.post("/v1/integrations/:provider/preflight",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const provider=String((request.params as {provider?:unknown}).provider??"");if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});if(!options.integration_preflight)return {provider,status:"preflight_unavailable",read_only_preflight_performed:false,provider_mutation_performed:false,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};const preflight=await options.repository.runIntegrationPreflight(principal,provider,options.secrets,(secret)=>options.integration_preflight!(provider,secret));return {...preflight,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};},options.repository));
   // Retained path for existing integrations; same read-only behaviour.
   app.post("/v1/integrations/:provider/test",api(async(principal,request,reply)=>{reply.header("Deprecation","true");reply.header("Link","</v1/integrations/{provider}/preflight>; rel=\"successor-version\"");sessionOnly(principal);requireCsrf(request,principal);const provider=String((request.params as {provider?:unknown}).provider??"");if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const readiness=await options.repository.integrationReadiness(principal,provider,options.secrets);if(!readiness.credential_available||!options.integration_preflight)return {...readiness,read_only_preflight_performed:false,provider_mutation_performed:false};const preflight=await options.repository.runIntegrationPreflight(principal,provider,options.secrets,(secret)=>options.integration_preflight!(provider,secret));return {...preflight,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};},options.repository));

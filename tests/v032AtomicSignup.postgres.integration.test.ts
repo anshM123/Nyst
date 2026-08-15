@@ -156,18 +156,21 @@ describe("Nyst v0.3.2 Phase 4 — signup is one transaction", { skip: databaseUr
   it("no orphan policy or autonomy rule survives either", async () => {
     // The user-facing check above looks for the organization. This looks for
     // the rows that would be left DANGLING if the transaction leaked.
-    const before = (await pool.query(
-      `SELECT (SELECT count(*)::int FROM nyst_policy_versions) policies,
-              (SELECT count(*)::int FROM nyst_autonomy_rules)  rules`)).rows[0]!;
-
+    //
+    // Scoped to THIS signup's identifiers rather than counted globally: other
+    // suites create workspaces concurrently, and a global count made this
+    // assertion depend on what else happened to be running.
     const failing = new ProductRepository(poolFailingAt(3));
     await assert.rejects(failing.createBootstrap(bootstrapInput("orphan")), /forced failure/);
 
-    const after = (await pool.query(
-      `SELECT (SELECT count(*)::int FROM nyst_policy_versions) policies,
-              (SELECT count(*)::int FROM nyst_autonomy_rules)  rules`)).rows[0]!;
-    assert.equal(Number(after.policies), Number(before.policies), "an orphan policy survived");
-    assert.equal(Number(after.rules), Number(before.rules), "an orphan autonomy rule survived");
+    const orphans = (await pool.query(
+      `SELECT (SELECT count(*)::int FROM nyst_policy_versions p
+                 JOIN nyst_organizations o USING(organization_id) WHERE o.slug=$1) policies,
+              (SELECT count(*)::int FROM nyst_autonomy_rules a
+                 JOIN nyst_organizations o USING(organization_id) WHERE o.slug=$1) rules`,
+      [`atomic-orphan-${suffix}`])).rows[0]!;
+    assert.equal(Number(orphans.policies), 0, "an orphan policy survived");
+    assert.equal(Number(orphans.rules), 0, "an orphan autonomy rule survived");
   });
 
   /* ==================================================== REAL CONFLICTS */

@@ -608,8 +608,33 @@ export class ProductRepository {
     return { mode: normalizeMode(row.mode), is_demo: row.is_demo === true, onboarding_stage: Number(row.onboarding_stage ?? 0) };
   }
 
-  async setEnvironmentMode(scope: TenantScope, userId: string, mode: EnvironmentMode, reason: string): Promise<{ mode: EnvironmentMode }> {
+  /**
+   * Move an environment between Shadow, Canary and Enforced.
+   *
+   * COMMERCIAL ENTITLEMENT IS CHECKED HERE (v0.3.2 Phase 10), because this is
+   * the API a customer actually calls. Before v0.3.2 nothing checked it
+   * anywhere: the plan was never stored, so "Shadow Trial does not include
+   * Enforced" was true only of the pricing page and a trial user could POST
+   * straight here and get Enforced. Hiding the button is not enforcement.
+   *
+   * WHAT THIS CHECK IS NOT. It gates a COMMERCIAL feature and nothing else.
+   * Passing it means the customer is allowed to ASK for Enforced. Whether
+   * Enforced is SAFE is decided independently by readiness, policy, the
+   * Autonomy Line, Freeze, Blast Radius and Authority -- none of which look at
+   * the plan. Money decides what you may ask for, never what is safe.
+   *
+   * Moving back to SHADOW is never gated. A customer must always be able to
+   * stop controlling things, including one whose trial just expired.
+   */
+  async setEnvironmentMode(scope: TenantScope, userId: string, mode: EnvironmentMode, reason: string, entitlements?: { mayEnable(organizationId: string, feature: "enforced_mode" | "canary_mode"): Promise<{ decision: "allowed" | "refused"; reason: string; remedy: string | null }> }): Promise<{ mode: EnvironmentMode }> {
     if (!['shadow','canary','enforced'].includes(mode)) throw new Error("Unsupported environment mode");
+    if (entitlements && mode !== "shadow") {
+      const feature = mode === "enforced" ? "enforced_mode" as const : "canary_mode" as const;
+      const verdict = await entitlements.mayEnable(scope.organization_id, feature);
+      if (verdict.decision !== "allowed") {
+        throw Object.assign(new Error(verdict.reason), { statusCode: 402, nyst_blocked_by: "entitlement" });
+      }
+    }
     const result = await this.db.query(`WITH changed AS (
       UPDATE nyst_environments SET mode=$4 WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND mode<>$4
       RETURNING mode AS new_mode,(SELECT mode FROM nyst_environments WHERE environment_id=$1) AS previous_mode
@@ -874,7 +899,10 @@ export class ProductRepository {
         (SELECT coalesce(array_agg(effect_name ORDER BY effect_name),ARRAY[]::text[]) FROM nyst_environment_effect_specs
           WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND enabled AND split_part(effect_name,'.',1)=$4) enabled_effects
       FROM (SELECT 1) one
-      LEFT JOIN nyst_integrations i ON i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND i.provider=$4
+      -- disconnected_at IS NULL: a disconnected integration is not an
+      -- integration. Without this the row keeps answering and readiness
+      -- keeps saying ready for a connection the customer switched off.
+      LEFT JOIN nyst_integrations i ON i.environment_id=$1 AND i.project_id=$2 AND i.organization_id=$3 AND i.provider=$4 AND i.disconnected_at IS NULL
       LEFT JOIN LATERAL (SELECT status,performed_at,scope_result,account_identity,resource_result
         FROM nyst_integration_preflights
         WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4
@@ -1005,10 +1033,59 @@ export class ProductRepository {
    * row carries a CHECK constraint fixing provider_mutation_performed=false,
    * and runPreflight throws if a probe self-reports a mutation.
    */
+  /**
+   * Stop Nyst using a provider connection (v0.3.2 Phase 11).
+   *
+   * WHAT THIS DOES: blocks NEW provider work, and invalidates readiness -- a
+   * disconnected integration is not ready, so nothing that requires it can be
+   * admitted.
+   *
+   * WHAT THIS DOES NOT DO, stated plainly because a control that looks like a
+   * kill switch and is not one is worse than none: it does not stop work
+   * ALREADY ADMITTED. The integration is consulted at admission, and the
+   * scheduler, recovery worker and provider clients read the environment
+   * directly. Emergency Freeze is the thing that stops in-flight consequence.
+   *
+   * HISTORY IS RETAINED. Evidence, receipts, WorldFacts and audit rows all
+   * survive. Disconnecting a provider today does not make yesterday's
+   * observations untrue -- it makes them STALE, so an outcome that depends on
+   * fresh evidence correctly becomes INDETERMINATE instead of quietly keeping
+   * a verdict nothing supports any more.
+   */
+  async disconnectIntegration(scope: TenantScope, userId: string, provider: string, reason: string): Promise<{ disconnected: boolean }> {
+    await this.requireTenantScope(scope);
+    if (!["github","okta","stripe"].includes(provider)) throw Object.assign(new Error("Unsupported integration provider"), { statusCode: 400 });
+    if (reason.trim().length < 5) {
+      throw Object.assign(new Error("Disconnecting an integration requires a reason a person can read"), { statusCode: 400 });
+    }
+    const result = await this.db.query(
+      `UPDATE nyst_integrations
+         SET disconnected_at=now(), disconnected_by=$5, disconnect_reason=$6, configured=false
+       WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4 AND disconnected_at IS NULL
+       RETURNING integration_id`,
+      [scope.environment_id, scope.project_id, scope.organization_id, provider, userId, reason.trim()]);
+    return { disconnected: result.rows.length === 1 };
+  }
+
+  /**
+   * Reconnect. A deliberate act that clears the disconnection entirely.
+   *
+   * It does NOT restore readiness: the credential must be preflighted again,
+   * because nothing here knows whether it still works. That is the same rule
+   * rotation follows.
+   */
+  async reconnectIntegration(scope: TenantScope, provider: string, credentialRef: string): Promise<Record<string, unknown>> {
+    await this.db.query(
+      `UPDATE nyst_integrations SET disconnected_at=NULL, disconnected_by=NULL, disconnect_reason=NULL
+       WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,
+      [scope.environment_id, scope.project_id, scope.organization_id, provider]);
+    return this.configureIntegration(scope, provider, credentialRef);
+  }
+
   async runIntegrationPreflight(scope:TenantScope,provider:string,secrets:SecretProvider,probe:PreflightProbe,now:Date=new Date()):Promise<Record<string,unknown>>{
     if(!["github","okta","stripe"].includes(provider))throw new Error("Unsupported integration provider");
     await this.requireTenantScope(scope);
-    const row=(await this.db.query(`SELECT credential_ref,configured FROM nyst_integrations WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,
+    const row=(await this.db.query(`SELECT credential_ref,configured FROM nyst_integrations WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4 AND disconnected_at IS NULL`,
       [scope.environment_id,scope.project_id,scope.organization_id,provider])).rows[0];
     const reference=row?.configured===true&&typeof row.credential_ref==="string"?row.credential_ref:null;
     const record=await runPreflight(provider,reference,secrets,probe,now);
