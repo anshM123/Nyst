@@ -110,12 +110,27 @@ export class FederatedRepository {
   /* ------------------------------------------------------ identities */
 
   /** The user bound to this provider subject, or null. THE identity lookup. */
-  async userByProviderSubject(provider: string, subject: string): Promise<FederatedUser | null> {
+  /**
+   * The user bound to this provider subject, or null. THE identity lookup.
+   *
+   * SCOPED TO THE ISSUER (v0.3.2 Phase 12). A subject identifier is unique only
+   * WITHIN an issuer -- Okta hands out `00u...`, and so does every other Okta
+   * tenant; "123" is an entirely ordinary subject on a self-hosted provider.
+   * Matching on (provider, subject) alone would resolve one customer's OIDC
+   * user to a DIFFERENT customer's Nyst account as soon as two identity
+   * providers minted the same value.
+   *
+   * Google passes no config id and keeps the sentinel namespace: there is one
+   * Google, and its subjects are globally unique within it.
+   */
+  async userByProviderSubject(provider: string, subject: string, providerConfigId: string | null = null): Promise<FederatedUser | null> {
     const row = (await this.db.query(
       `SELECT u.user_id,u.organization_id,u.email,u.display_name
        FROM nyst_federated_identities f JOIN nyst_users u USING(user_id)
-       WHERE f.provider=$1 AND f.provider_subject=$2 AND f.disconnected_at IS NULL AND u.disabled_at IS NULL`,
-      [provider, subject])).rows[0];
+       WHERE f.provider=$1 AND f.provider_subject=$2 AND f.disconnected_at IS NULL AND u.disabled_at IS NULL
+         AND coalesce(f.provider_config_id, '00000000-0000-0000-0000-000000000000'::uuid)
+             = coalesce($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)`,
+      [provider, subject, providerConfigId])).rows[0];
     return row ? hydrateUser(row) : null;
   }
 
@@ -157,11 +172,14 @@ export class FederatedRepository {
     return String(row.federated_identity_id);
   }
 
-  async recordLogin(provider: string, subject: string): Promise<void> {
+  async recordLogin(provider: string, subject: string, providerConfigId: string | null = null): Promise<void> {
+    // Issuer-scoped for the same reason as the lookup above.
     await this.db.query(
       `UPDATE nyst_federated_identities SET last_login_at=now()
-       WHERE provider=$1 AND provider_subject=$2 AND disconnected_at IS NULL`,
-      [provider, subject]);
+       WHERE provider=$1 AND provider_subject=$2 AND disconnected_at IS NULL
+         AND coalesce(provider_config_id, '00000000-0000-0000-0000-000000000000'::uuid)
+             = coalesce($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)`,
+      [provider, subject, providerConfigId]);
   }
 
   async connectedIdentities(userId: string): Promise<ConnectedIdentity[]> {
