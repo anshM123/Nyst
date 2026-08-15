@@ -25,6 +25,7 @@ import { buildProductServer } from "../src/product/server.js";
 import { TestSecretProvider } from "../src/product/secretProvider.js";
 import { InMemoryOperationalMetrics, NystReconciliationScheduler } from "../src/product/scheduler.js";
 import { createPostgresStore } from "../src/store/postgresStore.js";
+import { EntitlementRepository } from "../src/product/entitlementRepository.js";
 import type { TenantScope } from "../src/product/types.js";
 import { MutableClock } from "./githubHelpers.js";
 
@@ -60,6 +61,25 @@ describe("Nyst v0.2.2 Phase 21 — complete customer value loop", { skip: databa
     runtime = product.runtime; descriptors = product.descriptors;
     const fake = descriptors.find((item) => item.provider === "fake")!;
     effect = fake.effect_name; specVersion = fake.spec_version;
+
+    /**
+     * A PLAN, MADE EXPLICIT (v0.3.3).
+     *
+     * PUT /v1/environment/mode now enforces commercial entitlement, which it
+     * did not when this suite was written: the check existed on the repository
+     * method and the route never passed it, so a trial organization could reach
+     * Enforced through the public API. Fixing that made every rollout test here
+     * fail with a clean 402, because a new workspace is a TRIAL.
+     *
+     * That is the gate working. These tests are about ROLLOUT MECHANICS, not
+     * billing, so the plan is granted here as a stated precondition rather than
+     * the gate being weakened to keep them green.
+     */
+    await new EntitlementRepository(pool).setEntitlement({
+      organization_id: tenant.organization_id, state: "enterprise", changed_by: null,
+      reason: "Rollout mechanics fixture: this suite exercises modes, not billing.",
+    });
+
     app = await buildProductServer({ repository, effect_specs: descriptors, runtime: product.runtime, commit: product.commit, production: false, secrets,
       verify_receipt: (receipt) => verifyResolution(signer, receipt as never) });
     const login = await app.inject({ method: "POST", url: "/v1/auth/login", payload: { organization: `northwind-${suffix}`, email: `it-${suffix}@northwind.test`, password } });

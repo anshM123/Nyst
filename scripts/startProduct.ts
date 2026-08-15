@@ -28,6 +28,8 @@ import { OutcomeRepository } from "../dist/src/product/outcome/outcomeRepository
 import { OutcomeShadow } from "../dist/src/product/outcome/outcomeShadow.js";
 import { EvidenceIngest, RelayCoordinator } from "../dist/src/product/outcome/evidenceIngest.js";
 import { AuthorityRepository } from "../dist/src/product/authority/authorityRepository.js";
+import { EntitlementRepository } from "../dist/src/product/entitlementRepository.js";
+import { TenantCredentialStore } from "../dist/src/product/tenantCredentials.js";
 import { registerPublicRoutes } from "../dist/src/public/publicRoutes.js";
 import { InboundRepository } from "../dist/src/public/inboundRepository.js";
 import { PasswordResetService } from "../dist/src/product/auth/passwordReset.js";
@@ -54,6 +56,34 @@ const pool = new pg.default.Pool({
 });
 const repository = new ProductRepository(pool);
 
+/**
+ * CUSTOMER-SUPPLIED CREDENTIALS (v0.3.3), if this deployment can hold them.
+ *
+ * Constructed at BOOT rather than lazily on the first connect request. A
+ * misconfigured key should fail while somebody is watching a deploy log, not
+ * when a customer is halfway through onboarding with a token in a form field.
+ *
+ * A deployment without the key is single-tenant — operator-configured `env:`
+ * and `vault:` references still work — and it says so once here rather than
+ * failing confusingly later. What it never does is quietly store plaintext.
+ */
+const tenantCredentials = TenantCredentialStore.configured(process.env.NYST_CREDENTIAL_KEY)
+  ? new TenantCredentialStore(pool, process.env.NYST_CREDENTIAL_KEY)
+  : null;
+structuredLog({
+  type: "credential_store",
+  // Deliberately NOT named "..._credentials": the structured logger redacts any
+  // field whose name contains "credential", which is correct and which turned
+  // this boolean into "[redacted]" — an operator could not read the one fact
+  // the line exists to report. Whether a key EXISTS is operational; the key
+  // itself is never logged and never could be from here.
+  self_serve_connections_enabled: tenantCredentials !== null,
+  detail: tenantCredentials
+    ? "Customers can connect their own providers through the UI."
+    : "NYST_CREDENTIAL_KEY is not set to 32 base64 bytes, so the connect form will refuse rather than "
+      + "store a credential in plaintext. Operator-configured env:/vault: references are unaffected.",
+});
+
 // First boot only: create the initial organization from explicit environment.
 const count = await pool.query(`SELECT count(*)::int count FROM nyst_organizations`);
 let bootstrapScope: Awaited<ReturnType<ProductRepository["createBootstrap"]>> | undefined;
@@ -64,6 +94,21 @@ if (Number(count.rows[0]?.count ?? 0) === 0 && process.env.NYST_BOOTSTRAP_ORGANI
     environment: required("NYST_BOOTSTRAP_ENVIRONMENT"), environment_slug: required("NYST_BOOTSTRAP_ENV_SLUG"),
     email: required("NYST_BOOTSTRAP_EMAIL"), display_name: required("NYST_BOOTSTRAP_DISPLAY_NAME"),
     password: required("NYST_BOOTSTRAP_PASSWORD"),
+    /**
+     * A NEW DEPLOYMENT STARTS IN SHADOW (v0.3.3).
+     *
+     * `createBootstrap` defaults to `enforced` and this call passed no mode, so
+     * a fresh deployment came up CONTROLLING a production environment that
+     * nobody had reviewed a single finding in. Every piece of copy in the
+     * product says Nyst starts by evaluating and prevents nothing until you
+     * decide otherwise; the deployment path did the opposite.
+     *
+     * Shadow is also the only honest default for a posture the operator has
+     * not chosen yet. Moving out of it is now a deliberate act with a reason,
+     * a commercial check and a readiness check behind it — see the control
+     * posture panel in Settings.
+     */
+    mode: "shadow",
   });
   structuredLog({ type: "bootstrap_created", organization_id: bootstrapScope.organization_id });
 }
@@ -157,6 +202,21 @@ const app = await buildProductServer({
   // Agent do, what happened to the operation, and what became true.
   outcomes: outcomeRepository,
   authority: new AuthorityRepository(pool),
+  /**
+   * COMMERCIAL ENTITLEMENT (v0.3.3).
+   *
+   * `buildProductServer` constructs one when this is absent, so this is belt
+   * and braces rather than the enforcement itself. Written out anyway, because
+   * the defect being repaired here was a safety layer that existed everywhere
+   * except the place it was needed.
+   */
+  entitlements: new EntitlementRepository(pool),
+  /**
+   * Present only when NYST_CREDENTIAL_KEY is configured. Absent, the connect
+   * form answers 503 with the exact reason and operator-configured references
+   * keep working — a single-tenant deployment is a coherent thing to be.
+   */
+  ...(tenantCredentials ? { tenant_credentials: tenantCredentials } : {}),
   shadow: new OutcomeShadow(pool, outcomeRepository),
   evidence: evidenceIngest,
   relay: new RelayCoordinator(pool, evidenceIngest),

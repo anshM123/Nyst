@@ -1,6 +1,6 @@
 {
   "name": "@nyst-ai/sdk",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": false,
   "description": "Client for Nyst \u2014 effect-control infrastructure for autonomous software. Know what actually happened after a consequential action, and what is safe to do next.",
   "license": "UNLICENSED",

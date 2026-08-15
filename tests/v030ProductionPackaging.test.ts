@@ -121,8 +121,8 @@ describe("Phase 1I — version truth", () => {
   ];
 
   for (const [name, version] of files) {
-    it(`${name} declares 0.3.2`, () => {
-      assert.equal(version, "0.3.2");
+    it(`${name} declares 0.3.3`, () => {
+      assert.equal(version, "0.3.3");
     });
   }
 

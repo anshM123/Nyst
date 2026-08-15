@@ -47,7 +47,29 @@ export const NYST_CSS = `
   --sans: ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 
-  --nav-width: 232px;
+  /**
+   * THE SHELL SCALES WITH THE VIEWPORT (v0.3.3).
+   *
+   * Both of these were fixed pixel values, and both were wrong at one end of
+   * the range. A 232px rail is generous on a 13" laptop and mean on a 32"
+   * monitor; a 1180px content cap left more than half of a 2560px display
+   * empty while tables scrolled horizontally inside a narrow column.
+   *
+   * They are now fluid. clamp() keeps a floor for small screens and a ceiling
+   * so the rail never becomes a landing page, and interpolates continuously
+   * between them rather than stepping at one breakpoint.
+   */
+  --nav-width: clamp(200px, 15vw, 300px);
+  --shell-gutter: clamp(18px, 2.2vw, 56px);
+  /**
+   * THE READING MEASURE STAYS.
+   *
+   * Widening the shell must not widen the PARAGRAPHS. Body text at 200
+   * characters per line is unreadable, so prose keeps a measure while tables,
+   * metric grids and diagrams take the full width. Fluid layout is not the same
+   * as unbounded line length, and trading one usability defect for another is
+   * not a fix.
+   */
   --measure: 68ch;
 }
 
@@ -127,6 +149,52 @@ small, .small { font-size: .8rem; color: var(--ink-muted); }
   text-decoration: none; color: inherit; border-radius: var(--radius);
 }
 .brand:hover span { color: #fff; }
+/**
+ * THE PLATE BEHIND THE MARK (v0.3.3).
+ *
+ * The Nyst mark is blue on transparent and the sidebar is navy, so on the
+ * deployed site the logo all but disappeared into its own background — the
+ * product's own identity was the least legible thing on the page.
+ *
+ * A light plate rather than a recoloured mark: the asset is the brand and gets
+ * reproduced as drawn. This is the same treatment a favicon gets on a dark tab
+ * bar, and it works for whatever the mark becomes later.
+ */
+.brand-plate {
+  display: grid; place-items: center;
+  width: 34px; height: 34px; flex: 0 0 34px;
+  background: #fff;
+  border-radius: 9px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.28);
+}
+.brand-plate img { width: 24px; height: 24px; display: block; }
+
+/**
+ * The same problem, the other logo.
+ *
+ * The sign-in page puts the nyst.ai WORDMARK on the navy panel, and the
+ * wordmark is drawn in the same navy. On the deployed site it was effectively
+ * invisible — the first thing a customer sees of the brand was a blank space
+ * where the brand should be.
+ *
+ * Wider padding than the square plate because a wordmark needs air around it
+ * to read as a lockup rather than a cropped image.
+ */
+.brand-plate-wide {
+  display: inline-block;
+  /* .login-brand is a flex COLUMN, whose default align-items is stretch — so
+     an inline-block plate grew to the full 930px panel width behind a 190px
+     logo. It has to shrink to its contents, and align-self is what does that
+     inside a flex parent; width:fit-content alone would not survive stretch. */
+  align-self: flex-start;
+  width: fit-content;
+  background: #fff;
+  border-radius: 12px;
+  padding: 14px 20px;
+  margin-bottom: 32px;
+  box-shadow: 0 2px 10px rgba(0,0,0,.22);
+}
+.brand-plate-wide img { display: block; width: 190px; max-width: 100%; margin: 0; }
 .brand img { width: 26px; height: 26px; display: block; }
 /* The product is called Nyst. The .ai lockup is reserved for external identity. */
 .brand span { font-size: 1.02rem; font-weight: 640; letter-spacing: -0.01em; color: #fff; }
@@ -160,14 +228,26 @@ small, .small { font-size: .8rem; color: var(--ink-muted); }
 
 .topbar {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  padding: 12px 28px; background: var(--surface); border-bottom: 1px solid var(--rule);
+  padding: 12px var(--shell-gutter); background: var(--surface); border-bottom: 1px solid var(--rule);
   position: sticky; top: 0; z-index: 20;
 }
 .topbar .context { display: flex; align-items: center; gap: 8px; font-size: .84rem; color: var(--ink-muted); min-width: 0; }
 .topbar .context strong { color: var(--ink); font-weight: 600; }
 .topbar .spacer { flex: 1 1 auto; }
 
-.content { padding: 26px 28px 64px; max-width: 1180px; width: 100%; min-width: 0; }
+/**
+ * The content area fills the window.
+ *
+ * No pixel cap. On a wide display the extra width goes to the things that
+ * benefit from it — tables that were scrolling horizontally, metric grids that
+ * were wrapping at four across, side-by-side comparisons — while --measure
+ * keeps prose readable. The very widest displays get a ceiling in vw so a
+ * single row of text is not stretched across an ultrawide.
+ */
+.content {
+  padding: clamp(18px, 2vw, 34px) var(--shell-gutter) 64px;
+  width: 100%; max-width: min(2100px, 100%); min-width: 0;
+}
 
 /* ============================================================ freeze banner */
 /* Serious, not theatrical. It is a statement of fact, not an alarm. */
@@ -445,7 +525,11 @@ legend { font-size: .78rem; font-weight: 660; letter-spacing: .04em; text-transf
 /* ============================================================ login */
 .login { display: grid; grid-template-columns: 1.15fr 1fr; min-height: 100vh; }
 .login-brand { background: var(--navy); color: #fff; padding: 56px 48px; display: flex; flex-direction: column; justify-content: center; }
-.login-brand img { width: 190px; max-width: 60%; margin-bottom: 32px; }
+/* The wordmark is inside .brand-plate-wide now, which owns its size and the
+   spacing below it. The old rule here set max-width:60% OF THE PLATE and a
+   32px bottom margin INSIDE it, so the logo shrank to 114px and the plate grew
+   a 32px empty strip under it. Sizing lives in one place. */
+.login-brand .brand-plate-wide img { width: 190px; max-width: 100%; height: auto; margin: 0; display: block; }
 .login-brand h1 { color: #fff; font-size: 2rem; letter-spacing: -0.025em; }
 .login-brand p { color: #B9C4E0; margin-top: 14px; max-width: 44ch; }
 .login-brand .eyebrow { color: #8494BD; margin-bottom: 10px; }
@@ -453,6 +537,75 @@ legend { font-size: .78rem; font-weight: 660; letter-spacing: .04em; text-transf
 .login-card form { max-width: 340px; width: 100%; }
 .login-card h2 { margin-bottom: 20px; }
 .login-card button { width: 100%; justify-content: center; margin-top: 6px; }
+
+/* ====================================================== Google sign-in */
+/**
+ * THE GOOGLE BUTTON (v0.3.3).
+ *
+ * It was an underlined blue text link, which read as a footnote next to a
+ * full-width primary button — so the fastest way to sign in looked like the
+ * least important thing on the card.
+ *
+ * Google's identity guidelines are specific and this follows them: white
+ * surface, 1px #747775 border, Roboto-or-system at 14px medium, the unmodified
+ * four-colour mark at 18px, and the exact wording "Sign in with Google". The
+ * mark is inline SVG — see GOOGLE_MARK for why it is not an <img>.
+ */
+.login-alt { max-width: 340px; width: 100%; margin-top: 18px; }
+.login-or {
+  display: flex; align-items: center; gap: 12px;
+  font-size: .78rem; color: var(--ink-faint); text-transform: uppercase; letter-spacing: .08em;
+  margin-bottom: 14px;
+}
+.login-or::before, .login-or::after { content: ""; flex: 1; height: 1px; background: var(--rule); }
+
+.google-signin {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  width: 100%; min-height: 40px; padding: 0 12px;
+  background: #FFF; border: 1px solid #747775; border-radius: 20px;
+  /* No underline, and not link-blue. This is a button. */
+  color: #1F1F1F; text-decoration: none;
+  font-family: var(--sans); font-size: 14px; font-weight: 500; letter-spacing: .01em;
+}
+.google-signin:hover { background: #F7F8F8; box-shadow: 0 1px 2px rgba(60,64,67,.3); }
+.google-signin:active { background: #F1F3F4; }
+.google-signin:focus-visible { outline: 2px solid var(--navy); outline-offset: 2px; }
+.google-mark { flex: 0 0 18px; display: block; }
+
+/* ==================================================== Failure Lab result */
+/* Rendered in place beside the control that produced it, never on a new page. */
+.lab-result {
+  background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius);
+  padding: 16px 18px; margin: 4px 0 10px;
+}
+.lab-result h3 { margin: 0; }
+
+/* ================================================= connect a provider */
+.connect-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-top: 14px; }
+.connect-form label { display: flex; flex-direction: column; gap: 5px; flex: 1 1 300px; min-width: 0; font-size: .82rem; font-weight: 600; }
+.connect-form input {
+  font-family: var(--mono); font-size: .84rem; padding: 8px 10px;
+  border: 1px solid var(--rule); border-radius: var(--radius); background: #fff; min-width: 0;
+}
+.connect-form .hint { font-weight: 400; color: var(--ink-muted); font-size: .78rem; }
+
+/* ======================================================== promotion */
+.promotion { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 14px; }
+.promotion .target { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; }
+.promotion .target.is-current { border-color: var(--navy); box-shadow: inset 0 0 0 1px var(--navy); }
+/* A commercial blocker and a safety blocker must not look the same. One means
+   "upgrade"; the other means "this is not safe yet". */
+.blocker { border-left: 3px solid var(--rule); padding: 6px 0 6px 11px; font-size: .82rem; }
+.blocker.commercial { border-left-color: var(--uncertain); }
+.blocker.readiness { border-left-color: var(--blocked); }
+.blocker.operational { border-left-color: var(--blocked); }
+.blocker .remedy { display: block; color: var(--ink-muted); margin-top: 3px; }
+
+@media (max-width: 720px) {
+  .login { grid-template-columns: 1fr; }
+  .login-brand { padding: 36px 24px; }
+  .login-card { padding: 36px 24px; }
+}
 
 /* ============================================================ document */
 /* Print-quality standalone documents (Protection Report, Proof Pack). */

@@ -14,8 +14,15 @@
 
 export type SecretReference = string;
 
-/** `scheme:path`, where the path never contains whitespace or control characters. */
-export const SECRET_REFERENCE_PATTERN = /^(?:env|vault|secret-manager):[A-Za-z0-9_./:-]{3,280}$/;
+/**
+ * `scheme:path`, where the path never contains whitespace or control characters.
+ *
+ * `tenant:` was added in v0.3.3 for credentials the CUSTOMER supplied through
+ * the UI, resolved from an encrypted table rather than the host environment.
+ * It is a name like every other scheme — `tenant:9f3c…` is a row id, and is as
+ * safe to log, render, sign and export as `env:NYST_GITHUB_TOKEN`.
+ */
+export const SECRET_REFERENCE_PATTERN = /^(?:env|vault|secret-manager|tenant):[A-Za-z0-9_./:-]{3,280}$/;
 
 export class SecretResolutionError extends Error {
   readonly category: "malformed_reference" | "unknown_scheme" | "not_found" | "provider_unavailable";

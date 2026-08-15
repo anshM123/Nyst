@@ -302,15 +302,18 @@ describe("Nyst v0.3.0 Phases 46-58 — the release gate", { skip: databaseUrl ? 
 
   /* =================================================== PHASE 1I: VERSION */
 
-  it("VERSION TRUTH: every artefact agrees on 0.3.2", () => {
+  it("VERSION TRUTH: every artefact agrees on 0.3.3", () => {
     const read = (path: string) => readFileSync(resolve(process.cwd(), path), "utf8");
     const root = JSON.parse(read("package.json")) as { version: string; name: string };
     const sdk = JSON.parse(read("packages/sdk/package.json")) as { version: string; name: string };
-    assert.equal(root.version, "0.3.2", "the root package does not claim 0.3.2");
-    assert.equal(sdk.version, "0.3.2", "the SDK does not claim 0.3.2");
-    assert.equal(NYST_VERSION, "0.3.2", "the server does not report 0.3.2");
+    assert.equal(root.version, "0.3.3", "the root package does not claim 0.3.3");
+    assert.equal(sdk.version, "0.3.3", "the SDK does not claim 0.3.3");
+    assert.equal(NYST_VERSION, "0.3.3", "the server does not report 0.3.3");
     for (const document of ["README.md", "VERIFICATION.md"]) {
-      assert.match(read(document), /0\.3\.2/, `${document} does not mention 0.3.2`);
+      // The CURRENT version. Both documents keep a history section naming
+      // every previous release, so asserting an OLD version here would pass
+      // forever and prove nothing about this build.
+      assert.match(read(document), /0\.3\.3/, `${document} does not mention 0.3.3`);
     }
   });
 

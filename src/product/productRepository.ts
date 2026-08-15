@@ -538,7 +538,10 @@ export class ProductRepository {
   async configureIntegration(scope: TenantScope, provider: string, credentialRef: string): Promise<Record<string, unknown>> {
     await this.requireTenantScope(scope);
     if (!["github","okta","stripe"].includes(provider)) throw new Error("Unsupported integration provider");
-    const ref=bounded(credentialRef,300,"credential reference"); if (!/^(?:env|vault|secret-manager):[A-Za-z0-9_./:-]{3,280}$/.test(ref)) throw new Error("Integration requires an opaque credential reference");
+    // `tenant:` added in v0.3.3 for credentials the CUSTOMER supplied through
+    // the UI. Still a NAME and never a secret: it is a row id, and the value it
+    // names lives encrypted in nyst_tenant_credentials.
+    const ref=bounded(credentialRef,300,"credential reference"); if (!/^(?:env|vault|secret-manager|tenant):[A-Za-z0-9_./:-]{3,280}$/.test(ref)) throw new Error("Integration requires an opaque credential reference");
     /**
      * ROTATION INVALIDATES THE PREFLIGHT (v0.3.1 issue 11).
      *
@@ -692,7 +695,13 @@ export class ProductRepository {
       const feature = mode === "enforced" ? "enforced_mode" as const : "canary_mode" as const;
       const verdict = await entitlements.mayEnable(scope.organization_id, feature);
       if (verdict.decision !== "allowed") {
-        throw Object.assign(new Error(verdict.reason), { statusCode: 402, nyst_blocked_by: "entitlement" });
+        // The REMEDY travels with the refusal. A commercial dead end that says
+        // only "not included" leaves the customer with nothing to do next, and
+        // it is the one refusal in this product that always has an answer.
+        throw Object.assign(new Error(verdict.reason), {
+          statusCode: 402, nyst_blocked_by: "entitlement",
+          nyst_remedy: verdict.remedy ?? "Contact sales to enable this mode for your organization.",
+        });
       }
     }
     const result = await this.db.query(`WITH changed AS (

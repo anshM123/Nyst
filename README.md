@@ -10,11 +10,37 @@
 INTENT → EXECUTION → OBSERVATION → RECONCILIATION → EFFECT STATE → CONTROL DECISION → SIGNED RECEIPT
 ```
 
-**Version 0.3.2 — launch RC.**
+**Version 0.3.3 — launch RC.**
 
 > **Just want to run it?** → **[RUN.md](RUN.md)** (fifteen minutes)
 > **Want to know what was actually verified?** → **[VERIFICATION.md](VERIFICATION.md)**
 > **Want to know where Nyst stops?** → **[Known boundaries](docs/product/known-boundaries.md)**
+
+## What is new in 0.3.3
+
+**The first pass driven by a real deployed site.** v0.3.2 shipped against a
+laptop database with nothing deployed. Nyst now runs on Render against managed
+PostgreSQL with Google sign-in working, and ten minutes of clicking found five
+defects that 1125 passing tests had no opinion about.
+
+| # | Defect | Why it mattered |
+|---|---|---|
+| A | The Failure Lab's outcome buttons were **forms with no handler** | A native form POST hit a JSON+CSRF API, got a 403, and the browser rendered raw error JSON. Clicking the flagship demo page's main control gave you a black screen |
+| B | The entitlement gate **had no caller — again** | `setEnvironmentMode` takes entitlements as an *optional* argument and `PUT /v1/environment/mode` never passed it, so a trial organization could reach Enforced through the public API. Eleven tests proved the parameter works; every one called the repository method directly |
+| C | Credentials were an **operator-only** feature | Every reference had to be `env:SOMETHING`. A customer who signs up on the hosted site cannot set an environment variable on your server, so only the operator could ever connect a provider. Nyst was multi-tenant in its data model and single-tenant in its onboarding |
+| D | A fresh deployment **bootstrapped into Enforced** | Every line of copy says Nyst starts by evaluating and prevents nothing until you decide otherwise. The deployment path did the opposite |
+| E | The layout was pinned to **1180px**, and Google sign-in was a blue text link | More than half a large display sat empty while tables scrolled inside a narrow column |
+
+B and C are the same shape as three of the eight defects in 0.3.2 — a complete,
+well-tested model with nothing calling it. **An optional safety argument fails
+open, fails silently, and type-checks.** The entitlement layer is now
+constructed unconditionally rather than passed in.
+
+New in this release: `tenant:` credential references (AES-256-GCM, scoped by
+organization *and* environment, bound into the cipher's AAD), a self-serve
+Connect flow for GitHub / Okta / Stripe, a **control posture** panel showing
+every unmet condition between you and Enforced with its remedy, and a structural
+test that no form anywhere may post to a `/v1/` endpoint without a handler.
 
 ## What is new in 0.3.2
 

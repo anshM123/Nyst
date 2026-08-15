@@ -128,6 +128,33 @@ export const APP_JS = `
       return;
     }
 
+    /**
+     * LEAVING SHADOW.
+     *
+     * Confirmed deliberately, and the reason is required rather than generated:
+     * the audit row this writes is immutable and somebody will read it during
+     * an incident six months from now. "Changed via UI" would be useless then.
+     *
+     * A refusal here is rendered in place by send(), which already prefers the
+     * server's stated reason — so a 402 shows the commercial sentence and a 409
+     * shows the safety one, rather than both collapsing into "failed".
+     */
+    if (button.dataset.setMode) {
+      const mode = button.dataset.setMode;
+      const warning = mode === "shadow"
+        ? "Returning to Shadow. Nyst will evaluate everything and prevent nothing."
+        : "Moving to " + mode.toUpperCase() + " means Nyst will begin REFUSING your software's actions, not just reporting on them.\\n\\nThis is recorded permanently and cannot be edited afterwards.";
+      const reason = prompt(warning + "\\n\\nWhy are you making this change?");
+      if (reason === null) return;
+      if (reason.trim().length < 5 && mode !== "shadow") {
+        announce(button, "Leaving Shadow requires a reason a person can read later.", true);
+        return;
+      }
+      const result = await send(button, "PUT", "/v1/environment/mode", { mode, reason });
+      if (result) location.reload();
+      return;
+    }
+
     if (button.dataset.freeze) {
       // A freeze stops every new consequence in scope. Confirm deliberately.
       const reason = prompt("Activating an Emergency Freeze stops every NEW consequential action in this environment.\\n\\nRead-only reconciliation continues.\\n\\nReason for the freeze:");
@@ -198,6 +225,113 @@ export const APP_JS = `
     const data = Object.fromEntries(new FormData(form).entries());
     const result = await send(button, "POST", "/v1/failure-lab/runs", { scenario: data.scenario, seed: Number(data.seed) });
     if (result) location.reload();
+  });
+
+  /**
+   * THE FAILURE LAB OUTCOME CONTROLS (v0.3.3).
+   *
+   * THE DEFECT. These forms were rendered with data-lab-outcome and NOTHING
+   * LISTENED FOR THEM. So the browser performed a native form POST to a
+   * JSON+CSRF API: no CSRF header, wrong content type, 403, and the browser
+   * painted the raw JSON error body in its own viewer. A customer clicked a
+   * button on the flagship demonstration page and landed on a black screen full
+   * of pretty-printed error JSON.
+   *
+   * Two rules follow from that, and both are asserted by tests.
+   *
+   * NEVER NAVIGATE. Whatever happens — success, refusal, network failure — the
+   * customer stays on this page. Navigation is the failure being replaced.
+   *
+   * NEVER RELOAD. A lab run is COMPUTED AND RETURNED, never stored: it is a
+   * simulation, and persisting simulated verdicts next to real ones is exactly
+   * the confusion the SIMULATION banner exists to prevent. So a reload would
+   * silently discard the result the customer just asked for.
+   */
+  document.addEventListener("submit", async (event) => {
+    const form = event.target.closest("form[data-lab-outcome]");
+    if (!form) return;
+    event.preventDefault();
+    const fault = form.dataset.labOutcome;
+    const button = form.querySelector("button");
+    const result = await send(button, "POST", "/v1/failure-lab/outcome-runs", { fault, seed: 1 });
+    if (result) renderOutcomeRun(form, result);
+  });
+
+  /**
+   * Render the verdict beside the control that produced it.
+   *
+   * The three verdicts get three different treatments and INDETERMINATE is not
+   * a lesser version of the other two — it is Nyst concluding that it looked
+   * and cannot establish what is true, which is the answer this product exists
+   * to be able to give.
+   */
+  function renderOutcomeRun(form, result) {
+    const row = form.closest("tr") || form.parentElement;
+    let panel = row.parentElement.querySelector("[data-lab-outcome-result]");
+    if (!panel) {
+      panel = document.createElement("tr");
+      panel.dataset.labOutcomeResult = "true";
+      const cell = document.createElement("td");
+      cell.colSpan = 4;
+      panel.appendChild(cell);
+      row.parentElement.insertBefore(panel, row.nextSibling);
+    }
+    const evaluation = result.evaluation || {};
+    const verdict = String(evaluation.verdict || "indeterminate");
+    const badge = verdict === "satisfied" ? "resolved" : verdict === "unsatisfied" ? "blocked" : "uncertain";
+    const invariants = (evaluation.required || []).map((invariant) => {
+      const state = invariant.result === "true" ? "pass" : invariant.result === "false" ? "fail" : "unknown";
+      const word = invariant.result === "true" ? "Holds" : invariant.result === "false" ? "FALSE" : "Unknown";
+      return '<li><span class="state ' + state + '">' + word + '</span>'
+        + '<span class="body"><strong>' + text(invariant.statement) + '</strong>'
+        + '<span>' + text(invariant.reason) + '</span></span></li>';
+    }).join("");
+    const coverage = evaluation.coverage || {};
+    panel.firstChild.innerHTML =
+      '<div class="lab-result">'
+      + '<div class="split-top"><h3>' + text((result.description || {}).title || result.label || "Result") + '</h3>'
+      + '<span class="badge ' + badge + '">' + text(verdict) + '</span></div>'
+      + (invariants ? '<ul class="checks gap-m">' + invariants + '</ul>' : "")
+      + '<p class="small gap-m">Coverage ' + text(coverage.numerator) + "/" + text(coverage.denominator)
+      + ". Seed " + text(result.seed) + ", so this run reproduces exactly. "
+      + "SIMULATION: no provider was contacted and nothing was mutated.</p></div>";
+    panel.scrollIntoView({ block: "nearest" });
+  }
+
+  /** Escape before insertion. Everything here comes from a response body. */
+  function text(value) {
+    const node = document.createElement("span");
+    node.textContent = value === undefined || value === null ? "" : String(value);
+    return node.innerHTML;
+  }
+
+  /**
+   * CONNECT A PROVIDER (v0.3.3).
+   *
+   * The one form in the product whose field contains a real secret. So:
+   * the input is CLEARED the moment the request is issued, whatever the
+   * outcome, and the value is never written anywhere else — not to a dataset
+   * attribute, not to sessionStorage, not into the note text on failure.
+   */
+  document.addEventListener("submit", async (event) => {
+    const form = event.target.closest("form[data-connect-provider]");
+    if (!form) return;
+    event.preventDefault();
+    const provider = form.dataset.connectProvider;
+    const field = form.querySelector("input[name=credential]");
+    const button = form.querySelector("button");
+    const credential = field.value;
+    // Cleared before the await, so a slow network never leaves a token sitting
+    // in a visible field on an unattended screen.
+    field.value = "";
+    const result = await send(button, "POST", "/v1/integrations/" + provider + "/credential", { credential });
+    if (!result) return;
+    announce(button, "Stored (" + result.fingerprint + "). " + result.next_step, false);
+    // Storing is not verifying. Run the read-only preflight immediately so the
+    // customer finds out now whether the credential actually works, rather than
+    // discovering it during their first real action.
+    const preflight = await send(button, "POST", "/v1/integrations/" + provider + "/preflight", {});
+    if (preflight) location.reload();
   });
 })();
 `;

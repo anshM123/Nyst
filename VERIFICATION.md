@@ -12,14 +12,76 @@ verified, with the reason.
 
 | | |
 | --- | --- |
-| Version | **0.3.2 — launch RC** |
-| Automated tests | **1125 passing, 0 failing, 0 skipped** |
-| Test suites | 136 |
-| Migrations | 35, applied cleanly from an empty database |
+| Version | **0.3.3 — launch RC** |
+| Automated tests | **1152 passing, 0 failing, 0 skipped** |
+| Test suites | 138 |
+| Migrations | 37, applied cleanly from an empty database |
 | Runtime dependencies | 4 — `fastify`, `@fastify/cookie`, `bcryptjs`, `pg` |
 | Secret scan | No credential-shaped value in source, tests, docs, migrations, brand assets, the packed SDK tarball, or the Docker build context |
 
-Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → **1125**.
+Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1152**.
+
+---
+
+## What v0.3.3 added, and what proves it
+
+**This is the first pass driven by a real deployed site.** Everything before it
+was verified against a laptop database. Nyst now runs on Render against managed
+PostgreSQL with Google sign-in working, and ten minutes of a person clicking
+around found five defects that 1125 passing tests had no opinion about.
+
+That is the finding, not an aside. **A test suite cannot fail on a control
+nobody wired up**, and four of the five defects below are exactly that shape.
+
+### The five
+
+| Defect | Proof it is fixed |
+|---|---|
+| Failure Lab outcome buttons were forms with **no handler** — a native POST to a JSON+CSRF API, answered 403, rendered as raw JSON on a blank page | A **structural** test over all of `src/`: no `<form>` may post to a `/v1/` endpoint unless a handler is bound to its id or a data attribute. Plus a live browser click confirming the page does not navigate and renders a verdict |
+| `PUT /v1/environment/mode` **never passed** the entitlements argument, so a trial organization could reach Enforced through the public API | A test that drives the **HTTP route** and asserts 402 + `blocked_by: entitlement` + a remedy, and that the mode did not move |
+| Every credential reference had to be `env:` — an operator-only feature, so no self-serve customer could ever connect a provider | An HTTP connect flow storing a `tenant:` reference, plus the adversarial test below |
+| A fresh deployment **bootstrapped into Enforced** | Verified on a genuinely empty database: an environment *named* "Production" comes up in `shadow` |
+| Layout pinned to 1180px; Google sign-in was a blue text link | Measured in a real browser at 1920/1366/375. 99.2% of a 1920px viewport used, prose still capped at `--measure`, no horizontal scroll at any width |
+
+### The credential scheme, and the risk it introduces
+
+`tenant:<uuid>` names a ROW, which means unlike `env:` it is **addressable**.
+If resolution were id-bound rather than scope-bound, one organization could
+configure its integration with another organization's credential id — the
+v0.3.2 Phase 2 defect through a new door.
+
+So the scope is in the `WHERE` clause and bound into the cipher's AAD. Another
+tenant's id is **not found** rather than found-and-refused: there is no
+authorization step anybody can forget to write. There is a test that tries it.
+
+Also verified: ciphertext never contains the plaintext, a revoked credential
+stops resolving with no cache window, storing supersedes rather than
+accumulating, a missing key **refuses to construct** rather than storing
+plaintext, and the credential appears on **none** of 13 authenticated pages nor
+in the server log — checked against a running server, not only in unit tests.
+
+### Honest limitations of this release
+
+- **The encryption key lives in the deployment's environment.** Someone with
+  both the database and the running host has everything. This protects a leaked
+  backup, a dropped disk and a SQL-injection read. It does not protect a
+  compromised host. A KMS-backed key would; the constructor takes the key from
+  outside precisely so that swap is a one-line change.
+- **No live provider has been contacted.** Every credential in every test is
+  provider-*shaped* and fake. The connect flow, the encryption and the refusal
+  paths are verified; whether a real GitHub token produces a successful
+  preflight is **NOT INDEPENDENTLY VERIFIED** and needs one read-only token.
+- **Observation semantics remain `measured_at: null`** — DECLARED, NOT
+  MEASURED — unchanged from v0.3.2, with the test that fails if one claims
+  otherwise.
+- **Screenshots were unavailable** in the verification environment. Layout was
+  confirmed by measuring computed geometry and colours in a real browser
+  (element widths, background colours, scroll overflow) rather than by eye.
+- **Five tests failed transiently on one full-suite run** while two dev servers
+  with active background workers were polling the same PostgreSQL instance.
+  They pass in isolation and the suite is green across two subsequent clean
+  runs. Recorded rather than omitted: it is a real property of running the
+  suite alongside live workers.
 
 ---
 
@@ -293,7 +355,7 @@ provider-shaped clients and fault injection.
 
 **Nyst v0.3.2 is not LAUNCH READY**, and this document will say so until it is.
 
-What is true: the architecture is complete across all three layers, 1125 tests
+What is true: the architecture is complete across all three layers, 1152 tests
 pass with nothing skipped, every known defect has a regression test that failed
 first, and every boundary above is stated rather than hidden.
 

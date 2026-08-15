@@ -7,13 +7,15 @@ import { APP_CSS, APP_JS, LOGIN_JS, PRODUCT_ENHANCEMENT_CSS } from "./assets.js"
 import { actionPage, actionsPage, agentsPage, effectRegistryPage, failureLabPage, genericPage, integrationsPage, loginPage, needsAttentionPage, offboardingPage, onboardingPage, overviewPage, policiesPage, protectionPage, receiptPage, receiptsPage, reviewsPage, settingsPage, type ShellContext } from "./dashboard.js";
 import { digest, ProductRepository } from "./productRepository.js";
 import type { PreflightProbeResult } from "./readiness.js";
-import type { SecretProvider } from "./secretProvider.js";
+import { SecretResolutionError, type SecretProvider } from "./secretProvider.js";
+import { TENANT_REFERENCE, TenantCredentialStore, assertProvider } from "./tenantCredentials.js";
+import { EntitlementRepository, featureForMode } from "./entitlementRepository.js";
 import { NYST_SAFETY_FLOOR } from "./policyTemplates.js";
 import { healthMetricsText } from "./operationalHealth.js";
 import { LAB_EFFECT } from "./failureLabEngine.js";
 
 /** Single source of the product version string. */
-export const NYST_VERSION = "0.3.2";
+export const NYST_VERSION = "0.3.3";
 import { protectionReportCsv } from "./protectionReport.js";
 import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";
@@ -106,6 +108,25 @@ export interface ProductServerOptions {
   outcomes?: OutcomeRepository;
   /** The AUTHORITY layer. */
   authority?: AuthorityRepository;
+  /**
+   * COMMERCIAL ENTITLEMENT (v0.3.3).
+   *
+   * Not optional in spirit. `setEnvironmentMode` takes entitlements as an
+   * OPTIONAL argument and this route did not pass it, so a trial organization
+   * could PUT its way to Enforced — the exact sentence Phase 10 claimed to have
+   * fixed, with eleven passing tests that all called the repository method
+   * directly. When this is absent the server now constructs one from the
+   * repository's own pool rather than silently skipping the check.
+   */
+  entitlements?: EntitlementRepository;
+  /**
+   * Customer-supplied provider credentials (v0.3.3).
+   *
+   * Without this, the only resolvable references are the ones the OPERATOR set
+   * in the host environment, which means a self-serve customer can never
+   * connect a provider at all.
+   */
+  tenant_credentials?: TenantCredentialStore;
   /** Outcome Shadow: independent evaluation of a customer's existing Agents. */
   shadow?: OutcomeShadow;
   /** Renders the public marketing home for an anonymous visitor at "/". */
@@ -191,7 +212,44 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     const status = candidate >= 400 && candidate < 500 ? candidate : 500;
     if (status === 500) return reply.code(500).send({ error: "internal_error", request_id: request.id });
     const message = error instanceof Error ? error.message.replace(/[\r\n]+/g, " ").slice(0, 200) : "";
-    reply.code(status).send({ error: "invalid_request", ...(message ? { detail: message } : {}), request_id: request.id });
+    /**
+     * WHICH LAYER REFUSED, carried through to the client (v0.3.3).
+     *
+     * A commercial refusal and a safety refusal have different remedies and
+     * must not be rendered identically: one means "upgrade", the other means
+     * "this is not safe yet". Collapsing them teaches an operator that safety
+     * refusals are a billing inconvenience. The status codes already differ —
+     * 402 against 409 — and this names the layer explicitly so a client does
+     * not have to infer it from a number.
+     */
+    const detail = error as { nyst_blocked_by?: unknown; nyst_remedy?: unknown; nyst_disposition?: unknown };
+    reply.code(status).send({
+      error: "invalid_request",
+      ...(message ? { detail: message } : {}),
+      ...(typeof detail.nyst_blocked_by === "string" ? { blocked_by: detail.nyst_blocked_by } : {}),
+      ...(typeof detail.nyst_remedy === "string" ? { remedy: detail.nyst_remedy } : {}),
+      ...(typeof detail.nyst_disposition === "string" ? { disposition: detail.nyst_disposition } : {}),
+      request_id: request.id,
+    });
+  });
+
+  /**
+   * What each mode MEANS, in one sentence, wherever it is offered.
+   *
+   * These are the formal definitions from goLiveReadiness, not marketing. A
+   * customer choosing to leave Shadow is choosing to let software prevent
+   * things, and the control that offers that choice has to say so plainly.
+   */
+  const MODE_DESCRIPTIONS: Readonly<Record<"shadow" | "canary" | "enforced", string>> = Object.freeze({
+    shadow:
+      "Nyst evaluates every action with the real EffectSpec semantics and controls nothing. Nothing is "
+      + "prevented. This is always available, including on an expired plan.",
+    canary:
+      "Nyst controls a deterministic subset — specific Agents and EffectSpecs. Everything outside that "
+      + "scope continues unchanged, so the blast radius of being wrong is bounded by construction.",
+    enforced:
+      "Every consequential action in this environment routes through Nyst safety control, and unsafe ones "
+      + "are prevented rather than reported.",
   });
 
   app.get("/assets/app.css", async (_request, reply) => reply.type("text/css; charset=utf-8").send(APP_CSS+PRODUCT_ENHANCEMENT_CSS));
@@ -403,6 +461,150 @@ export async function buildProductServer(options: ProductServerOptions): Promise
    * Read from persisted state on every render, never cached, so the freeze
    * banner and the attention badge cannot go stale.
    */
+  /**
+   * THE PER-REQUEST SECRET RESOLVER (v0.3.3).
+   *
+   * `secretsFor(principal)` resolves references the OPERATOR configured — `env:`,
+   * `vault:`, `secret-manager:`. It has no tenant and needs none: naming a
+   * different environment variable gets you a variable that does not exist.
+   *
+   * A `tenant:` reference is different in kind. It is a ROW ID, so it is
+   * addressable, and resolving one without a scope would let an organization
+   * configure its integration with another organization's credential id. That
+   * is the v0.3.2 Phase 2 defect — one customer acting with another customer's
+   * token — reintroduced through a new door.
+   *
+   * So a tenant reference is never resolvable except through a resolver built
+   * for one exact scope. This function is the only place the two schemes meet,
+   * and it takes the principal, which means every caller has already proved who
+   * is asking before a credential can be reached.
+   */
+  function secretsFor(principal: ProductPrincipal): SecretProvider {
+    const base = options.secrets;
+    const tenantStore = options.tenant_credentials;
+    // TOTAL on purpose. An optional SecretProvider is what let readiness treat
+    // "no resolver configured" as "nothing to check" at some call sites and as
+    // a 503 at others. This always returns a resolver; one that resolves
+    // nothing still REFUSES rather than quietly reporting success.
+    return {
+      async resolve(reference: string): Promise<string> {
+        if (TENANT_REFERENCE.test(reference)) {
+          if (!tenantStore) throw new SecretResolutionError("provider_unavailable", reference);
+          return tenantStore.scopedTo(principal).resolve(reference);
+        }
+        if (!base) throw new SecretResolutionError("unknown_scheme", reference);
+        return base.resolve(reference);
+      },
+    };
+  }
+  /** Can this deployment resolve credentials at all, by either route? */
+  const secretsAvailable = (): boolean => Boolean(options.secrets ?? options.tenant_credentials);
+
+  /**
+   * Entitlement, constructed unconditionally.
+   *
+   * Deliberately NOT `options.entitlements ?? undefined`. The whole defect this
+   * repairs is that a missing entitlement layer meant NO commercial check
+   * rather than a refusal — an omission that opens the gate. Building one from
+   * the repository's own pool means the check exists in every deployment, and a
+   * caller cannot forget to pass it because there is nothing to pass.
+   */
+  const entitlementLayer = options.entitlements ?? new EntitlementRepository(options.repository.database);
+
+  /**
+   * Every mode this environment could move to, and what is in the way.
+   *
+   * The three refusal families are kept SEPARATE on purpose. Commercial,
+   * safety-readiness and operational blocks have different remedies, and a UI
+   * that renders them as one list of red text teaches an operator to treat
+   * "upgrade your plan" and "this is not safe yet" as the same kind of problem.
+   */
+  async function promotionView(principal: ProductPrincipal): Promise<Record<string, unknown>> {
+    const [control, readiness, freezes] = await Promise.all([
+      options.repository.environmentControl(principal),
+      secretsAvailable()
+        ? options.repository.integrationsReadiness(principal, secretsFor(principal)!).catch(() => [])
+        : Promise.resolve([]),
+      options.repository.freezeState(principal),
+    ]);
+
+    const providers = await Promise.all((["github", "okta", "stripe"] as const).map(async (provider) => {
+      const item = readiness.find((entry) => entry.provider === provider) ?? null;
+      const stored = options.tenant_credentials
+        ? await options.tenant_credentials.describe(principal, provider).catch(() => null)
+        : null;
+      return {
+        provider,
+        /** A credential exists. Says nothing about whether it works. */
+        connected: item?.configured === true || stored !== null,
+        /**
+         * A successful read-only preflight inside the trust window. This is the
+         * only field entitled to imply a working connection, and it is computed
+         * by the same readiness evaluator every other page reads.
+         */
+        verified: item?.preflight_verified === true,
+        ready: item?.ready === true,
+        reason: item?.reason ?? "No credential is configured for this provider.",
+        credential_source: stored ? "customer_supplied" : item?.configured ? "operator_configured" : null,
+        fingerprint: stored?.fingerprint ?? null,
+      };
+    }));
+
+    const targets = await Promise.all((["shadow", "canary", "enforced"] as const).map(async (mode) => {
+      const blockers: Array<{ kind: string; reason: string; remedy: string | null }> = [];
+
+      // COMMERCIAL. Decides what you may ASK for, never what is safe.
+      const feature = featureForMode(mode);
+      if (feature) {
+        const verdict = await entitlementLayer.mayEnable(principal.organization_id, feature);
+        if (verdict.decision !== "allowed") {
+          blockers.push({ kind: "commercial", reason: verdict.reason, remedy: verdict.remedy });
+        }
+      }
+
+      // OPERATIONAL. A freeze is an active decision to stop, so promoting
+      // through one would silently override somebody's incident response.
+      if (mode !== "shadow" && freezes.freezes.length > 0) {
+        blockers.push({
+          kind: "operational",
+          reason: "An Emergency Freeze is active in this environment, so no new consequential action may begin.",
+          remedy: "Investigate the incident, then release the freeze with explicit confirmation.",
+        });
+      }
+
+      // SAFETY. Enforcement with no verified provider means Nyst would be
+      // controlling actions it cannot observe the results of.
+      if (mode === "enforced" && !providers.some((provider) => provider.verified)) {
+        blockers.push({
+          kind: "readiness",
+          reason:
+            "No provider has a successful read-only preflight inside the trust window, so Nyst cannot "
+            + "independently observe whether anything it allows actually took effect.",
+          remedy: "Connect a provider and run its read-only preflight.",
+        });
+      }
+
+      return {
+        mode,
+        current: control.mode === mode,
+        allowed: blockers.length === 0,
+        blockers,
+        // Shadow is always reachable. Charging for the ability to STOP
+        // controlling things would be indefensible, and so would blocking it
+        // on readiness: standing down must never require anything to be healthy.
+        description: MODE_DESCRIPTIONS[mode],
+      };
+    }));
+
+    return {
+      current_mode: control.mode,
+      frozen: freezes.freezes.length > 0,
+      providers,
+      targets,
+      credential_store_available: Boolean(options.tenant_credentials),
+    };
+  }
+
   async function pageContext(principal: ProductPrincipal): Promise<ShellContext> {
     const [info, control, freezes, attention, tenantContext] = await Promise.all([
       options.repository.projectInfo(principal),
@@ -473,16 +675,16 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     return actionPage(action, evidence ?? [], resolutions ?? [], context);
   }, options.repository));
   app.get("/protection", pageHandler(async (principal) => {
-    if (!options.secrets) return genericPage("Protection", "No SecretProvider is configured, so readiness cannot be evaluated.");
+    if (!secretsAvailable()) return genericPage("Protection", "No SecretProvider is configured, so readiness cannot be evaluated.");
     const [report, readiness, context] = await Promise.all([
-      options.repository.protectionReport(principal, options.secrets, "all"),
-      options.repository.goLiveMatrix(principal, options.secrets, options.effect_specs),
+      options.repository.protectionReport(principal, secretsFor(principal), "all"),
+      options.repository.goLiveMatrix(principal, secretsFor(principal), options.effect_specs),
       pageContext(principal),
     ]);
     return protectionPage(report, readiness, context);
   }, options.repository));
-  app.get("/effect-specs", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository, principal, options.effect_specs, options.production === true, options.secrets ?? null), await pageContext(principal)), options.repository));
-  app.get("/effect-registry", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository, principal, options.effect_specs, options.production === true, options.secrets ?? null), await pageContext(principal)), options.repository));
+  app.get("/effect-specs", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository, principal, options.effect_specs, options.production === true, secretsFor(principal) ?? null), await pageContext(principal)), options.repository));
+  app.get("/effect-registry", pageHandler(async (principal) => effectRegistryPage(await registryView(options.repository, principal, options.effect_specs, options.production === true, secretsFor(principal) ?? null), await pageContext(principal)), options.repository));
   app.get("/policies", pageHandler(async (principal) => policiesPage(await options.repository.policyHistory(principal), await pageContext(principal)), options.repository));
   app.get("/receipts", pageHandler(async (principal) => receiptsPage(await options.repository.listActions(principal), await pageContext(principal)), options.repository));
   app.get("/receipts/:id", pageHandler(async (principal, request, reply) => {
@@ -494,8 +696,19 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   }, options.repository));
   app.get("/exports/:id", api(async (principal,request,reply)=>{requireScope(principal,"receipts:read");const receipt=await options.repository.receipt(principal,routeId(request));if(!receipt)return reply.code(404).send({error:"not_found",request_id:request.id});reply.header("Content-Disposition",`attachment; filename="nyst-${routeId(request)}.json"`);return {receipt:sanitizeForProduct(receipt),signature_valid:options.verify_receipt?options.verify_receipt(receipt):null};},options.repository));
   app.get("/integrations", pageHandler(async (principal) => {
-    const readiness = options.secrets ? await options.repository.integrationsReadiness(principal, options.secrets) : [];
-    return integrationsPage(readiness as unknown as Record<string, unknown>[], await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true, options.secrets ?? null), await pageContext(principal));
+    const readiness = secretsAvailable() ? await options.repository.integrationsReadiness(principal, secretsFor(principal)) : [];
+    /**
+     * The FINGERPRINT of the customer-supplied credential, so the page can say
+     * WHICH one is loaded. A truncated keyed digest — not a suffix of the
+     * token, because a partial secret is still a secret.
+     */
+    const withCredentials = await Promise.all(readiness.map(async (item) => {
+      const stored = options.tenant_credentials
+        ? await options.tenant_credentials.describe(principal, String(item.provider)).catch(() => null)
+        : null;
+      return { ...item, credential_fingerprint: stored?.fingerprint ?? null };
+    }));
+    return integrationsPage(withCredentials as unknown as Record<string, unknown>[], await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true, secretsFor(principal) ?? null), await pageContext(principal));
   }, options.repository));
   /* ---------------- OUTCOMES (Phases 18-32) ---------------- */
 
@@ -615,8 +828,8 @@ export async function buildProductServer(options: ProductServerOptions): Promise
 
   app.post("/v1/outcomes/:id/evaluate", api(async (principal, request) => {
     requireScope(principal, "actions:write"); requireCsrf(request, principal);
-    const capabilities = options.secrets
-      ? (await options.repository.integrationsReadiness(principal, options.secrets))
+    const capabilities = secretsFor(principal)
+      ? (await options.repository.integrationsReadiness(principal, secretsFor(principal)))
           .flatMap((item) => (item.capability_manifest?.capabilities ?? [])
             .filter((capability) => capability.state === "verified" || capability.state === "authorized")
             .map((capability) => capability.capability))
@@ -932,11 +1145,12 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.get("/evidence", pageHandler(async (principal) => actionsPage(await options.repository.listActions(principal), "Evidence", {}, await pageContext(principal)), options.repository));
   app.get("/offboarding", pageHandler(async (principal) => offboardingPage(await options.repository.offboardingRuns(principal), await pageContext(principal)), options.repository));
   app.get("/reviews", pageHandler(async (principal) => reviewsPage(await options.repository.humanReviews(principal), await pageContext(principal)), options.repository));
-  app.get("/onboarding", pageHandler(async (principal) => onboardingPage(await options.repository.onboardingProgress(principal), await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true, options.secrets ?? null), await pageContext(principal)), options.repository));
+  app.get("/onboarding", pageHandler(async (principal) => onboardingPage(await options.repository.onboardingProgress(principal), await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true, secretsFor(principal) ?? null), await pageContext(principal)), options.repository));
   app.get("/settings", pageHandler(async (principal) => settingsPage(
     await options.repository.projectInfo(principal), await options.repository.environmentControl(principal),
     await options.repository.webhookStatus(principal), await options.repository.apiKeys(principal),
-    await options.repository.freezes(principal), await pageContext(principal)), options.repository));
+    await options.repository.freezes(principal), await pageContext(principal),
+    await promotionView(principal).catch(() => null)), options.repository));
 
   app.get("/v1/overview", api(async (principal) => {requireScope(principal,"actions:read");return options.repository.overview(principal);}, options.repository));
   app.get("/v1/actions", api(async (principal, request) => {requireScope(principal,"actions:read");return options.repository.listActions(principal, filters(request.query));}, options.repository));
@@ -1069,8 +1283,8 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.post("/v1/policy-templates/:template", api(async (principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const template=String((request.params as {template?:unknown}).template??"");if(template!=="access_revocation"&&template!=="financial_action"&&template!=="high_risk_production")throw Object.assign(new Error("Unknown policy template"),{statusCode:400});const body=object(request.body);const effect=body.effect_name===undefined||body.effect_name===null?null:string(body.effect_name,200);const idempotent=await options.repository.idempotent(principal,"policy.create_version",idempotencyKey(request),{template,effect},async()=>options.repository.createPolicyFromTemplate(principal,principal.user_id!,template,effect));return idempotent.value;},options.repository));
 
   /* ---------------- Protection Report (Phase 9) ---------------- */
-  app.get("/v1/protection-report", api(async (principal,request)=>{requireScope(principal,"actions:read");if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const query=request.query as {range?:unknown;from?:unknown;to?:unknown;format?:unknown};const range=metricRange(query.range);const report=await options.repository.protectionReport(principal,options.secrets,range,query.from===undefined?undefined:String(query.from),query.to===undefined?undefined:String(query.to));return report;},options.repository));
-  app.get("/v1/protection-report.csv", api(async (principal,request,reply)=>{requireScope(principal,"actions:read");if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const query=request.query as {range?:unknown};const report=await options.repository.protectionReport(principal,options.secrets,metricRange(query.range));reply.header("Content-Type","text/csv; charset=utf-8");reply.header("Content-Disposition",`attachment; filename="nyst-protection-report.csv"`);return protectionReportCsv(report);},options.repository));
+  app.get("/v1/protection-report", api(async (principal,request)=>{requireScope(principal,"actions:read");if(!secretsAvailable())throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const query=request.query as {range?:unknown;from?:unknown;to?:unknown;format?:unknown};const range=metricRange(query.range);const report=await options.repository.protectionReport(principal,secretsFor(principal),range,query.from===undefined?undefined:String(query.from),query.to===undefined?undefined:String(query.to));return report;},options.repository));
+  app.get("/v1/protection-report.csv", api(async (principal,request,reply)=>{requireScope(principal,"actions:read");if(!secretsAvailable())throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const query=request.query as {range?:unknown};const report=await options.repository.protectionReport(principal,secretsFor(principal),metricRange(query.range));reply.header("Content-Type","text/csv; charset=utf-8");reply.header("Content-Disposition",`attachment; filename="nyst-protection-report.csv"`);return protectionReportCsv(report);},options.repository));
 
   /* ---------------- Needs Attention / Go-Live / Proof Pack (Phases 13,14,18) ---------------- */
   app.get("/v1/needs-attention", api(async (principal)=>{requireScope(principal,"actions:read");return options.repository.needsAttention(principal);},options.repository));
@@ -1080,7 +1294,7 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   // action, but it did claim operations were permitted on something the caller
   // cannot touch, which is a lie the UI would faithfully render.
   app.get("/v1/actions/:id/review-options", api(async (principal,request,reply)=>{requireScope(principal,"actions:read");const id=routeId(request);const action=await options.repository.actionDetail(principal,id);if(!action)return notFound(reply,request);return options.repository.humanReviewOptions(principal,id);},options.repository));
-  app.get("/v1/go-live", api(async (principal,request)=>{requireAnyScope(principal,["actions:read","integrations:read"]);if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const query=request.query as {agent_id?:unknown;effect?:unknown};if(query.effect===undefined)return options.repository.goLiveMatrix(principal,options.secrets,options.effect_specs);return options.repository.goLiveReadiness(principal,options.secrets,query.agent_id===undefined?null:String(query.agent_id),String(query.effect),options.effect_specs);},options.repository));
+  app.get("/v1/go-live", api(async (principal,request)=>{requireAnyScope(principal,["actions:read","integrations:read"]);if(!secretsAvailable())throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const query=request.query as {agent_id?:unknown;effect?:unknown};if(query.effect===undefined)return options.repository.goLiveMatrix(principal,secretsFor(principal),options.effect_specs);return options.repository.goLiveReadiness(principal,secretsFor(principal),query.agent_id===undefined?null:String(query.agent_id),String(query.effect),options.effect_specs);},options.repository));
   app.get("/v1/actions/:id/proof-pack", api(async (principal,request,reply)=>{requireAnyScope(principal,["actions:read","receipts:read"]);const pack=await options.repository.proofPack(principal,routeId(request),options.verify_receipt);if(!pack)return reply.code(404).send({error:"not_found",request_id:request.id});const query=request.query as {format?:unknown};if(String(query.format??"json")==="html"){reply.header("Content-Type","text/html; charset=utf-8");return proofPackDocument(pack);}return pack;},options.repository));
   app.get("/v1/offboarding/stages", api(async (principal)=>{requireAnyScope(principal,["actions:read","integrations:read"]);return {summary:CANONICAL_OFFBOARDING_SUMMARY,stages:CANONICAL_OFFBOARDING_STAGES};},options.repository));
 
@@ -1119,9 +1333,9 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     };
   }, options.repository));
 
-  app.post("/v1/integrations/:provider/preflight",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const provider=String((request.params as {provider?:unknown}).provider??"");if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});if(!options.integration_preflight)return {provider,status:"preflight_unavailable",read_only_preflight_performed:false,provider_mutation_performed:false,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};const preflight=await options.repository.runIntegrationPreflight(principal,provider,options.secrets,(secret)=>options.integration_preflight!(provider,secret));return {...preflight,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};},options.repository));
+  app.post("/v1/integrations/:provider/preflight",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const provider=String((request.params as {provider?:unknown}).provider??"");if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});if(!secretsAvailable())throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});if(!options.integration_preflight)return {provider,status:"preflight_unavailable",read_only_preflight_performed:false,provider_mutation_performed:false,readiness:await options.repository.integrationReadiness(principal,provider,secretsFor(principal))};const preflight=await options.repository.runIntegrationPreflight(principal,provider,secretsFor(principal),(secret)=>options.integration_preflight!(provider,secret));return {...preflight,readiness:await options.repository.integrationReadiness(principal,provider,secretsFor(principal))};},options.repository));
   // Retained path for existing integrations; same read-only behaviour.
-  app.post("/v1/integrations/:provider/test",api(async(principal,request,reply)=>{reply.header("Deprecation","true");reply.header("Link","</v1/integrations/{provider}/preflight>; rel=\"successor-version\"");sessionOnly(principal);requireCsrf(request,principal);const provider=String((request.params as {provider?:unknown}).provider??"");if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});if(!options.secrets)throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const readiness=await options.repository.integrationReadiness(principal,provider,options.secrets);if(!readiness.credential_available||!options.integration_preflight)return {...readiness,read_only_preflight_performed:false,provider_mutation_performed:false};const preflight=await options.repository.runIntegrationPreflight(principal,provider,options.secrets,(secret)=>options.integration_preflight!(provider,secret));return {...preflight,readiness:await options.repository.integrationReadiness(principal,provider,options.secrets)};},options.repository));
+  app.post("/v1/integrations/:provider/test",api(async(principal,request,reply)=>{reply.header("Deprecation","true");reply.header("Link","</v1/integrations/{provider}/preflight>; rel=\"successor-version\"");sessionOnly(principal);requireCsrf(request,principal);const provider=String((request.params as {provider?:unknown}).provider??"");if(provider!=="github"&&provider!=="okta"&&provider!=="stripe")throw Object.assign(new Error("Unsupported provider"),{statusCode:400});if(!secretsAvailable())throw Object.assign(new Error("No SecretProvider is configured"),{statusCode:503});const readiness=await options.repository.integrationReadiness(principal,provider,secretsFor(principal));if(!readiness.credential_available||!options.integration_preflight)return {...readiness,read_only_preflight_performed:false,provider_mutation_performed:false};const preflight=await options.repository.runIntegrationPreflight(principal,provider,secretsFor(principal),(secret)=>options.integration_preflight!(provider,secret));return {...preflight,readiness:await options.repository.integrationReadiness(principal,provider,secretsFor(principal))};},options.repository));
   /**
    * The durable CapabilityManifest for one provider connection: what each
    * required capability's state is, and why. Not a `connected` boolean.
@@ -1140,7 +1354,127 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.get("/v1/context", api(async (principal)=>{if(principal.kind!=="session")throw Object.assign(new Error("Session required"),{statusCode:403});return options.repository.context(principal);},options.repository));
   app.post("/v1/context", api(async (principal,request,reply)=>{if(principal.kind!=="session")throw Object.assign(new Error("Session required"),{statusCode:403});requireCsrf(request,principal);const body=object(request.body);const projectId=string(body.project_id,36);const environmentId=string(body.environment_id,36);if(!UUID.test(projectId)||!UUID.test(environmentId))throw Object.assign(new Error("Invalid context ID"),{statusCode:400});const session=request.cookies[SESSION_COOKIE];if(!session||!(await options.repository.switchSessionContext(session,principal,projectId,environmentId)))return reply.code(404).send({error:"not_found",request_id:request.id});return {project_id:projectId,environment_id:environmentId};},options.repository));
   app.get("/v1/environment",api(async principal=>options.repository.environmentControl(principal),options.repository));
-  app.put("/v1/environment/mode",api(async(principal,request)=>{sessionOnly(principal);requireCsrf(request,principal);const body=object(request.body);const mode=string(body.mode,8);if(mode!=="shadow"&&mode!=="canary"&&mode!=="enforced")throw Object.assign(new Error("Invalid environment mode"),{statusCode:400});const idempotent = await options.repository.idempotent(principal, "environment.set_mode", idempotencyKey(request), object(request.body), async () => options.repository.setEnvironmentMode(principal,principal.user_id!,mode,string(body.reason,500))); return idempotent.value;},options.repository));
+  /**
+   * LEAVING SHADOW (v0.3.3).
+   *
+   * THE DEFECT THIS FIXES, and it is the third instance of one shape.
+   *
+   * `setEnvironmentMode` enforces commercial entitlement correctly and takes
+   * the entitlements object as an OPTIONAL argument. This route never passed
+   * it. So a trial organization could PUT straight here and get Enforced —
+   * which is verbatim the sentence the Phase 10 header comment claims to have
+   * fixed. Eleven tests proved the parameter works; every one of them called
+   * the repository method directly, so not one proved the route uses it.
+   *
+   * An optional safety argument fails OPEN, fails SILENTLY, and type-checks.
+   * `entitlementLayer` is therefore constructed unconditionally below rather
+   * than being another thing a caller can forget.
+   */
+  app.put("/v1/environment/mode",api(async(principal,request)=>{
+    sessionOnly(principal); requireCsrf(request,principal);
+    const body=object(request.body);
+    const mode=string(body.mode,8);
+    if(mode!=="shadow"&&mode!=="canary"&&mode!=="enforced") throw Object.assign(new Error("Invalid environment mode"),{statusCode:400});
+    const reason=string(body.reason,500);
+    // A mode change is a deliberate act with a reason somebody will read in an
+    // audit six months from now. "test" is not one.
+    if(mode!=="shadow"&&reason.trim().length<5){
+      throw Object.assign(new Error("Leaving Shadow requires a reason a person can read later"),{statusCode:400});
+    }
+    const idempotent = await options.repository.idempotent(
+      principal, "environment.set_mode", idempotencyKey(request), object(request.body),
+      async () => options.repository.setEnvironmentMode(principal,principal.user_id!,mode,reason,entitlementLayer));
+    return idempotent.value;
+  },options.repository));
+
+  /**
+   * WHAT IS STANDING BETWEEN THIS ENVIRONMENT AND ENFORCED.
+   *
+   * A 402 with a sentence is better than a hidden button and still not enough:
+   * an operator who cannot see the whole list has to discover the conditions
+   * one refusal at a time. This answers the question directly — every target
+   * mode, whether it is currently reachable, and every unmet condition with the
+   * reason and the remedy.
+   *
+   * Read-only, and it changes nothing. It reports what the PUT would decide;
+   * the PUT decides it again independently, because a view that pre-authorises
+   * a transition is a second evaluator and this codebase does not have those.
+   */
+  app.get("/v1/environment/promotion", api(async (principal) => {
+    requireAnyScope(principal,["actions:read","integrations:read"]);
+    return promotionView(principal);
+  }, options.repository));
+
+  /**
+   * CONNECT A PROVIDER (v0.3.3).
+   *
+   * The customer supplies their own credential. It is encrypted immediately,
+   * stored against this organization and environment, and the integration is
+   * pointed at the resulting `tenant:` reference in the same request — so a
+   * connection is never half-made, with a stored secret nothing references or a
+   * reference to nothing.
+   *
+   * THE RESPONSE NEVER CONTAINS THE CREDENTIAL, and neither does any error
+   * raised on this path. The body of this request is the single most sensitive
+   * payload the product accepts.
+   */
+  app.post("/v1/integrations/:provider/credential", api(async (principal, request) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const provider = assertProvider(String((request.params as { provider?: unknown }).provider ?? ""));
+    const store = options.tenant_credentials;
+    if (!store) {
+      throw Object.assign(
+        new Error(
+          "This deployment cannot accept customer-supplied credentials because no credential encryption "
+          + "key is configured. Set NYST_CREDENTIAL_KEY, or configure this integration with a secrets-manager "
+          + "reference instead. Nyst will not store a credential it cannot encrypt."),
+        { statusCode: 503 });
+    }
+    const raw = object(request.body).credential;
+    if (typeof raw !== "string") {
+      throw Object.assign(new Error("Supply the credential as a string in the `credential` field"), { statusCode: 400 });
+    }
+    const stored = await store.store(principal, principal.user_id ?? null, provider, raw);
+    // Point the integration at it in the same request. A stored credential that
+    // nothing references is a secret held for no reason.
+    await options.repository.reconnectIntegration(principal, provider, stored.credential_ref);
+
+    options.structured_log?.({
+      type: "integration_credential_stored", provider,
+      organization_id: principal.organization_id, environment_id: principal.environment_id,
+      // The reference and the fingerprint are names. Neither is any part of the value.
+      credential_ref: stored.credential_ref, fingerprint: stored.fingerprint,
+    });
+    return {
+      provider,
+      credential_ref: stored.credential_ref,
+      fingerprint: stored.fingerprint,
+      stored_at: stored.created_at,
+      // Storing is not verifying, and the response says so rather than letting
+      // a green tick imply a working connection.
+      verified: false,
+      next_step: "Run the read-only preflight. Storing a credential proves nothing about whether it works.",
+    };
+  }, options.repository));
+
+  /** Revoke the stored credential without disconnecting the integration. */
+  app.delete("/v1/integrations/:provider/credential", api(async (principal, request) => {
+    sessionOnly(principal); requireCsrf(request, principal);
+    const provider = assertProvider(String((request.params as { provider?: unknown }).provider ?? ""));
+    const store = options.tenant_credentials;
+    if (!store) throw Object.assign(new Error("No credential store is configured"), { statusCode: 503 });
+    const current = await store.describe(principal, provider);
+    if (!current) return { revoked: false, detail: "No customer-supplied credential is stored for this provider." };
+    const reason = string(object(request.body).reason, 500) || "Revoked by the customer.";
+    const result = await store.revoke(principal, current.credential_ref, reason);
+    return {
+      ...result,
+      provider,
+      detail:
+        "The credential is revoked and stops resolving immediately — nothing caches it. This does NOT stop "
+        + "work already admitted; Emergency Freeze is that control.",
+    };
+  }, options.repository));
   /**
    * Shadow evaluation. The caller must name the EXACT EffectSpec version the
    * environment has enabled; there is no implicit latest-version substitution.

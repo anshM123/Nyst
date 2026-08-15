@@ -95,11 +95,11 @@ function shell(title: string, current: string, body: string, context: ShellConte
   return page(title, `<a class="skip-link" href="#main">Skip to content</a>
 <div class="shell">
   <nav class="sidebar" aria-label="Primary">
-    <a class="brand" href="/" aria-label="Nyst — back to Overview"><img src="/brand/nyst-mark.png" alt=""><span>nyst</span></a>
+    <a class="brand" href="/" aria-label="Nyst — back to Overview"><span class="brand-plate"><img src="/brand/nyst-mark.png" alt=""></span><span>nyst</span></a>
     <div class="nav">${NAV.map(link).join("")}</div>
     <p class="nav-group">Configure</p>
     <div class="nav">${NAV_CONFIGURE.map(link).join("")}</div>
-    <div class="sidebar-foot"><p>Nyst v0.3.2</p></div>
+    <div class="sidebar-foot"><p>Nyst v0.3.3</p></div>
   </nav>
   <div class="main">
     <header class="topbar">
@@ -150,13 +150,39 @@ function contextSwitcher(context: ShellContext): string {
  * "Sign in with Google" button that leads to a 503 is worse than no button, so
  * an unconfigured deployment simply does not render one.
  */
+/**
+ * The Google "G", inline.
+ *
+ * INLINE, NOT HOSTED, for two independent reasons. The Content-Security-Policy
+ * allows images from 'self' only, so an <img> pointing at gstatic would be
+ * blocked and the button would render as a broken image. And a remote asset
+ * means every visitor to the sign-in page announces themselves to Google before
+ * choosing to sign in with it — a request the customer did not ask for on a
+ * page that has not yet asked them anything.
+ *
+ * The four paths and their colours are Google's own mark, unmodified, which is
+ * what their identity guidelines require. The mark is not recoloured, rotated,
+ * or redrawn.
+ */
+const GOOGLE_MARK = `<svg class="google-mark" viewBox="0 0 48 48" width="18" height="18" aria-hidden="true" focusable="false">
+  <path fill="#4285F4" d="M45.12 24.5c0-1.56-.14-3.06-.4-4.5H24v8.51h11.84c-.51 2.75-2.06 5.08-4.39 6.64v5.52h7.11c4.16-3.83 6.56-9.47 6.56-16.17z"/>
+  <path fill="#34A853" d="M24 46c5.94 0 10.92-1.97 14.56-5.33l-7.11-5.52c-1.97 1.32-4.49 2.1-7.45 2.1-5.73 0-10.58-3.87-12.31-9.07H4.34v5.7C7.96 41.07 15.4 46 24 46z"/>
+  <path fill="#FBBC05" d="M11.69 28.18C11.25 26.86 11 25.45 11 24s.25-2.86.69-4.18v-5.7H4.34C2.85 17.09 2 20.45 2 24s.85 6.91 2.34 9.88l7.35-5.7z"/>
+  <path fill="#EA4335" d="M24 10.75c3.23 0 6.13 1.11 8.41 3.29l6.31-6.31C34.91 4.18 29.93 2 24 2 15.4 2 7.96 6.93 4.34 14.12l7.35 5.7c1.73-5.2 6.58-9.07 12.31-9.07z"/>
+</svg>`;
+
 export function loginPage(options: { google?: boolean } = {}): string {
+  // Rendered only when a Google client is actually configured. A button that
+  // can only fail is harder to debug than no button at all.
   const google = options.google === true
-    ? `<div class="login-alt"><a class="secondary login-google" href="/auth/google/start">Sign in with Google</a></div>`
+    ? `<div class="login-alt">
+    <span class="login-or">or</span>
+    <a class="google-signin" href="/auth/google/start">${GOOGLE_MARK}<span>Sign in with Google</span></a>
+  </div>`
     : "";
   return page("Sign in", `<main class="login">
   <section class="login-brand">
-    <img src="/brand/nyst-domain-wordmark.png" alt="nyst.ai">
+    <span class="brand-plate-wide"><img src="/brand/nyst-domain-wordmark.png" alt="nyst.ai"></span>
     <p class="eyebrow">Effect-control infrastructure</p>
     <h1>Know what happened.<br>Control what happens next.</h1>
     <p>Nyst determines what actually happened after a consequential software action — and decides what is safe to do next.</p>
@@ -771,6 +797,7 @@ export function integrationsPage(readiness: readonly Record<string, unknown>[], 
       ${dimension("Capabilities sufficient", item.capabilities_sufficient === true, ((item.missing_capabilities as string[]) ?? []).length ? `Not granted: ${((item.missing_capabilities as string[]) ?? []).join(", ")}` : "Every capability the enabled EffectSpecs require was observed as granted.")}
     </ul>
     ${capabilityBlock(item)}
+    ${connectForm(item)}
     <div class="button-row gap-l">
       <button data-preflight="${escape(String(item.provider))}">Run read-only preflight</button>
     </div>
@@ -786,6 +813,139 @@ export function integrationsPage(readiness: readonly Record<string, unknown>[], 
         <td><span class="badge ${spec.ready ? "resolved" : "neutral"}">${escape(String(spec.status ?? ""))}</span></td>
       </tr>`).join("")}</tbody></table></div>` : `<div class="panel panel-pad"><p class="empty">No EffectSpecs registered.</p></div>`}
   </section>`, context);
+}
+
+/**
+ * LEAVING SHADOW (v0.3.3).
+ *
+ * Shadow is where every workspace starts and it was where every workspace
+ * stayed, because the only thing the product ever said about Enforced was a
+ * 402 from an endpoint with no visible control. An operator had to discover the
+ * preconditions one refusal at a time.
+ *
+ * This shows all three modes and everything standing in the way of each, with
+ * the three refusal FAMILIES kept visually distinct:
+ *
+ *   commercial   — you may not ASK for this yet. Remedy: talk to us.
+ *   readiness    — this would not be SAFE yet. Remedy: fix the condition.
+ *   operational  — something is deliberately stopped right now.
+ *
+ * Collapsing those into one list of red text teaches an operator to read a
+ * safety refusal as a billing inconvenience, which is the single worst habit
+ * this product could instil.
+ *
+ * The button is offered ONLY when the transition is currently allowed. That is
+ * not the enforcement — the route re-decides independently, because a view that
+ * pre-authorises anything is a second evaluator and this codebase does not have
+ * those. It is so the control does not lie about what it will do.
+ */
+function promotionPanel(promotion: Record<string, unknown> | null): string {
+  if (!promotion) return "";
+  const targets = (promotion.targets ?? []) as Array<{
+    mode: string; current: boolean; allowed: boolean; description: string;
+    blockers: Array<{ kind: string; reason: string; remedy: string | null }>;
+  }>;
+  if (!targets.length) return "";
+  const providers = (promotion.providers ?? []) as Array<{
+    provider: string; connected: boolean; verified: boolean; reason: string;
+  }>;
+
+  return `<section class="section">
+    <div class="section-head"><div><p class="eyebrow">Rollout</p><h2>Control posture</h2></div>
+      <a href="/integrations">Integrations →</a></div>
+    <p class="lede">Nyst starts in Shadow, where it evaluates everything and prevents nothing. Moving past
+      Shadow means Nyst begins refusing your software's actions, so every condition below has to hold first.</p>
+
+    <div class="promotion gap-m">
+      ${targets.map((target) => `<div class="target${target.current ? " is-current" : ""}">
+        <div class="split-top">
+          <h3>${escape(target.mode)}</h3>
+          <span class="badge ${target.current ? "resolved" : target.allowed ? "neutral" : "uncertain"}">${
+            target.current ? "Current" : target.allowed ? "Available" : "Blocked"}</span>
+        </div>
+        <p class="small">${escape(target.description)}</p>
+        ${target.blockers.map((blocker) => `<div class="blocker ${escape(blocker.kind)}">
+          ${escape(blocker.reason)}
+          ${blocker.remedy ? `<span class="remedy">${escape(blocker.remedy)}</span>` : ""}
+        </div>`).join("")}
+        ${target.current || !target.allowed ? "" : `<div class="button-row">
+          <button data-set-mode="${escape(target.mode)}">Move to ${escape(target.mode)}</button>
+        </div>`}
+      </div>`).join("")}
+    </div>
+
+    ${providers.length ? `<div class="panel panel-pad gap-m">
+      <p class="small"><strong>Provider verification.</strong> Connected means a credential is stored.
+        Verified means a read-only preflight succeeded inside the trust window — only that second one says
+        anything about whether the connection works.</p>
+      <ul class="checks gap-m">
+        ${providers.map((provider) => `<li>
+          <span class="state ${provider.verified ? "pass" : provider.connected ? "unknown" : "fail"}">${
+            provider.verified ? "Verified" : provider.connected ? "Stored" : "None"}</span>
+          <span class="body"><strong>${escape(provider.provider)}</strong><span>${escape(provider.reason)}</span></span>
+        </li>`).join("")}
+      </ul>
+    </div>` : ""}
+  </section>`;
+}
+
+/**
+ * CONNECT A PROVIDER (v0.3.3).
+ *
+ * Until this existed the only way to connect anything was to set an environment
+ * variable on the host, so the only person who could connect a provider was the
+ * operator. Nyst was multi-tenant in its data model and single-tenant in its
+ * onboarding.
+ *
+ * WHAT THE COPY HAS TO GET RIGHT, because this is the one form in the product
+ * that carries a real secret:
+ *
+ *  - It asks for READ-ONLY scopes. Nyst can run its whole Shadow proposition on
+ *    read access, and asking for write access before a customer has any reason
+ *    to trust the product is both bad security and bad selling.
+ *  - It says storing is not verifying. A green tick after a paste, with no
+ *    read-only preflight behind it, would be the same over-claim the readiness
+ *    conjunction exists to prevent.
+ *  - It never renders the credential, and it names the reference — a reference
+ *    is a NAME, and the operator needs to see which one is configured.
+ */
+function connectForm(item: Record<string, unknown>): string {
+  const provider = String(item.provider);
+  const guidance: Readonly<Record<string, { label: string; hint: string; scopes: string }>> = {
+    github: {
+      label: "GitHub token",
+      hint: "A fine-grained personal access token, or a classic token.",
+      scopes: "Read-only is enough for Shadow: repo metadata, members and collaborators.",
+    },
+    okta: {
+      label: "Okta API token",
+      hint: "Created under Security → API → Tokens in your Okta admin console.",
+      scopes: "Read-only is enough for Shadow: users and groups.",
+    },
+    stripe: {
+      label: "Stripe key",
+      hint: "Use a RESTRICTED key, not your secret key.",
+      scopes: "Read-only is enough for Shadow: charges, refunds and customers.",
+    },
+  };
+  const help = guidance[provider];
+  if (!help) return "";
+  const fingerprint = typeof item.credential_fingerprint === "string" ? item.credential_fingerprint : null;
+  const reference = typeof item.credential_ref === "string" ? item.credential_ref : null;
+
+  return `<div class="gap-l">
+    ${fingerprint ? `<p class="small">A credential supplied through this page is loaded (<span class="mono">${escape(fingerprint)}</span>). Storing a new one replaces it and revokes the old one immediately.</p>` : ""}
+    ${reference && !fingerprint ? `<p class="small">Configured from <span class="mono">${escape(reference)}</span>, a reference this deployment resolves. Pasting a credential below would replace it.</p>` : ""}
+    <form class="connect-form" data-connect-provider="${escape(provider)}" method="post" action="/v1/integrations/${escape(provider)}/credential">
+      <label>${escape(help.label)}
+        <input name="credential" type="password" autocomplete="off" spellcheck="false"
+          placeholder="Paste the credential" aria-describedby="connect-hint-${escape(provider)}">
+        <span class="hint" id="connect-hint-${escape(provider)}">${escape(help.hint)} ${escape(help.scopes)}</span>
+      </label>
+      <button type="submit">${fingerprint ? "Replace credential" : "Connect"}</button>
+    </form>
+    <p class="small">Nyst encrypts this before storing it and never displays it again — not on this page, not in a log, not in an export. Storing a credential proves nothing about whether it works; the read-only preflight decides that.</p>
+  </div>`;
 }
 
 /**
@@ -840,9 +1000,10 @@ export function reviewsPage(reviews: readonly Record<string, unknown>[], context
     </tr>`).join("")}</tbody></table></div>` : `<div class="panel panel-pad"><p class="empty">No human reviews are open.</p></div>`}`, context);
 }
 
-export function settingsPage(info: Record<string, unknown> | null, control: Record<string, unknown>, webhooks: readonly Record<string, unknown>[], keys: readonly Record<string, unknown>[], freezes: { active: Record<string, unknown>[] } = { active: [] }, context: ShellContext = {}): string {
+export function settingsPage(info: Record<string, unknown> | null, control: Record<string, unknown>, webhooks: readonly Record<string, unknown>[], keys: readonly Record<string, unknown>[], freezes: { active: Record<string, unknown>[] } = { active: [] }, context: ShellContext = {}, promotion: Record<string, unknown> | null = null): string {
   return shell("Settings", "/settings", `
   <div class="page-head"><p class="eyebrow">Configuration</p><h1>Settings</h1></div>
+  ${promotionPanel(promotion)}
 
   <section class="section">
     <div class="section-head"><div><h2>Workspace</h2></div></div>

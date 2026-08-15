@@ -24,6 +24,7 @@ import { buildProductServer } from "../src/product/server.js";
 import { TestSecretProvider } from "../src/product/secretProvider.js";
 import { LAB_EFFECT } from "../src/product/failureLabEngine.js";
 import { createPostgresStore } from "../src/store/postgresStore.js";
+import { EntitlementRepository } from "../src/product/entitlementRepository.js";
 import { failureLabPage } from "../src/product/dashboard.js";
 import type { TenantScope } from "../src/product/types.js";
 import { MutableClock } from "./githubHelpers.js";
@@ -53,6 +54,25 @@ describe("Nyst v0.2.2 Phase 34 browser-QA regressions", { skip: databaseUrl ? fa
     const product = createProductProviderRuntime(store, repository, Ed25519Signer.ephemeral("p34"), new MutableClock(),
       { production: false, enable_development_fake: true });
     await repository.configureEffectSpec(tenant, product.descriptors.find((item) => item.provider === "fake")!, true);
+
+    /**
+     * A PLAN, MADE EXPLICIT (v0.3.3).
+     *
+     * PUT /v1/environment/mode now enforces commercial entitlement, which it
+     * did not when this suite was written: the check existed on the repository
+     * method and the route never passed it, so a trial organization could reach
+     * Enforced through the public API. Fixing that made every rollout test here
+     * fail with a clean 402, because a new workspace is a TRIAL.
+     *
+     * That is the gate working. These tests are about ROLLOUT MECHANICS, not
+     * billing, so the plan is granted here as a stated precondition rather than
+     * the gate being weakened to keep them green.
+     */
+    await new EntitlementRepository(pool).setEntitlement({
+      organization_id: tenant.organization_id, state: "enterprise", changed_by: null,
+      reason: "Rollout mechanics fixture: this suite exercises modes, not billing.",
+    });
+
     app = await buildProductServer({
       repository, effect_specs: product.descriptors, runtime: product.runtime, commit: product.commit,
       production: false, secrets: new TestSecretProvider(),
