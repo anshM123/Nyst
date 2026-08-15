@@ -56,7 +56,15 @@ export class FetchGitHubTransport implements GitHubTransport {
         }
       }
       const headers: Record<string, string> = {};
-      for (const name of ["x-github-request-id", "retry-after", "x-ratelimit-remaining", "x-ratelimit-reset"]) {
+      /**
+       * `x-oauth-scopes` added in v0.3.3.
+       *
+       * The transport captures an ALLOWLIST of headers, and adding the scope
+       * header to `safeHeaders` without adding it here meant the value was
+       * discarded one layer earlier and every capability read as "not stated".
+       * Two functions had to agree and only one was changed.
+       */
+      for (const name of ["x-github-request-id", "retry-after", "x-ratelimit-remaining", "x-ratelimit-reset", "x-oauth-scopes"]) {
         const value = response.headers.get(name);
         if (value !== null) headers[name] = value;
       }
@@ -425,17 +433,33 @@ function parseInvitations(value: unknown): GitHubRepositoryInvitation[] {
 }
 
 function safeHeaders(headers: Readonly<Record<string, string>>): GitHubSafeHeaders {
-  const get = (name: string) => {
+  /**
+   * `limit` exists because `x-oauth-scopes` is not like the others.
+   *
+   * The shared cap was 200 characters, which is generous for a request id and
+   * TOO SHORT for a scope list: a classic GitHub token with the usual admin
+   * boxes ticked emits well over 200 characters of comma-separated scopes. The
+   * whole header was then dropped as suspicious, so a token that genuinely
+   * held `repo` reported no scopes at all and `github:collaborator:write`
+   * stayed at "not stated" — indistinguishable, from the UI, from a token that
+   * had no permissions.
+   *
+   * A cap is still applied: this is header data from a remote host and it ends
+   * up rendered and stored. It is simply sized for the field it guards.
+   */
+  const get = (name: string, limit = 200) => {
     const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === name);
     const value = entry?.[1] ?? null;
-    return value !== null && value.length <= 200 && !/[\r\n]/.test(value) ? value : null;
+    return value !== null && value.length <= limit && !/[\r\n]/.test(value) ? value : null;
   };
   return {
     request_id: get("x-github-request-id"),
     retry_after: get("retry-after"),
     rate_limit_remaining: get("x-ratelimit-remaining"),
     rate_limit_reset: get("x-ratelimit-reset"),
-    oauth_scopes: get("x-oauth-scopes"),
+    // 2000 characters: comfortably above every scope combination GitHub
+    // publishes, and still bounded.
+    oauth_scopes: get("x-oauth-scopes", 2000),
   };
 }
 

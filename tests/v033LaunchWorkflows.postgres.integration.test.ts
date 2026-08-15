@@ -68,6 +68,7 @@ import { createPostgresStore } from "../src/store/postgresStore.js";
 import { APP_JS } from "../src/product/assets.js";
 import { NYST_CSS } from "../src/product/designSystem.js";
 import { loginPage } from "../src/product/dashboard.js";
+import { capabilitiesFromProviderScopes } from "../src/product/capabilityManifest.js";
 import type { TenantScope } from "../src/product/types.js";
 import { MutableClock } from "./githubHelpers.js";
 
@@ -736,6 +737,50 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
         `${capability} IS A WRITE CAPABILITY IN verified_capabilities. Proving one requires performing the `
         + "mutation invariant I20 forbids; it can only ever be authorized or attested.");
     }
+  });
+
+  /**
+   * TWO FUNCTIONS HAD TO AGREE AND ONLY ONE WAS CHANGED.
+   *
+   * The transport captures an ALLOWLIST of response headers. Adding
+   * `x-oauth-scopes` to `safeHeaders` without adding it to that list meant the
+   * value was discarded one layer earlier — so a classic PAT that genuinely
+   * held `repo` reported no scopes at all, and `github:collaborator:write`
+   * stayed indistinguishable from a token with no permissions.
+   *
+   * The second half: the shared 200-character cap. Generous for a request id,
+   * far too short for a scope list — a classic token with the usual admin boxes
+   * ticked emits well over 200 characters, and the whole header was dropped.
+   */
+  it("THE DEFECT: the transport captures the scope header at all", () => {
+    const client = readFileSync(join(root, "src/providers/github/githubClient.ts"), "utf8");
+    const allowlist = /for \(const name of \[([^\]]*)\]\)/.exec(client)?.[1] ?? "";
+    assert.match(allowlist, /x-oauth-scopes/,
+      "THE TRANSPORT DROPS x-oauth-scopes, so no scope ever reaches the manifest no matter what else is right");
+  });
+
+  it("the scope header is not truncated by a cap sized for a request id", () => {
+    const client = readFileSync(join(root, "src/providers/github/githubClient.ts"), "utf8");
+    assert.match(client, /oauth_scopes: get\("x-oauth-scopes", (\d{4,})\)/,
+      "the scope header uses the default cap; a classic token's scope list exceeds 200 characters and "
+      + "would be discarded whole, reporting a fully-scoped token as having none");
+    const cap = Number(/oauth_scopes: get\("x-oauth-scopes", (\d+)\)/.exec(client)?.[1] ?? "0");
+    assert.ok(cap >= 1000, `the scope cap of ${cap} is still too small for a real classic token`);
+    // Still bounded: this is remote data that gets stored and rendered.
+    assert.ok(cap <= 8192, "the scope header is effectively unbounded");
+  });
+
+  it("a `repo` scope authorizes the write capability the EffectSpec needs", () => {
+    // The end of the chain, checked as arithmetic rather than through a live
+    // provider: `repo` must map to github:collaborator:write, or a correctly
+    // scoped classic token can never satisfy readiness.
+    const mapped = capabilitiesFromProviderScopes("github", ["repo"]);
+    assert.ok(mapped.includes("github:collaborator:write"),
+      "a classic token with `repo` does not authorize the write capability");
+    assert.ok(mapped.includes("github:repository:read"));
+    // And a read-only scope must NOT authorize a write.
+    assert.ok(!capabilitiesFromProviderScopes("github", ["public_repo"]).includes("github:collaborator:write"),
+      "a read-only scope authorized a WRITE capability");
   });
 
   it("the provider's scope metadata reaches the capability manifest", () => {
