@@ -13,13 +13,13 @@ verified, with the reason.
 | | |
 | --- | --- |
 | Version | **0.3.3 — launch RC** |
-| Automated tests | **1160 passing, 0 failing, 0 skipped** |
+| Automated tests | **1165 passing, 0 failing, 0 skipped** |
 | Test suites | 138 |
 | Migrations | 37, applied cleanly from an empty database |
 | Runtime dependencies | 4 — `fastify`, `@fastify/cookie`, `bcryptjs`, `pg` |
 | Secret scan | No credential-shaped value in source, tests, docs, migrations, brand assets, the packed SDK tarball, or the Docker build context |
 
-Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1160**.
+Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1165**.
 
 ---
 
@@ -148,6 +148,55 @@ Two smaller fixes in the same pass:
   than *the provider looked at it and said no* — two different problems with
   two different fixes. Status codes are now checked first.
 
+### Fourth round: the capability chain, and a regression I introduced
+
+With the preflight fixed, `Preflight verified` went **YES against a live GitHub
+API** — the first real credential this codebase has ever verified. Readiness
+was still Not ready, with three capabilities missing, and two of those three
+were **my regression**.
+
+The first rewrite probed only `GET /user`, proving `github:user:read` — a
+capability nothing requires. So `github:repository:read` and
+`github:organization:read` sat at AVAILABLE ("the provider supports this, but
+nothing has observed that this credential holds it"). I had traded *needs
+impossible fixture configuration* for *proves less than it should*.
+
+**A preflight must prove the capabilities the enabled workload REQUIRES**, not
+the one that happens to be easy to prove. It now performs
+`GET /user/repos?per_page=1` and `GET /user/orgs?per_page=1` — scoped to the
+credential rather than to a named resource, so no configuration, and performing
+them successfully *is* the proof. A 200 with an empty list still proves the
+capability: an account with no repositories has not failed anything. A non-200
+is a capability fact, not a connection fault, so it does not fail the whole
+preflight and tell a customer their working token is broken.
+
+The third missing capability was a separate defect. `github:collaborator:write`
+can never be VERIFIED — proving it means performing the mutation I20 forbids —
+so its only route is AUTHORIZED, computed by `observedCapabilities` from the
+provider's own scope metadata. **The `startProduct` preflight adapter dropped
+`scopes` entirely.** Nothing could ever reach AUTHORIZED, so every write
+capability was permanently stuck at AVAILABLE and readiness was unsatisfiable
+for any workload requiring one, regardless of what the token could do.
+
+And the last resort had no control: **`POST /v1/integrations/:provider/
+capabilities/attest` existed with nothing in the interface calling it** — the
+fifth instance of this pattern in one release. A fine-grained GitHub token
+publishes no scope header at all, so for those customers attestation is the
+*only* remaining route, and there was no button. There is now one, offered
+**only** where observation could not settle it, requiring a justification, and
+labelled a CLAIM everywhere the result appears.
+
+Guarded by tests: a write capability may never appear in `verified_capabilities`
+(checked against the actual `verified.push` calls, after a first version of that
+test failed on its own explanatory comment); the adapter must forward scopes;
+the attest control must not be offered next to a verified capability.
+
+One process note, recorded because it cost three build cycles: **a backtick
+inside a template literal ends the string**. Three separate prose comments in
+this release used `` `word` `` for emphasis inside rendered HTML and produced
+walls of parser errors far from the real line. There is now a structural test
+for it rather than a fourth instance.
+
 ### Honest limitations of this release
 
 - **The encryption key lives in the deployment's environment.** Someone with
@@ -155,10 +204,18 @@ Two smaller fixes in the same pass:
   backup, a dropped disk and a SQL-injection read. It does not protect a
   compromised host. A KMS-backed key would; the constructor takes the key from
   outside precisely so that swap is a one-line change.
-- **No live provider has been contacted.** Every credential in every test is
-  provider-*shaped* and fake. The connect flow, the encryption and the refusal
-  paths are verified; whether a real GitHub token produces a successful
-  preflight is **NOT INDEPENDENTLY VERIFIED** and needs one read-only token.
+- **A live GitHub credential HAS now been verified — by the operator, not by
+  this build.** A real PAT reached `Preflight verified: YES` against the GitHub
+  API on the deployed site, which is the first time any provider claim in this
+  project rested on something other than a fixture. Everything in the automated
+  suite still uses provider-*shaped* fake tokens, so the CI claim is unchanged:
+  the connect flow, encryption, capability arithmetic and refusal paths are
+  verified in tests; the live result is verified by observation on Render and is
+  recorded here as such. **Okta and Stripe remain fixture-only.**
+- **`github:collaborator:write` has never been observed anywhere.** By design it
+  cannot be, and its authorized/attested routes are exercised only against
+  fixtures. A workload that actually performs a permission change is still
+  **NOT INDEPENDENTLY VERIFIED** end to end.
 - **Observation semantics remain `measured_at: null`** — DECLARED, NOT
   MEASURED — unchanged from v0.3.2, with the test that fails if one claims
   otherwise.
@@ -443,7 +500,7 @@ provider-shaped clients and fault injection.
 
 **Nyst v0.3.2 is not LAUNCH READY**, and this document will say so until it is.
 
-What is true: the architecture is complete across all three layers, 1160 tests
+What is true: the architecture is complete across all three layers, 1165 tests
 pass with nothing skipped, every known defect has a regression test that failed
 first, and every boundary above is stated rather than hidden.
 

@@ -990,16 +990,34 @@ function capabilityBlock(item: Record<string, unknown>): string {
   } | null | undefined;
   const capabilities = manifest?.capabilities ?? [];
   if (!capabilities.length) return "";
+  const provider = String(item.provider ?? "");
   const rows = capabilities.map((capability) => `<tr>
     <td class="mono small">${escape(capability.capability)}</td>
     <td>${escape(capability.kind)}</td>
     <td><span class="badge ${capability.state === "verified" || capability.state === "authorized" ? "resolved" : capability.state === "insufficient_permission" || capability.state === "unavailable" ? "blocked" : "uncertain"}">${escape(capability.state.replace(/_/g, " "))}</span></td>
     <td class="small">${escape(capability.detail)}${capability.attested_not_observed ? ` <strong>Claimed, not observed.</strong>` : ""}</td>
+    <!--
+      THE ATTESTATION CONTROL (v0.3.3).
+
+      POST /v1/integrations/:provider/capabilities/attest existed with NOTHING
+      in the interface calling it. That mattered most for a WRITE capability,
+      which can never reach "verified" — proving it requires performing the
+      mutation invariant I20 forbids — and which reaches "authorized" only when
+      the provider publishes scope metadata. A fine-grained GitHub token
+      publishes none, so "github:collaborator:write" was permanently stuck at
+      "available" with no route forward and readiness permanently unsatisfiable.
+
+      A person vouching is the remaining honest route, and the result is
+      labelled a CLAIM everywhere it appears. Offered only where an observation
+      could not settle it.
+    -->
+    <td>${capability.state === "verified" || capability.state === "authorized" ? ""
+      : `<button data-attest="${escape(provider)}" data-capability="${escape(capability.capability)}">Attest</button>`}</td>
   </tr>`).join("");
   return `<details class="gap-l"><summary>Capabilities (${capabilities.length})</summary>
     <p class="small">Nyst compares what each enabled EffectSpec requires against what a read-only preflight could observe. A write capability cannot be proved without performing a write, so it is only ever authorized by the provider's own metadata or claimed by a person.</p>
     <div class="table-scroll"><table>
-      <thead><tr><th scope="col">Capability</th><th scope="col">Kind</th><th scope="col">State</th><th scope="col">Why it is in that state</th></tr></thead>
+      <thead><tr><th scope="col">Capability</th><th scope="col">Kind</th><th scope="col">State</th><th scope="col">Why it is in that state</th><th scope="col"><span class="visually-hidden">Action</span></th></tr></thead>
       <tbody>${rows}</tbody></table></div>
     ${manifest?.limitation ? `<p class="note">${escape(String(manifest.limitation))}</p>` : ""}
   </details>`;

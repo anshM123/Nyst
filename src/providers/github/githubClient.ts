@@ -120,6 +120,29 @@ export class GitHubRestClient {
     return { ...response, data: response.status === 200 ? parseUser(response.data) : null };
   }
 
+  /**
+   * PROVING `github:repository:read` WITHOUT BEING TOLD WHICH REPOSITORY.
+   *
+   * `GET /user/repos?per_page=1` is scoped to the credential itself, so it
+   * needs no operator configuration and no fixture topology — and performing it
+   * successfully IS the proof that this credential can read repositories.
+   *
+   * One page of one item: the cheapest possible request that still constitutes
+   * a real read. An empty list is still a successful read (the account may
+   * genuinely have no repositories), so the CAPABILITY is proved by the 200,
+   * never by the row count.
+   */
+  async listAccessibleRepositories(credentialRef: string): Promise<GitHubApiResponse<number>> {
+    const response = await this.request("GET", "/user/repos?per_page=1", credentialRef, null);
+    return { ...response, data: response.status === 200 && Array.isArray(response.data) ? response.data.length : null };
+  }
+
+  /** The same idea for `github:organization:read`. See the note above. */
+  async listAccessibleOrganizations(credentialRef: string): Promise<GitHubApiResponse<number>> {
+    const response = await this.request("GET", "/user/orgs?per_page=1", credentialRef, null);
+    return { ...response, data: response.status === 200 && Array.isArray(response.data) ? response.data.length : null };
+  }
+
   async getUser(login: string, credentialRef: string): Promise<GitHubApiResponse<GitHubPrincipalIdentity>> {
     const response = await this.request("GET", `/users/${this.login(login)}`, credentialRef, null);
     return { ...response, data: response.status === 200 ? parseUser(response.data) : null };

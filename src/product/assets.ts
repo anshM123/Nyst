@@ -135,6 +135,31 @@ export const APP_JS = `
       return;
     }
 
+    /**
+     * A PERSON VOUCHES FOR A CAPABILITY NOTHING COULD OBSERVE.
+     *
+     * The last resort, and deliberately the least comfortable control on the
+     * page: it records a CLAIM, and every screen that shows the result says so.
+     * A justification is required because this is the one capability state that
+     * rests on somebody's word, and an audit will want to know whose and why.
+     */
+    if (button.dataset.attest) {
+      const capability = button.dataset.capability;
+      const justification = prompt(
+        "ATTESTING IS NOT OBSERVING.\\n\\n" + capability + " cannot be confirmed by a read-only check — proving a "
+        + "write would require performing one. Recording it here states that YOU know this credential holds it, and "
+        + "Nyst will label it a claim wherever it appears.\\n\\nHow do you know?");
+      if (justification === null) return;
+      if (justification.trim().length < 10) {
+        announce(button, "An attestation needs a justification somebody can evaluate later.", true);
+        return;
+      }
+      const result = await send(button, "POST", "/v1/integrations/" + button.dataset.attest + "/capabilities/attest",
+        { capability, justification });
+      if (result) location.reload();
+      return;
+    }
+
     if (button.dataset.preflight) {
       const result = await send(button, "POST", "/v1/integrations/" + button.dataset.preflight + "/preflight", {});
       if (result) location.reload();

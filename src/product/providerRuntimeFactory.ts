@@ -195,13 +195,56 @@ export function createProductProviderRuntime(
        * Fine-grained tokens send no scope header at all, and absence means
        * "not stated", never "not granted".
        */
+      /**
+       * PROVE THE READS THE ENABLED EFFECTSPEC ACTUALLY REQUIRES.
+       *
+       * The first version of this rewrite probed only `GET /user`, which fixed
+       * the fixture problem and introduced a smaller one: it proved a single
+       * capability nothing requires, so `github:repository:read` and
+       * `github:organization:read` sat at AVAILABLE — "the provider supports
+       * this, but nothing has observed that this credential holds it" — and
+       * readiness stayed Not ready with three capabilities missing.
+       *
+       * These two endpoints are scoped to the CREDENTIAL rather than to a named
+       * resource, so they need no configuration and performing them IS the
+       * proof. A 200 with an empty list is still a successful read: the
+       * capability is proved by the status, never by the row count, because an
+       * account with no repositories has not failed anything.
+       *
+       * A non-200 is NOT treated as failure of the whole preflight. The
+       * credential authenticates — that was established above — and this
+       * particular permission simply was not granted, which is a capability
+       * fact and not a connection fault. Conflating them would tell a customer
+       * their token is broken when it is merely narrow.
+       */
+      const [repos,orgs]=await Promise.all([
+        client.listAccessibleRepositories(ref).catch(()=>({status:0,data:null,headers:undefined})),
+        client.listAccessibleOrganizations(ref).catch(()=>({status:0,data:null,headers:undefined})),
+      ]);
+      const verified=["github:user:read"];
+      if(repos.status===200)verified.push("github:repository:read");
+      if(orgs.status===200)verified.push("github:organization:read");
+
+      /**
+       * VERIFIED versus AUTHORIZED, and the line is not decorative.
+       *
+       * Everything in `verified` was PROVED by performing a read. Everything
+       * below was merely STATED by GitHub in its scope header, and a WRITE
+       * capability can never be proved by a read-only probe without performing
+       * the mutation invariant I20 forbids — so `github:collaborator:write`
+       * appears here at most, never in `verified`.
+       *
+       * Fine-grained tokens send no scope header at all, and absence means
+       * "not stated", never "not granted".
+       */
       const stated=(user.headers?.oauth_scopes??"").split(",").map(s=>s.trim()).filter(Boolean);
       const authorized:string[]=[];
+      if(stated.includes("repo"))authorized.push("github:collaborator:write");
       if(stated.includes("repo")||stated.includes("public_repo"))authorized.push("github:repository:read");
       if(stated.includes("read:org")||stated.includes("admin:org"))authorized.push("github:organization:read");
       return {
         status:"ready",provider,provider_mutation_performed:false,
-        verified_capabilities:["github:user:read"],
+        verified_capabilities:verified,
         authorized_capabilities:authorized,
         scopes_stated_by_provider:stated,
         // Fine-grained tokens publish no scope list. Say that, rather than

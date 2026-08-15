@@ -160,6 +160,22 @@ const preflight = async (provider: "github" | "okta" | "stripe", secret: string)
       // Only capabilities the probe actually proved by reading. Never a write.
       verified_capabilities: Array.isArray(result.verified_capabilities)
         ? result.verified_capabilities.filter((item): item is string => typeof item === "string") : [],
+      /**
+       * THE PROVIDER'S OWN SCOPE METADATA, forwarded (v0.3.3).
+       *
+       * This adapter dropped it. `observedCapabilities` maps native scope
+       * strings to Nyst capability tokens and is the ONLY route to the
+       * AUTHORIZED state — so with scopes never forwarded, no capability could
+       * ever be authorized, and a write capability (which can never be
+       * verified read-only) was permanently stuck at AVAILABLE: "the provider
+       * supports this, but nothing has observed that this credential holds it".
+       *
+       * Readiness was therefore unsatisfiable for any workload requiring a
+       * write, regardless of what the customer's token could actually do.
+       */
+      ...(Array.isArray(result.scopes_stated_by_provider) && result.scopes_stated_by_provider.length > 0
+        ? { scopes: result.scopes_stated_by_provider.filter((item): item is string => typeof item === "string") }
+        : {}),
       mutated: result.provider_mutation_performed === true,
     };
   } catch (error) {

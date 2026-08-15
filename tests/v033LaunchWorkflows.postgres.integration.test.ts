@@ -154,6 +154,29 @@ describe("Nyst v0.3.3 — the dead form, the logo, and the layout", () => {
 
   /* ------------------------------------------------------ THE LOGO */
 
+  /**
+   * A BACKTICK INSIDE A TEMPLATE LITERAL TERMINATES IT.
+   *
+   * Three separate times in this release a prose comment written inside a
+   * template literal used `word` for emphasis and silently ended the string,
+   * producing a wall of parser errors far from the actual line. It is caught by
+   * the compiler every time and it costs a build cycle every time, so it is
+   * cheaper to make it a test than to keep remembering.
+   */
+  it("STRUCTURAL: no stray backtick inside a rendered template literal", () => {
+    const offenders: string[] = [];
+    for (const file of ["src/product/dashboard.ts", "src/product/assets.ts", "src/product/designSystem.ts", "src/product/outcomeViews.ts"]) {
+      const text = readFileSync(join(root, file), "utf8");
+      // Inside an HTML comment or a // comment, a backtick is always a mistake:
+      // there is no interpolation to perform and it ends the enclosing literal.
+      for (const match of text.matchAll(/<!--[\s\S]*?-->/g)) {
+        if (match[0].includes("`")) offenders.push(`${file}: backtick inside an HTML comment`);
+      }
+    }
+    assert.deepEqual(offenders, [],
+      `a backtick inside a template literal ends the string early:\n  ${offenders.join("\n  ")}`);
+  });
+
   it("the Nyst logo sits on a plate, so a blue mark is not lost on a navy sidebar", () => {
     assert.match(NYST_CSS, /\.brand-plate/,
       "the logo has no backing plate and the blue mark blends into the sidebar");
@@ -666,6 +689,77 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
       assert.match(response.body, /rejected this credential|not expired/i,
         "the failure does not say what is actually wrong with the credential");
     } finally { await failing.close(); }
+  });
+
+  /**
+   * THE REGRESSION I INTRODUCED FIXING THE FIXTURE PROBLEM.
+   *
+   * The first rewrite probed only `GET /user`, which proved
+   * `github:user:read` — a capability nothing requires. So the two reads the
+   * EffectSpec actually needs sat at AVAILABLE ("the provider supports this,
+   * but nothing has observed that this credential holds it") and readiness
+   * stayed Not ready with three capabilities missing.
+   *
+   * A preflight must prove the capabilities the enabled workload REQUIRES, not
+   * a capability that happens to be easy to prove.
+   */
+  it("the probe proves the READ capabilities the EffectSpec requires", () => {
+    const factory = readFileSync(join(root, "src/product/providerRuntimeFactory.ts"), "utf8");
+    const probe = factory.slice(factory.indexOf("const preflight"), factory.indexOf("return { runtime,"));
+    for (const capability of ["github:repository:read", "github:organization:read"]) {
+      assert.ok(probe.includes(capability),
+        `the preflight never proves ${capability}, so a workload requiring it can never be ready`);
+    }
+    assert.match(probe, /listAccessibleRepositories/,
+      "the probe does not perform a repository read, so repository:read is claimed rather than proved");
+    // And it must prove them by READING, never by assuming from a status code
+    // it did not receive.
+    assert.match(probe, /repos\.status===200/,
+      "repository:read is added without checking that the read actually succeeded");
+  });
+
+  it("a WRITE capability is never reported as verified", () => {
+    // Proving one requires performing the mutation invariant I20 forbids.
+    const factory = readFileSync(join(root, "src/product/providerRuntimeFactory.ts"), "utf8");
+    const probe = factory.slice(factory.indexOf("const preflight"), factory.indexOf("return { runtime,"));
+    // The CODE, not the prose around it: every capability literal that is
+    // actually placed into `verified`. An earlier version of this test matched
+    // the explanatory comment and failed on its own documentation.
+    const placed = [
+      ...[...probe.matchAll(/verified\.push\("([^"]+)"\)/g)].map((m) => m[1]!),
+      ...[...probe.matchAll(/const verified=\[([^\]]*)\]/g)]
+        .flatMap((m) => [...m[1]!.matchAll(/"([^"]+)"/g)].map((q) => q[1]!)),
+    ];
+    assert.ok(placed.length > 0, "no verified capabilities are computed at all");
+    for (const capability of placed) {
+      assert.doesNotMatch(capability, /:write$|:lifecycle$|:capture$/,
+        `${capability} IS A WRITE CAPABILITY IN verified_capabilities. Proving one requires performing the `
+        + "mutation invariant I20 forbids; it can only ever be authorized or attested.");
+    }
+  });
+
+  it("the provider's scope metadata reaches the capability manifest", () => {
+    // `observedCapabilities` maps native scope strings to Nyst tokens and is
+    // the ONLY route to the AUTHORIZED state. The startProduct adapter dropped
+    // `scopes` entirely, so no capability could ever be authorized and a write
+    // capability was permanently stuck at AVAILABLE with no route forward.
+    const adapter = readFileSync(join(root, "scripts/startProduct.ts"), "utf8");
+    assert.match(adapter, /scopes:\s*result\.scopes_stated_by_provider/,
+      "THE PREFLIGHT ADAPTER DROPS THE PROVIDER'S SCOPE METADATA, so nothing can ever reach AUTHORIZED");
+  });
+
+  it("a capability nothing could observe offers an attestation route", () => {
+    // POST /v1/integrations/:provider/capabilities/attest existed with nothing
+    // in the interface calling it — and it is the ONLY remaining route for a
+    // write capability when the provider publishes no scope metadata.
+    assert.match(APP_JS, /dataset\.attest/, "nothing in the shipped script records an attestation");
+    assert.match(APP_JS, /capabilities\/attest/, "the handler does not call the attestation route");
+    const dashboard = readFileSync(join(root, "src/product/dashboard.ts"), "utf8");
+    assert.match(dashboard, /data-attest="/, "no attestation control is rendered");
+    // Offered ONLY where observation could not settle it. An attest button next
+    // to a verified capability invites replacing evidence with a claim.
+    assert.match(dashboard, /capability\.state === "verified" \|\| capability\.state === "authorized" \? ""/,
+      "an attestation control is offered for a capability that was actually observed");
   });
 
   it("STRUCTURAL: no probe resolves a hardcoded operator credential reference", () => {
