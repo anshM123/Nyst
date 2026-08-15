@@ -204,18 +204,30 @@ for it rather than a fourth instance.
   backup, a dropped disk and a SQL-injection read. It does not protect a
   compromised host. A KMS-backed key would; the constructor takes the key from
   outside precisely so that swap is a one-line change.
-- **A live GitHub credential HAS now been verified — by the operator, not by
-  this build.** A real PAT reached `Preflight verified: YES` against the GitHub
-  API on the deployed site, which is the first time any provider claim in this
-  project rested on something other than a fixture. Everything in the automated
-  suite still uses provider-*shaped* fake tokens, so the CI claim is unchanged:
-  the connect flow, encryption, capability arithmetic and refusal paths are
-  verified in tests; the live result is verified by observation on Render and is
-  recorded here as such. **Okta and Stripe remain fixture-only.**
-- **`github:collaborator:write` has never been observed anywhere.** By design it
-  cannot be, and its authorized/attested routes are exercised only against
-  fixtures. A workload that actually performs a permission change is still
-  **NOT INDEPENDENTLY VERIFIED** end to end.
+- **GITHUB REACHED `Ready` AGAINST THE LIVE API — verified by observation on
+  the deployed site, not by this build.** All seven readiness conditions held
+  simultaneously for a real customer-supplied classic PAT:
+  `github:repository:read` and `github:organization:read` **verified** by
+  performing real reads, `github:collaborator:write` **authorized** from
+  GitHub's own `X-OAuth-Scopes` header. This is the first time in this project
+  that any provider claim has rested on something other than a fixture, and the
+  first workload that could actually be protected.
+
+  The distinction the whole capability model exists for held under real
+  conditions: the two reads are VERIFIED because a probe performed them; the
+  write is AUTHORIZED because GitHub *stated* it. **Nothing observed the write,
+  and nothing could** — proving it requires performing the mutation invariant
+  I20 forbids.
+
+  What that does **not** license: the automated suite still uses
+  provider-*shaped* fake tokens throughout, so the CI claim is unchanged. The
+  live result is an observation on Render, recorded here as such, reproducible
+  by anyone with a classic PAT. **Okta and Stripe remain fixture-only.**
+- **No consequential action has ever been executed against a live provider.**
+  Readiness says a workload *could* be controlled. A permission change actually
+  dispatched, observed, reconciled and signed end to end against real GitHub is
+  still **NOT INDEPENDENTLY VERIFIED**, and it is the next thing that would
+  change what this product can claim.
 - **Observation semantics remain `measured_at: null`** — DECLARED, NOT
   MEASURED — unchanged from v0.3.2, with the test that fails if one claims
   otherwise.
