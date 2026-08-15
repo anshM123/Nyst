@@ -40,8 +40,10 @@ import { Ed25519Signer } from "../src/core/signing.js";
 import { ProductRepository, type ProductDb } from "../src/product/productRepository.js";
 import { AuthorityRepository } from "../src/product/authority/authorityRepository.js";
 import { buildProductServer } from "../src/product/server.js";
+import { createProductProviderRuntime } from "../src/product/providerRuntimeFactory.js";
 import { createPostgresStore } from "../src/store/postgresStore.js";
 import type { TenantScope } from "../src/product/types.js";
+import { MutableClock } from "./githubHelpers.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 type Pool = ProductDb & { connect(): Promise<ProductDb & { release(): void }>; end(): Promise<void> };
@@ -62,11 +64,23 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
 
   /** Every provider dispatch that actually happened. The number that matters. */
   let providerCalls: { effect: string; business_key: string }[] = [];
-  const EFFECT = "nyst.fake.mutate";
-  const DESCRIPTOR = {
-    effect_name: EFFECT, spec_version: "1.0.0", provider: "fake",
-    supported_topology: "fixture",
+  /**
+   * The development fake, chosen deliberately.
+   *
+   * An earlier version of this file supplied a hand-rolled `commit` returning
+   * `{ ok: true, resolution: {...} }`. Authority allowed the action, the
+   * provider was reached, and then the route's downstream bookkeeping rejected
+   * the shape and answered 500 -- which looks exactly like an authority failure
+   * and is not one. Using the real runtime means a 200 here proves the whole
+   * path, and the dispatch counter still proves the provider was reached.
+   */
+  let EFFECT = "";
+  /** The development fake validates its input; an empty object fails schema. */
+  const FAKE_INPUT = {
+    repository_id: "nyst-fixtures/authority", principal_id: "alice",
+    desired_permission: "none", scenario: "definitely_applied",
   } as const;
+  let descriptors: readonly { effect_name: string }[] = [];
 
   before(async () => {
     const pg = await import("pg") as unknown as { default: { Pool: new (o: { connectionString: string }) => Pool } };
@@ -84,21 +98,25 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
       email: `authority-${suffix}@test.test`, display_name: "Authority", password: PASSWORD,
     });
 
+    const signer = Ed25519Signer.ephemeral(`authority-${suffix}`);
+    const product = createProductProviderRuntime(store, repository, signer, new MutableClock(),
+      { production: false, enable_development_fake: true });
+    EFFECT = product.descriptors[0]!.effect_name;
+    descriptors = product.descriptors;
+
     app = await buildProductServer({
       repository,
       authority,
-      effect_specs: [DESCRIPTOR],
+      effect_specs: product.descriptors,
+      runtime: product.runtime,
       production: false,
-      signer: Ed25519Signer.ephemeral(`authority-${suffix}`),
-      // The provider. Counting invocations here is the whole point: a test that
-      // asserts a 409 without asserting ZERO dispatches proves nothing, because
-      // the refusal could have arrived after the mutation.
-      commit: async (input: { effect: string; businessKey: string }) => {
+      signer,
+      // The real commit, wrapped. Counting invocations is the whole point: a
+      // test that asserts a 409 without asserting ZERO dispatches proves
+      // nothing, because the refusal could have arrived after the mutation.
+      commit: async (input: { effect: string; businessKey: string }, principal: unknown) => {
         providerCalls.push({ effect: input.effect, business_key: input.businessKey });
-        return {
-          ok: true as const,
-          resolution: { resolution_id: randomUUID(), effect_name: input.effect },
-        };
+        return product.commit(input as never, principal as never);
       },
     } as never);
 
@@ -128,7 +146,7 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
     // The EffectSpec must be ENABLED for this environment, or the route refuses
     // before authority is ever consulted and the suite passes for the wrong
     // reason -- which it did on the first run.
-    await repository.configureEffectSpec(tenant, DESCRIPTOR, true);
+    await repository.configureEffectSpec(tenant, product.descriptors[0]!, true);
     await repository.configureIntegration(tenant, "github", "env:NYST_GITHUB_TOKEN").catch(() => null);
 
     const agent = await repository.createAgent(tenant, tenant.user_id, {
@@ -146,7 +164,7 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
     const response = await app.inject({
       method: "POST", url: "/v1/actions",
       headers: { cookie, "x-nyst-csrf": csrf, "content-type": "application/json" },
-      payload: { effect: EFFECT, businessKey, agent_id: agentId, input: {} },
+      payload: { effect: EFFECT, businessKey, agent_id: agentId, input: FAKE_INPUT },
     });
     return { response, dispatches: providerCalls.length };
   }
@@ -206,7 +224,7 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
     const response = await app.inject({
       method: "POST", url: "/v1/actions",
       headers: { cookie, "x-nyst-csrf": csrf, "content-type": "application/json" },
-      payload: { effect: EFFECT, businessKey: `human-${suffix}`, agent_id: heldId, input: {} },
+      payload: { effect: EFFECT, businessKey: `human-${suffix}`, agent_id: heldId, input: FAKE_INPUT },
     });
     assert.equal(providerCalls.length, 0, "a human-required Agent reached the provider");
     assert.ok(response.statusCode >= 400);
@@ -237,7 +255,7 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
     const response = await app.inject({
       method: "POST", url: "/v1/actions",
       headers: { cookie, "x-nyst-csrf": csrf, "content-type": "application/json" },
-      payload: { effect: EFFECT, businessKey: `disabled-${suffix}`, agent_id: offId, input: {} },
+      payload: { effect: EFFECT, businessKey: `disabled-${suffix}`, agent_id: offId, input: FAKE_INPUT },
     });
     assert.equal(providerCalls.length, 0,
       "A DISABLED AGENT REACHED THE PROVIDER — an exception released a BLOCK, which it may never do");
@@ -269,9 +287,17 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
     // The v0.3.0 structural test asserted there is no SECOND evaluator. True,
     // and not the same as the one evaluator being used — which is precisely how
     // this went unnoticed. This asserts USE.
-    const { readFileSync } = await import("node:fs");
+    const { readFileSync, existsSync } = await import("node:fs");
     const { join } = await import("node:path");
-    const source = readFileSync(join(import.meta.dirname, "..", "src/product/server.ts"), "utf8");
+    // Walk up to the repository root. `import.meta.dirname/..` resolves to
+    // `dist/` when this suite runs from a build, where there is no src/ -- so
+    // the assertion would fail for a reason that has nothing to do with the
+    // route. Same trap as the container-image suite.
+    let root = import.meta.dirname;
+    for (let depth = 0; depth < 6 && !existsSync(join(root, "src/product/server.ts")); depth += 1) {
+      root = join(root, "..");
+    }
+    const source = readFileSync(join(root, "src/product/server.ts"), "utf8");
     const route = source.slice(source.indexOf('app.post("/v1/actions"'));
     const body = route.slice(0, route.indexOf('app.get("/v1/actions/:id"'));
     assert.match(body, /evaluateAuthority|authorizeConsequence/,
@@ -293,10 +319,20 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
      * This asserts the consequence: a server built with NO authority option is
      * still gated.
      */
+    // An agent NO rule covers. The shared one was granted an autonomous rule by
+    // an earlier test in this file, so reusing it here proved nothing: the bare
+    // server allowed it correctly, and the assertion read that as a bypass.
+    const uncovered = await repository.createAgent(tenant, tenant.user_id, {
+      name: "Uncovered Agent", slug: `uncovered-${suffix}`, owner: "Authority",
+      description: "No Autonomy Line rule mentions this Agent.",
+      framework: "unspecified", tags: [],
+    });
+    const uncoveredId = String((uncovered as { agent_id?: unknown }).agent_id ?? uncovered);
+
     providerCalls = [];
     const bare = await buildProductServer({
       repository,
-      effect_specs: [DESCRIPTOR],
+      effect_specs: descriptors as never,
       production: false,
       commit: async () => { providerCalls.push({ effect: EFFECT, business_key: "bare" }); return { ok: true as const }; },
     } as never);
@@ -310,7 +346,7 @@ describe("Nyst v0.3.2 Phase 1 — Authority gates the real action path", { skip:
       const response = await bare.inject({
         method: "POST", url: "/v1/actions",
         headers: { cookie: bareCookie, "x-nyst-csrf": bareCsrf, "content-type": "application/json" },
-        payload: { effect: EFFECT, businessKey: `bare-${suffix}`, agent_id: agentId, input: {} },
+        payload: { effect: EFFECT, businessKey: `bare-${suffix}`, agent_id: uncoveredId, input: FAKE_INPUT },
       });
       assert.equal(providerCalls.length, 0,
         "A SERVER BUILT WITH NO AUTHORITY OPTION DISPATCHED A CONSEQUENCE — the defect returned as a config flag");
