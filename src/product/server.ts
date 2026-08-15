@@ -13,7 +13,7 @@ import { healthMetricsText } from "./operationalHealth.js";
 import { LAB_EFFECT } from "./failureLabEngine.js";
 
 /** Single source of the product version string. */
-export const NYST_VERSION = "0.3.1";
+export const NYST_VERSION = "0.3.2";
 import { protectionReportCsv } from "./protectionReport.js";
 import { proofPackHtml, type ProofPack } from "./proofPack.js";
 import { CANONICAL_OFFBOARDING_STAGES, CANONICAL_OFFBOARDING_SUMMARY } from "../offboarding/canonicalStages.js";

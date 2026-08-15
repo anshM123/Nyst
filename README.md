@@ -10,11 +10,32 @@
 INTENT → EXECUTION → OBSERVATION → RECONCILIATION → EFFECT STATE → CONTROL DECISION → SIGNED RECEIPT
 ```
 
-**Version 0.3.1 — backend-hardened.**
+**Version 0.3.2 — launch RC.**
 
 > **Just want to run it?** → **[RUN.md](RUN.md)** (fifteen minutes)
 > **Want to know what was actually verified?** → **[VERIFICATION.md](VERIFICATION.md)**
 > **Want to know where Nyst stops?** → **[Known boundaries](docs/product/known-boundaries.md)**
+
+## What is new in 0.3.2
+
+A launch-readiness pass on the parts of the product that were implemented but
+not *connected*. Three of the eight defects below were the same shape: a
+complete, well-tested model that nothing in the request path ever called.
+
+| # | Defect | Why it mattered |
+|---|---|---|
+| 1 | `evaluateAuthority()` had **zero production call sites** | An Agent with no Autonomy Line rule had *unlimited* authority — the exact inversion of "an undescribed Agent has no autonomy" |
+| 2 | Provider credentials were process-global | Every customer would have shared one GitHub token |
+| 3 | A ContinuationGrant accepted **any UUID** as its human exception | Nyst signed statements attributing decisions to approvals that did not exist |
+| 4 | Signup was three unlinked statements | A failure left someone signed in to a workspace with no policy and no Autonomy Line |
+| 5 | A new Google identity hit a 404 telling it to go and sign up | From the signup page |
+| 8 | No password reset existed | A forgotten password meant a lost account |
+| 10 | Commercial entitlement had no persistence and no caller | A trial could enable Enforced through the API |
+| 12 | OIDC identity was keyed without its issuer | Two identity providers sharing a subject merged two people |
+
+Plus integration Disconnect, lead notification, quotes that record what the
+visitor was actually shown, and observation semantics that replace guessed
+delays with declared, measurable convergence windows.
 
 ## What is new in 0.3.1
 

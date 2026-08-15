@@ -1,4 +1,4 @@
-# Verification status — Nyst v0.3.1 (backend-hardened)
+# Verification status — Nyst v0.3.2 (launch RC)
 
 What was actually checked for this release, how, and what was not.
 
@@ -12,14 +12,14 @@ verified, with the reason.
 
 | | |
 | --- | --- |
-| Version | **0.3.1 — backend-hardened** |
-| Automated tests | **998 passing, 0 failing, 0 skipped** |
-| Test suites | 125 |
-| Migrations | 30, applied cleanly from an empty database |
+| Version | **0.3.2 — launch RC** |
+| Automated tests | **1125 passing, 0 failing, 0 skipped** |
+| Test suites | 136 |
+| Migrations | 35, applied cleanly from an empty database |
 | Runtime dependencies | 4 — `fastify`, `@fastify/cookie`, `bcryptjs`, `pg` |
 | Secret scan | No credential-shaped value in source, tests, docs, migrations, brand assets, the packed SDK tarball, or the Docker build context |
 
-Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → **998**.
+Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → **1125**.
 
 ---
 
@@ -151,6 +151,55 @@ failing assertions.
 
 ---
 
+## v0.3.2 — the launch-readiness pass
+
+Eight defects, each **reproduced by a failing test before it was fixed**.
+
+| # | Defect | Fix | Migration |
+|---|---|---|---|
+| 1 | `evaluateAuthority()` had ZERO production call sites | `authorizeConsequence` between admission and dispatch; layer constructed by `buildProductServer` so it cannot be omitted | — |
+| 2 | Provider credentials process-global | `scopedCredentialSource` resolves the tenant's own reference; the constant became a default | — |
+| 3 | A grant accepted any UUID as its exception | Every dimension validated; revocation de-authorises an issued grant | — |
+| 4 | Signup spanned three unlinked statements | One transaction; refuses without a pool rather than degrading | — |
+| 5 | New Google identity dead-ended at a 404 | Server-side single-use handoff to a workspace-name form | 0034 |
+| 9 | Leads were durable but silent; quotes kept no price | Persist-then-notify; exact price string + catalog version | 0035 |
+| 10 | Entitlement had no persistence and no caller | Persisted and enforced at the mode transition | 0032 |
+| 11 | No integration disconnect | Built, and honest about what it does not stop | 0032 |
+| 12 | OIDC identity keyed without its issuer | `(provider, provider_config_id, subject)` | 0033 |
+
+**THE PATTERN WORTH NAMING.** Three of these — Authority, entitlement, and the
+Google verifier in v0.3.1 — were a complete, well-tested model that nothing in
+the request path called. A green test suite actively hides this: the unit tests
+exercise the model, the HTTP tests never reach it, and a structural test
+asserting "there is no second evaluator" is true and says nothing about whether
+the one evaluator is used. **Every new safety mechanism now has a test that
+drives it through the real route and counts real provider invocations.**
+
+### Two judgement calls, stated rather than buried
+
+**Bootstrap creates a default Autonomy Line rule** (`autonomous`, restricted to
+`requires_reversible`). Without it, closing the Authority hole means a new
+workspace can dispatch nothing and its first action fails with no explanation.
+Irreversible effects still fall through to a human. A stricter product would
+default to `human`; this chose usable-by-default for reversible effects.
+
+**Disconnect is not a kill switch**, and the API response says so in its own
+payload. It stops new work; Emergency Freeze stops work already admitted.
+
+### Observation semantics replace guessed delays
+
+`src/product/observationSemantics.ts` declares, per EffectSpec, how the world is
+authoritatively observed, how long a read is trusted, how long convergence may
+plausibly take, and when Nyst stops asking. A contradictory read inside the
+window is `pending`; past it, repeated contradiction is `not_applied`; past the
+deadline it is `unprovable`.
+
+**Every window is `measured_at: null` — DECLARED, NOT MEASURED.** A test fails
+the moment one claims otherwise, so a guess cannot quietly acquire the status of
+a fact. A provider 429 is never evidence about the world.
+
+---
+
 ## v0.3.1 — the backend hardening pass
 
 Nine defects, each **reproduced by a failing test before it was fixed**. The
@@ -242,9 +291,9 @@ provider-shaped clients and fault injection.
 
 ## Honest overall status
 
-**Nyst v0.3.1 is not LAUNCH READY**, and this document will say so until it is.
+**Nyst v0.3.2 is not LAUNCH READY**, and this document will say so until it is.
 
-What is true: the architecture is complete across all three layers, 998 tests
+What is true: the architecture is complete across all three layers, 1125 tests
 pass with nothing skipped, every known defect has a regression test that failed
 first, and every boundary above is stated rather than hidden.
 
