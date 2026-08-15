@@ -441,6 +441,79 @@ export const APP_JS = `
   }
 
   /**
+   * RUN A CONSEQUENTIAL ACTION FROM THE PAGE (v0.3.3).
+   *
+   * The business key is generated here and shown, because it is the identity
+   * Nyst deduplicates on: pressing the button twice with the same key is ONE
+   * logical action, which is the behaviour a person testing this should be
+   * able to see rather than read about.
+   */
+  document.addEventListener("submit", async (event) => {
+    const form = event.target.closest("form[data-dispatch]");
+    if (!form) return;
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(form).entries());
+    const button = form.querySelector("button");
+    for (const field of ["owner", "repository", "principal"]) {
+      if (!String(data[field] || "").trim()) {
+        announce(button, "Fill in " + field + " first.", true);
+        return;
+      }
+    }
+    const businessKey = "ui-" + data.owner + "/" + data.repository + "/" + data.principal
+      + "/" + data.desired_permission;
+    const result = await send(button, "POST", "/v1/actions", {
+      effect: form.dataset.dispatch,
+      businessKey,
+      input: {
+        owner: String(data.owner).trim(),
+        repository: String(data.repository).trim(),
+        principal: String(data.principal).trim(),
+        desired_permission: data.desired_permission,
+      },
+    });
+    if (result) renderDispatch(form, result, businessKey);
+  });
+
+  /**
+   * The answer, in the product's own vocabulary.
+   *
+   * The pair that matters is EFFECT plus OUTCOME, and they are shown side by
+   * side because the whole proposition is that they can disagree. Collapsing
+   * them into one "status" is the defect this product exists to remove, so the
+   * one screen a person is most likely to look at must not do it.
+   */
+  function renderDispatch(form, result, businessKey) {
+    let panel = form.parentElement.querySelector("[data-dispatch-result]");
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.dataset.dispatchResult = "true";
+      form.parentElement.appendChild(panel);
+    }
+    const effect = String(result.effect_state || result.state || "unknown");
+    const outcome = result.outcome ? String(result.outcome.verdict || "") : "";
+    const decision = String(result.control_decision || result.primary_directive || "");
+    const badge = (value) => value === "verified" || value === "satisfied" ? "resolved"
+      : value === "not_applied" || value === "unsatisfied" ? "blocked" : "uncertain";
+    panel.innerHTML =
+      '<div class="lab-result">'
+      + '<div class="split-top"><h3>Result</h3>'
+      + '<span class="badge ' + badge(effect) + '">' + text(effect) + '</span></div>'
+      + '<dl class="facts gap-m">'
+      + '<div><dt>Effect — what happened to the operation</dt><dd>' + text(effect) + '</dd></div>'
+      + (outcome ? '<div><dt>Outcome — what became true</dt><dd>' + text(outcome) + '</dd></div>' : "")
+      + (decision ? '<div><dt>Decision</dt><dd>' + text(decision) + '</dd></div>' : "")
+      + '<div><dt>Business key</dt><dd class="mono">' + text(businessKey) + '</dd></div>'
+      + '</dl>'
+      + (result.action_id
+        ? '<p class="small gap-m"><a href="/actions/' + text(result.action_id) + '">Open the full record →</a>'
+          + ' Evidence, the facts used, and the signed receipt.</p>'
+        : "")
+      + '</div>';
+    panel.scrollIntoView({ block: "nearest" });
+  }
+
+  /**
    * CONNECT A PROVIDER (v0.3.3).
    *
    * The one form in the product whose field contains a real secret. So:

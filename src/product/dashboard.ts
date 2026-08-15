@@ -401,7 +401,95 @@ export function agentsPage(agents: readonly Record<string, unknown>[], context: 
 
 export interface ActionFilterView { provider?: string; effect?: string; state?: string; decision?: string; since?: string }
 
-export function actionsPage(rows: readonly Record<string, unknown>[], title = "Actions", selected: ActionFilterView = {}, context: ShellContext = {}): string {
+/**
+ * RUN A CONSEQUENTIAL ACTION FROM THE INTERFACE (v0.3.3).
+ *
+ * `POST /v1/actions` is how a customer's SOFTWARE talks to Nyst, and that is
+ * the right primary interface — but it left no way for a person to try the
+ * product at all. Evaluating Nyst meant writing a curl command with a session
+ * cookie and a CSRF token, or creating an API key first, before seeing it do
+ * anything even once.
+ *
+ * This is the thing that lets somebody watch Nyst work before they integrate
+ * it. It is deliberately NOT a general console: it renders the fields THIS
+ * EffectSpec needs and nothing else, because a free-form JSON box would just be
+ * curl with extra steps.
+ *
+ * The environment mode is stated on the control itself. "Run" means something
+ * completely different in Shadow than in Enforced, and a person about to press
+ * it deserves to know which one they are in without going to look.
+ */
+function dispatchPanel(specs: readonly Record<string, unknown>[], mode: string): string {
+  const github = specs.find((spec) =>
+    String(spec.effect_name) === "github.repository_permission_change" && spec.enabled === true);
+  if (!github) {
+    return `<div class="panel panel-pad gap-below-l">
+      <h3>Run an action</h3>
+      <p class="small">No GitHub EffectSpec is enabled in this environment yet, so there is nothing to run.
+        Enable one on the <a href="/integrations">Integrations</a> page.</p>
+    </div>`;
+  }
+  const shadow = mode === "shadow";
+  /**
+   * SHADOW REFUSES DISPATCH ENTIRELY. It does not evaluate it.
+   *
+   * The first version of this panel said Nyst would "evaluate this action with
+   * the real EffectSpec semantics and control nothing", and pressing the button
+   * produced a 409: "The environment is in Shadow; Nyst evaluates but does not
+   * control this action." The copy promised something the route refuses.
+   *
+   * The distinction is real and worth stating rather than papering over.
+   * Shadow evaluates observations YOUR SOFTWARE reports about actions IT
+   * performed — Nyst is not in the path, so there is nothing for it to run.
+   * Asking Nyst to perform the action itself means asking it to CONTROL the
+   * action, and that is what leaving Shadow means.
+   *
+   * So the button is not offered here. A control that exists only to be refused
+   * teaches people to ignore refusals.
+   */
+  if (shadow) {
+    return `<div class="panel panel-pad gap-below-l">
+      <div class="split-top"><h3>Run an action</h3><span class="badge neutral">shadow</span></div>
+      <p class="small">This environment is in <strong>Shadow</strong>, where Nyst is not in the path of your
+        actions — it evaluates observations your software reports about actions it performed itself. There is
+        no action here for Nyst to run.</p>
+      <p class="small gap-m">Asking Nyst to perform the change <em>is</em> asking it to control the change,
+        which is what leaving Shadow means. See <a href="/settings">control posture</a> for what stands
+        between this environment and Canary or Enforced.</p>
+      <p class="small gap-m">To watch the engine reason about a failure right now without touching anything,
+        use the <a href="/failure-lab">Failure Lab</a> — same evaluator, synthetic observations.</p>
+    </div>`;
+  }
+  return `<div class="panel panel-pad gap-below-l">
+    <div class="split-top">
+      <h3>Run an action</h3>
+      <span class="badge blocked">${escape(mode)}</span>
+    </div>
+    <p class="small">This environment is <strong>${escape(mode.toUpperCase())}</strong>. Nyst will attempt this
+      change against GitHub for real, refuse it if it is not safe, and then verify whether the outcome you
+      asked for actually became true. <strong>Real access will be removed.</strong></p>
+    <form class="connect-form" data-dispatch="github.repository_permission_change"
+      method="post" action="/v1/actions">
+      <label>Organization<input name="owner" placeholder="acme-test-org" autocomplete="off" spellcheck="false"></label>
+      <label>Repository<input name="repository" placeholder="payments" autocomplete="off" spellcheck="false"></label>
+      <label>GitHub username<input name="principal" placeholder="dana" autocomplete="off" spellcheck="false"></label>
+      <label>Desired permission
+        <select name="desired_permission">
+          <option value="none">none — remove their access</option>
+          <option value="pull">pull</option>
+          <option value="push">push</option>
+          <option value="maintain">maintain</option>
+          <option value="admin">admin</option>
+        </select>
+      </label>
+      <button type="submit">Run against GitHub</button>
+    </form>
+    <p class="small">The repository must be PRIVATE and owned by an organization, and the person must be an
+      org member — the semantics Nyst has verified apply to that topology only.</p>
+  </div>`;
+}
+
+export function actionsPage(rows: readonly Record<string, unknown>[], title = "Actions", selected: ActionFilterView = {}, context: ShellContext = {}, specs: readonly Record<string, unknown>[] = []): string {
   const options = (name: string, label: string, values: readonly string[]): string =>
     `<label>${escape(label)}<select name="${name}"><option value="">Any</option>${values.map((value) =>
       `<option value="${escape(value)}"${(selected as Record<string, unknown>)[name] === value ? " selected" : ""}>${escape(value)}</option>`).join("")}</select></label>`;
@@ -412,6 +500,7 @@ export function actionsPage(rows: readonly Record<string, unknown>[], title = "A
     <h1>${escape(title)}</h1>
     <p class="lede">Every logical action Nyst took responsibility for, with the truth it established and the decision it made.</p>
   </div>
+  ${specs.length ? dispatchPanel(specs, String(context.mode ?? "unknown")) : ""}
   <form class="panel panel-pad gap-below-l" method="get" action="/actions" aria-label="Filter actions">
     <fieldset class="field-grid">
     <legend>Filter actions</legend>

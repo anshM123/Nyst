@@ -13,13 +13,13 @@ verified, with the reason.
 | | |
 | --- | --- |
 | Version | **0.3.3 — launch RC** |
-| Automated tests | **1181 passing, 0 failing, 0 skipped** |
+| Automated tests | **1185 passing, 0 failing, 0 skipped** |
 | Test suites | 138 |
 | Migrations | 37, applied cleanly from an empty database |
 | Runtime dependencies | 4 — `fastify`, `@fastify/cookie`, `bcryptjs`, `pg` |
 | Secret scan | No credential-shaped value in source, tests, docs, migrations, brand assets, the packed SDK tarball, or the Docker build context |
 
-Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1181**.
+Test count across this work: 444 at the v0.2.1 baseline → 658 at v0.2.2 → 851 at v0.3.0 → 998 at v0.3.1 → 1125 at v0.3.2 → **1185**.
 
 ---
 
@@ -234,6 +234,12 @@ for it rather than a fourth instance.
 - **Screenshots were unavailable** in the verification environment. Layout was
   confirmed by measuring computed geometry and colours in a real browser
   (element widths, background colours, scroll overflow) rather than by eye.
+- **`productV02` is FLAKY under `--test-concurrency=4`, roughly one run in
+  two.** Five tests in that one suite fail together and pass in isolation and on
+  repeat. This is a real property of the suite, not a passing remark: a
+  50%-failing suite trains people to re-run rather than investigate, and it is
+  the reason every count in this document was confirmed across multiple runs.
+  It is **NOT DIAGNOSED** and remains outstanding.
 - **Five tests failed transiently on one full-suite run** while two dev servers
   with active background workers were polling the same PostgreSQL instance.
   They pass in isolation and the suite is green across two subsequent clean
@@ -512,7 +518,7 @@ provider-shaped clients and fault injection.
 
 **Nyst v0.3.2 is not LAUNCH READY**, and this document will say so until it is.
 
-What is true: the architecture is complete across all three layers, 1181 tests
+What is true: the architecture is complete across all three layers, 1185 tests
 pass with nothing skipped, every known defect has a regression test that failed
 first, and every boundary above is stated rather than hidden.
 

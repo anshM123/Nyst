@@ -691,7 +691,7 @@ export async function buildProductServer(options: ProductServerOptions): Promise
   app.get("/overview", pageHandler(async (principal) => overviewPage(await options.repository.overview(principal), await pageContext(principal)), options.repository));
   app.get("/needs-attention", pageHandler(async (principal) => needsAttentionPage(await options.repository.needsAttention(principal), await pageContext(principal)), options.repository));
   app.get("/agents", pageHandler(async (principal) => agentsPage(await options.repository.agents(principal), await pageContext(principal)), options.repository));
-  app.get("/actions", pageHandler(async (principal, request) => { const selected = filters(request.query); return actionsPage(await options.repository.listActions(principal, selected), "Actions", selected, await pageContext(principal)); }, options.repository));
+  app.get("/actions", pageHandler(async (principal, request) => { const selected = filters(request.query); return actionsPage(await options.repository.listActions(principal, selected), "Actions", selected, await pageContext(principal), await options.repository.effectSpecStatuses(principal, options.effect_specs, options.production === true, secretsFor(principal) ?? null)); }, options.repository));
   app.get("/actions/:id", pageHandler(async (principal, request, reply) => {
     const id = routeId(request);
     const action = await options.repository.actionDetail(principal, id);

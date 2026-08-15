@@ -969,6 +969,64 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
    * session cookie and a CSRF token — precisely the thing an API key exists to
    * avoid. The feature was unreachable by the people who needed it most.
    */
+  /**
+   * A PERSON CAN RUN AN ACTION WITHOUT WRITING A CURL COMMAND.
+   *
+   * `POST /v1/actions` is how a customer's SOFTWARE talks to Nyst, and that is
+   * the right primary interface — but it left no way for a person to see the
+   * product do anything at all. Evaluating Nyst meant hand-writing a request
+   * with a session cookie and a CSRF token, or creating an API key first,
+   * before it had demonstrated a single thing.
+   */
+  it("THE DEFECT: an action can be dispatched from the interface", () => {
+    const dashboard = readFileSync(join(root, "src/product/dashboard.ts"), "utf8");
+    assert.match(dashboard, /data-dispatch="github\.repository_permission_change"/,
+      "the Actions page renders no way to run an action");
+    assert.match(APP_JS, /form\[data-dispatch\]/, "nothing in the shipped script dispatches an action");
+    assert.match(APP_JS, /"POST", "\/v1\/actions"/, "the handler does not call the dispatch route");
+  });
+
+  /**
+   * SHADOW REFUSES DISPATCH. IT DOES NOT EVALUATE IT.
+   *
+   * The first version of this panel said Nyst would "evaluate this action with
+   * the real EffectSpec semantics and control nothing". Pressing the button in
+   * a real browser produced a 409: "The environment is in Shadow; Nyst
+   * evaluates but does not control this action." The copy promised something
+   * the route refuses — found by clicking it, not by any assertion.
+   *
+   * So the button is not offered in Shadow. A control that exists only to be
+   * refused teaches people to ignore refusals.
+   */
+  it("no dispatch control is offered in SHADOW, where the route refuses it", () => {
+    const dashboard = readFileSync(join(root, "src/product/dashboard.ts"), "utf8");
+    const panel = dashboard.slice(
+      dashboard.indexOf("function dispatchPanel"), dashboard.indexOf("export function actionsPage"));
+    const shadowAt = panel.indexOf("if (shadow)");
+    const formAt = panel.indexOf("data-dispatch=");
+    assert.ok(shadowAt > 0, "the panel does not distinguish Shadow at all");
+    assert.ok(formAt > shadowAt,
+      "A DISPATCH FORM IS RENDERED BEFORE THE SHADOW BRANCH CAN RETURN, so Shadow gets a button whose "
+      + "only possible outcome is a refusal");
+    const shadowBranch = panel.slice(shadowAt, formAt);
+    assert.match(shadowBranch, /return `/, "the Shadow branch does not return early, so the form is offered");
+    assert.match(shadowBranch, /not in the path/i, "the panel does not explain why there is nothing to run");
+  });
+
+  it("the enforced control warns that it changes real provider state", () => {
+    const dashboard = readFileSync(join(root, "src/product/dashboard.ts"), "utf8");
+    assert.match(dashboard, /Real access will be removed/,
+      "the control does not warn that pressing it changes the real world");
+  });
+
+  it("the result shows EFFECT and OUTCOME separately, never collapsed", () => {
+    // The entire proposition is that these two can disagree. The one screen a
+    // person is most likely to look at must not merge them into a "status".
+    const render = APP_JS.slice(APP_JS.indexOf("function renderDispatch"));
+    assert.match(render, /what happened to the operation/i, "the effect layer is unlabelled");
+    assert.match(render, /what became true/i, "the outcome layer is unlabelled");
+  });
+
   it("THE DEFECT: a key can be created from the interface", () => {
     assert.match(APP_JS, /dataset\.createKey/, "nothing in the shipped script creates an API key");
     assert.match(APP_JS, /"POST", "\/v1\/api-keys"/, "the handler does not call the creation route");
