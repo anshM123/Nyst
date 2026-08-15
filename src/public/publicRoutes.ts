@@ -17,6 +17,7 @@ import {
   homePage, pricingPage, productPage, outcomesExplainedPage, integrationsPublicPage, securityPage, publicShell,
 } from "./site.js";
 import { configuratorPage, contactPage, recommendPlan, type QuoteInput } from "./configurator.js";
+import { forgotPasswordPage, resetPasswordPage } from "./site.js";
 import { signupPage } from "./site.js";
 import { escape } from "../product/dashboard.js";
 
@@ -61,6 +62,18 @@ export interface PublicRouteOptions {
   sales_contact_email?: string;
   /** Reports a submission that could not be stored. Never shown to a visitor. */
   on_error?: (event: Record<string, unknown>) => void;
+  /**
+   * Password recovery.
+   *
+   * Omit it and /forgot-password renders and explains that this deployment
+   * cannot reset passwords, rather than 404ing a link the sign-in page shows.
+   */
+  password_reset?: {
+    requestReset(input: { email: string; source_ip?: string | null; user_agent?: string | null }):
+      Promise<{ accepted: boolean; delivery_unavailable: boolean }>;
+    inspect(token: string): Promise<{ valid: boolean }>;
+    completeReset(token: string, password: string): Promise<{ ok: true } | { ok: false; reason: string }>;
+  };
   /**
    * Create a real Shadow trial account.
    *
@@ -267,6 +280,92 @@ export function registerPublicRoutes(app: FastifyInstance, options: PublicRouteO
     // signup form: signing in is where a session is established, and doing it
     // in two places is two places to get it wrong.
     return reply.redirect("/login?created=1");
+  });
+
+  /* ------------------------------------------------ password recovery */
+
+  /**
+   * THE RESPONSE NEVER REVEALS WHETHER AN ACCOUNT EXISTS.
+   *
+   * Same page, same words, same status, for a real address and an invented
+   * one. A form that distinguishes them enumerates the customer list for
+   * anyone who wants it, which is step one of every credential-stuffing run.
+   */
+  app.get("/forgot-password", async (_request, reply) =>
+    html(reply, forgotPasswordPage({ submitted: false })));
+
+  app.post("/forgot-password", async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const address = bounded(body.email, 320);
+
+    if (!options.password_reset) {
+      return reply.code(503).type("text/html; charset=utf-8").send(forgotPasswordPage({
+        submitted: true, delivery_unavailable: true,
+        sales_email: options.sales_contact_email ?? null,
+      }));
+    }
+
+    const outcome = await options.password_reset.requestReset({
+      email: address,
+      source_ip: clientAddress(request),
+      user_agent: bounded(request.headers["user-agent"], 400) || null,
+    }).catch((error: unknown) => {
+      // A failure here must ALSO be indistinguishable. Reporting it would say
+      // "something happened for this address", which is exactly the signal
+      // being withheld.
+      options.on_error?.({
+        type: "password_reset_request_failed",
+        detail: error instanceof Error ? error.message : "unknown",
+      });
+      return { accepted: true, delivery_unavailable: false };
+    });
+
+    return html(reply, forgotPasswordPage({
+      submitted: true,
+      delivery_unavailable: outcome.delivery_unavailable,
+      sales_email: options.sales_contact_email ?? null,
+    }));
+  });
+
+  /**
+   * GET does NOT consume the token.
+   *
+   * Mail clients and link scanners prefetch URLs. A GET that consumed the
+   * token would burn a person's reset before they ever saw the page, and they
+   * would have no idea why.
+   */
+  app.get("/reset-password", async (request, reply) => {
+    const query = request.query as { token?: unknown };
+    const token = bounded(query.token, 128);
+    if (!options.password_reset) {
+      return reply.code(503).type("text/html; charset=utf-8")
+        .send(resetPasswordPage({ token, valid: false }));
+    }
+    const { valid } = await options.password_reset.inspect(token);
+    return html(reply, resetPasswordPage({ token, valid }));
+  });
+
+  app.post("/reset-password", async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const token = bounded(body.token, 128);
+    const password = typeof body.password === "string" ? body.password : "";
+
+    if (!options.password_reset) {
+      return reply.code(503).type("text/html; charset=utf-8")
+        .send(resetPasswordPage({ token, valid: false }));
+    }
+
+    const result = await options.password_reset.completeReset(token, password);
+    if (result.ok) {
+      // Every session for this user is already gone -- the database trigger on
+      // nyst_users sees to that -- so there is nothing to sign out here.
+      return html(reply, resetPasswordPage({ token: "", valid: true, done: true }));
+    }
+    // A weak password must NOT burn the link, so the form comes back usable.
+    const stillValid = (await options.password_reset.inspect(token)).valid;
+    return reply.code(400).type("text/html; charset=utf-8").send(resetPasswordPage({
+      token, valid: stillValid, error: result.reason,
+    }));
   });
 
   app.get("/contact", async (request, reply) => {

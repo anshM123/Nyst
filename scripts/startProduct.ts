@@ -29,6 +29,9 @@ import { EvidenceIngest, RelayCoordinator } from "../dist/src/product/outcome/ev
 import { AuthorityRepository } from "../dist/src/product/authority/authorityRepository.js";
 import { registerPublicRoutes } from "../dist/src/public/publicRoutes.js";
 import { InboundRepository } from "../dist/src/public/inboundRepository.js";
+import { PasswordResetService } from "../dist/src/product/auth/passwordReset.js";
+import { smtpSettingsFromEnv } from "../dist/src/product/email.js";
+import { SmtpEmailProvider } from "../dist/src/product/smtpEmail.js";
 import { homePage } from "../dist/src/public/site.js";
 import { FederatedRepository } from "../dist/src/product/auth/federatedRepository.js";
 import { GoogleAuth, googleConfigFromEnv, httpGoogleTransport } from "../dist/src/product/auth/googleAuth.js";
@@ -164,6 +167,24 @@ const app = await buildProductServer({
  */
 const inbound = new InboundRepository(pool);
 
+/**
+ * Outbound mail, and password recovery.
+ *
+ * Unconfigured is a legitimate state and every caller handles it: the reset
+ * page says plainly that this deployment cannot send email rather than
+ * pretending a link is on its way.
+ */
+const smtp = smtpSettingsFromEnv();
+const emailProvider = smtp ? new SmtpEmailProvider(smtp, secrets) : null;
+if (!smtp) {
+  structuredLog({
+    type: "email_transport_unconfigured",
+    detail: "Set NYST_SMTP_HOST and NYST_EMAIL_FROM to enable password reset and lead notification.",
+  });
+}
+const passwordResets = new PasswordResetService(
+  pool, emailProvider, process.env.NYST_PUBLIC_ORIGIN ?? `http://${config.host}:${config.port}`);
+
 registerPublicRoutes(app, {
   mount_root: false,
   record_contact: (submission) => inbound.recordContact(submission),
@@ -173,6 +194,7 @@ registerPublicRoutes(app, {
     ? { sales_contact_email: process.env.NYST_SALES_CONTACT_EMAIL }
     : {}),
   on_error: structuredLog,
+  password_reset: passwordResets,
   /**
    * A real Shadow trial.
    *

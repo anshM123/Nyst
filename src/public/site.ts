@@ -439,3 +439,115 @@ export function signupPage(input: {
     </div>
   </section>`}`, { description: "Start a Nyst Shadow trial. Observation only — Nyst is not in the path of anything." });
 }
+
+/* ================================================== PASSWORD RECOVERY */
+
+/**
+ * Forgot password.
+ *
+ * The page NEVER says whether an address is known. That is not politeness, it
+ * is the whole security property: a form that distinguishes "sent" from "no
+ * such account" enumerates your customer list for anyone who wants it.
+ */
+export function forgotPasswordPage(input: {
+  submitted: boolean;
+  /** Set only when this deployment cannot send mail at all. */
+  delivery_unavailable?: boolean;
+  sales_email?: string | null;
+} = { submitted: false }): string {
+  const body = input.submitted
+    ? (input.delivery_unavailable
+      ? `<section class="band band-quiet">
+        <h2>This deployment cannot send email.</h2>
+        <p class="lede">No mail transport is configured, so no reset link was sent. Nothing has changed
+          about your account.${input.sales_email ? ` Contact <a href="mailto:${escape(input.sales_email)}">${escape(input.sales_email)}</a> for help.` : ""}</p>
+      </section>`
+      : `<section class="band band-quiet">
+        <h2>Check your email.</h2>
+        <p class="lede">If an account exists for that address, a reset link is on its way. It works once
+          and expires in 30 minutes.</p>
+        <p class="small">Nothing about your account has changed yet. It changes only when you open the
+          link and choose a new password — and doing that will sign out every device.</p>
+      </section>`)
+    : "";
+
+  return publicShell("Reset your password", "/forgot-password", `
+  <section class="page-head-public">
+    <p class="eyebrow">Account</p>
+    <h1>Reset your password</h1>
+    <p class="lede">Enter the address you sign in with and we will send a link.</p>
+  </section>
+
+  ${body}
+
+  <section class="configure">
+    <form method="post" action="/forgot-password" class="steps">
+      <fieldset class="step">
+        <legend>Your account</legend>
+        <label>Email <input type="email" name="email" maxlength="320" required autofocus></label>
+      </fieldset>
+      <div class="step-actions"><button type="submit" class="button primary">Send reset link</button></div>
+    </form>
+    <p class="small"><a href="/login">Back to sign in</a></p>
+  </section>`);
+}
+
+/**
+ * Choose a new password.
+ *
+ * `valid` is false for a link that is wrong, used, cancelled or expired — all
+ * four look identical, because telling someone holding a stolen link WHICH
+ * kind of stale it is tells them something useful.
+ */
+export function resetPasswordPage(input: {
+  token: string;
+  valid: boolean;
+  error?: string | null;
+  done?: boolean;
+}): string {
+  if (input.done) {
+    return publicShell("Password changed", "/reset-password", `
+  <section class="page-head-public">
+    <p class="eyebrow">Account</p>
+    <h1>Your password is changed.</h1>
+    <p class="lede">Every device that was signed in to this account has been signed out, including any
+      you did not recognise. Sign in again with your new password.</p>
+  </section>
+  <section class="configure"><p><a class="button primary" href="/login">Sign in</a></p></section>`);
+  }
+
+  if (!input.valid) {
+    return publicShell("That link is no longer valid", "/reset-password", `
+  <section class="page-head-public">
+    <p class="eyebrow">Account</p>
+    <h1>That link is no longer valid.</h1>
+    <p class="lede">Reset links work once and expire after 30 minutes. Requesting a new one also
+      cancels any older link.</p>
+  </section>
+  <section class="configure"><p><a class="button primary" href="/forgot-password">Request a new link</a></p></section>`);
+  }
+
+  return publicShell("Choose a new password", "/reset-password", `
+  <section class="page-head-public">
+    <p class="eyebrow">Account</p>
+    <h1>Choose a new password</h1>
+    <p class="lede">At least 12 characters. Length is what makes a password hard to guess — there are no
+      rules here about symbols, because those mostly produce <em>Password1!</em></p>
+  </section>
+
+  ${input.error ? `<section class="band band-quiet"><h2>That did not work.</h2>
+    <p class="lede">${escape(input.error)}</p></section>` : ""}
+
+  <section class="configure">
+    <form method="post" action="/reset-password" class="steps">
+      <input type="hidden" name="token" value="${escape(input.token)}">
+      <fieldset class="step">
+        <legend>New password</legend>
+        <label>New password <input type="password" name="password" minlength="12" maxlength="1024"
+          autocomplete="new-password" required autofocus></label>
+      </fieldset>
+      <div class="step-actions"><button type="submit" class="button primary">Change password</button></div>
+    </form>
+    <p class="small">This will sign out every device currently signed in to this account.</p>
+  </section>`);
+}

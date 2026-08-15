@@ -169,6 +169,7 @@ export function loginPage(options: { google?: boolean } = {}): string {
       <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
       <button class="primary">Continue</button>
       <p id="login-error" role="alert"></p>
+      <p class="small"><a href="/forgot-password">Forgot your password?</a></p>
     </form>${google}
   </section>
 </main>`, "/assets/login.js");
