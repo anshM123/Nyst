@@ -25,7 +25,15 @@ export interface ProductDb {
 
 const SESSION_HOURS = 12;
 const ALLOWED_API_SCOPES = new Set(["actions:read", "actions:write", "receipts:read", "integrations:read"]);
+/**
+ * The CONVENTIONAL reference per provider (v0.3.2 Phase 2).
+ *
+ * A default for a single-tenant deployment and for `.env.example`. It is no
+ * longer a requirement: enforcing it made every environment share one
+ * credential, which is the definition of a single-tenant architecture.
+ */
 const EXPECTED_PROVIDER_REFS: Readonly<Record<string, string>> = { github: "env:NYST_GITHUB_TOKEN", okta: "env:NYST_OKTA_ACCESS_TOKEN", stripe: "env:NYST_STRIPE_CREDENTIAL" };
+void EXPECTED_PROVIDER_REFS;
 
 export class ProductRepository {
   constructor(private readonly db: ProductDb) {}
@@ -420,7 +428,25 @@ export class ProductRepository {
       WHERE organization_id=$1 AND project_id=$2 AND environment_id=$3 AND provider=$4 AND configured=true`, [scope.organization_id, scope.project_id, scope.environment_id, descriptor.provider]);
     const credentialRef = integration.rows[0]?.credential_ref;
     if (typeof credentialRef !== "string") throw Object.assign(new Error("Required provider integration is not configured"), { statusCode: 409 });
-    if (credentialRef !== EXPECTED_PROVIDER_REFS[descriptor.provider]) throw Object.assign(new Error("Configured credential topology is unsupported by this provider runtime"), { statusCode: 409 });
+    /**
+     * ANY VALID REFERENCE, NOT ONE HARDCODED CONSTANT (v0.3.2 Phase 2).
+     *
+     * This used to require credential_ref === EXPECTED_PROVIDER_REFS[provider],
+     * so every environment on the deployment had to name the SAME variable --
+     * which is another way of saying every customer shared one GitHub token.
+     * Fine for a single design partner, impossible for a hosted product.
+     *
+     * The shape is checked here; whether the secret behind it exists is
+     * answered by the SecretProvider at the moment of use, and by preflight
+     * before anything is admitted. Checking resolvability here would mean
+     * resolving a secret on every admission, which is both slower and a wider
+     * blast radius for a value that must live as briefly as possible.
+     */
+    if (!/^(env|vault|secret-manager):[A-Za-z0-9_./:-]{3,280}$/.test(credentialRef)) {
+      throw Object.assign(new Error(
+        "The configured credential reference is not a usable reference. It must name a secret — " +
+        "env:NAME, vault:path or secret-manager:name."), { statusCode: 409 });
+    }
     return { ...descriptor, enabled: true, credential_ref: credentialRef };
   }
 
