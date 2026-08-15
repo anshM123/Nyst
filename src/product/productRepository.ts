@@ -135,7 +135,7 @@ export class ProductRepository {
    * non-atomic behaviour -- silently writing a half-workspace is exactly what
    * this exists to stop.
    */
-  async createBootstrap(input: { organization: string; organization_slug: string; project: string; project_slug: string; environment: string; environment_slug: string; email: string; display_name: string; password: string; mode?: EnvironmentMode }): Promise<TenantScope & { user_id: string }> {
+  async createBootstrap(input: { organization: string; organization_slug: string; project: string; project_slug: string; environment: string; environment_slug: string; email: string; display_name: string; password: string; mode?: EnvironmentMode; initial_agent?: { name: string; slug: string; owner: string; description?: string; framework?: string; tags?: readonly string[] }; federated_identity?: { provider: "google" | "oidc"; provider_subject: string; email_at_link: string; email_verified_at_link: boolean; provider_config_id?: string | null } }): Promise<TenantScope & { user_id: string }> {
     const organizationId = randomUUID(); const projectId = randomUUID(); const environmentId = randomUUID(); const userId = randomUUID();
     const email = normalizedEmail(input.email); const passwordHash = await hash(input.password, 12);
 
@@ -195,6 +195,25 @@ export class ProductRepository {
           + "rule on the Autonomy Line page once you know what your Agents actually do.",
           userId]);
 
+      if (input.initial_agent) {
+        const agent = input.initial_agent;
+        const tags = (agent.tags ?? []).slice(0, 12).map((tag) => bounded(tag, 40, "agent tag"));
+        await client.query(`INSERT INTO nyst_agents(agent_id,organization_id,project_id,environment_id,slug,name,owner,description,framework,tags,created_by)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [randomUUID(), organizationId, projectId, environmentId, slug(agent.slug), bounded(agent.name, 120, "agent name"),
+            bounded(agent.owner, 120, "agent owner"), agent.description ? bounded(agent.description, 1000, "agent description") : "",
+            agent.framework ? bounded(agent.framework, 80, "agent framework") : "unspecified", JSON.stringify(tags), userId]);
+      }
+
+      if (input.federated_identity) {
+        const identity = input.federated_identity;
+        await client.query(`INSERT INTO nyst_federated_identities(federated_identity_id,user_id,organization_id,provider,provider_config_id,
+            provider_subject,email_at_link,email_verified_at_link,last_login_at)
+          VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,now())`,
+          [userId, organizationId, identity.provider, identity.provider_config_id ?? null, identity.provider_subject,
+            normalizedEmail(identity.email_at_link), identity.email_verified_at_link]);
+      }
+
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
@@ -229,6 +248,21 @@ export class ProductRepository {
       RETURNING u.user_id,s.organization_id,s.selected_project_id project_id,s.selected_environment_id environment_id,s.csrf_hash`, [digest(session)]);
     const row = result.rows[0]; if (!row) return null;
     return { kind: "session", user_id: String(row.user_id), api_key_id: null, agent_id: null, organization_id: String(row.organization_id), project_id: String(row.project_id), environment_id: String(row.environment_id), scopes: ["*"], csrf_hash: String(row.csrf_hash) };
+  }
+
+  async refreshSessionCsrf(session: string): Promise<string | null> {
+    if (!/^[A-Za-z0-9_-]{40,100}$/.test(session)) return null;
+    const csrf = randomBytes(24).toString("base64url");
+    const result = await this.db.query(
+      `UPDATE nyst_sessions s SET csrf_hash=$2,last_seen_at=now()
+       FROM nyst_users u
+       WHERE s.session_hash=$1 AND s.user_id=u.user_id
+         AND s.organization_id=u.organization_id AND s.expires_at>now()
+         AND u.disabled_at IS NULL
+       RETURNING s.session_hash`,
+      [digest(session), digest(csrf)],
+    );
+    return result.rows.length === 1 ? csrf : null;
   }
 
   async deleteSession(session: string): Promise<void> { if (/^[A-Za-z0-9_-]{40,100}$/.test(session)) await this.db.query(`DELETE FROM nyst_sessions WHERE session_hash=$1`, [digest(session)]); }

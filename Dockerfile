@@ -22,9 +22,12 @@ COPY packages/sdk/package.json ./packages/sdk/
 RUN npm ci --no-audit --no-fund
 
 COPY tsconfig.json ./
+COPY tsconfig.scripts.json tsconfig.api.json ./
 COPY packages/sdk/tsconfig.json ./packages/sdk/
 COPY packages/sdk/src ./packages/sdk/src
 COPY src ./src
+COPY scripts ./scripts
+COPY api ./api
 COPY tests ./tests
 RUN npm run build
 
@@ -62,4 +65,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 # SIGTERM reaches PID 1 directly in exec form, which is what the graceful
 # shutdown handlers in scripts/startProduct.ts are waiting for.
-CMD ["node", "--experimental-strip-types", "scripts/startProduct.ts"]
+# Free Render services cannot use the gated Pre-Deploy Command. Apply the
+# idempotent schema migrations before starting the web process instead.
+CMD ["sh", "-c", "node --experimental-strip-types scripts/migrate.ts && exec node --experimental-strip-types scripts/startProduct.ts"]

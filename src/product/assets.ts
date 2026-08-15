@@ -39,6 +39,14 @@ document.getElementById("login-form")?.addEventListener("submit", async (event) 
 
 export const APP_JS = `
 (() => {
+  // A session cookie can survive a new tab while sessionStorage does not.
+  // Hydrate a fresh CSRF token for that existing browser session.
+  const csrfReady = sessionStorage.getItem("nyst_csrf")
+    ? Promise.resolve()
+    : fetch("/v1/auth/csrf", { credentials: "same-origin" })
+        .then((response) => response.ok ? response.json() : null)
+        .then((result) => { if (result?.csrf) sessionStorage.setItem("nyst_csrf", result.csrf); })
+        .catch(() => undefined);
   const csrf = () => sessionStorage.getItem("nyst_csrf") || "";
 
   /**
@@ -52,6 +60,7 @@ export const APP_JS = `
     const original = button.textContent;
     button.textContent = "Working…";
     try {
+      await csrfReady;
       const response = await fetch(url, {
         method,
         headers: {

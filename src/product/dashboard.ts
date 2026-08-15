@@ -99,7 +99,7 @@ function shell(title: string, current: string, body: string, context: ShellConte
     <div class="nav">${NAV.map(link).join("")}</div>
     <p class="nav-group">Configure</p>
     <div class="nav">${NAV_CONFIGURE.map(link).join("")}</div>
-    <div class="sidebar-foot"><p>Nyst v0.2.2</p></div>
+    <div class="sidebar-foot"><p>Nyst v0.3.2</p></div>
   </nav>
   <div class="main">
     <header class="topbar">

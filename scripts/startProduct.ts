@@ -262,17 +262,16 @@ registerPublicRoutes(app, {
           // only because the column requires one, and nobody is ever told it;
           // password reset is the supported route to adding a local credential.
           password: randomUUID() + randomUUID(),
+          initial_agent: {
+            name: "First Agent", slug: "first-agent", owner: input.display_name,
+            description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
+            framework: "unspecified", tags: [],
+          },
+          federated_identity: {
+            provider: "google", provider_subject: identity.provider_subject,
+            email_at_link: identity.email, email_verified_at_link: identity.email_verified,
+          },
         });
-        await federated.bindIdentity({
-          user_id: created.user_id, organization_id: created.organization_id,
-          provider: "google", provider_subject: identity.provider_subject,
-          email_at_link: identity.email, email_verified_at_link: identity.email_verified,
-        });
-        await repository.createAgent(created, created.user_id, {
-          name: "First Agent", slug: "first-agent", owner: input.display_name,
-          description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
-          framework: "unspecified", tags: [],
-        }).catch(() => null);
 
         const session = await federated.createSession(created.user_id);
         if (!session) return { ok: false, reason: "The workspace was created but the session could not be started. Sign in with Google again." };
@@ -315,16 +314,12 @@ registerPublicRoutes(app, {
         email: input.email,
         display_name: input.display_name,
         password: input.password,
+        initial_agent: {
+          name: "First Agent", slug: "first-agent", owner: input.display_name,
+          description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
+          framework: "unspecified", tags: [],
+        },
       });
-      // The rest of the lifecycle, so a new account arrives somewhere real
-      // rather than at an empty shell. None of it grants authority: an Agent
-      // with no Autonomy Line rule has no autonomy, and a Shadow environment
-      // controls nothing regardless.
-      await repository.createAgent(created, created.user_id, {
-        name: "First Agent", slug: "first-agent", owner: input.display_name,
-        description: "Created with your workspace. Rename or replace it — nothing is bound to this name.",
-        framework: "unspecified", tags: [],
-      }).catch(() => null);
 
       structuredLog({ type: "signup_created", organization_slug: input.organization_slug, mode: "shadow" });
       return { ok: true as const };

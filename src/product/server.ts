@@ -251,6 +251,12 @@ export async function buildProductServer(options: ProductServerOptions): Promise
     reply.setCookie(SESSION_COOKIE, result.session, { path: "/", httpOnly: true, sameSite: "strict", secure: options.production === true, maxAge: 12 * 60 * 60 });
     return { csrf: result.csrf, expires_in: 12 * 60 * 60 };
   });
+  app.get("/v1/auth/csrf", async (request, reply) => {
+    const session = request.cookies[SESSION_COOKIE];
+    const csrf = session ? await options.repository.refreshSessionCsrf(session) : null;
+    if (!csrf) return reply.code(401).send({ error: "session_required", request_id: request.id });
+    return { csrf, expires_in: 12 * 60 * 60 };
+  });
   /* ---------------- GOOGLE SIGN-IN (v0.3.1 issue 3) ---------------- */
 
   /**
