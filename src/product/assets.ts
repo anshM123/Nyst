@@ -496,9 +496,9 @@ export const APP_JS = `
       + "APPROVAL. Pressing OK records that YOU approved it, against your signed-in identity.\\n\\nProceed?");
     if (!approved) { announce(button, "Not approved. Nothing was sent.", false); return; }
 
-    const result = await send(button, "POST", "/v1/actions", {
+    const dispatch = (key) => send(button, "POST", "/v1/actions", {
       effect: form.dataset.dispatch,
-      businessKey,
+      businessKey: key,
       // Only ever true because a person just said so, in the dialog above.
       approved: true,
       input: {
@@ -508,7 +508,49 @@ export const APP_JS = `
         desired_permission: data.desired_permission,
       },
     });
-    if (result) renderDispatch(form, result, businessKey);
+
+    const result = await dispatch(businessKey);
+    if (!result) return;
+
+    /**
+     * "YOU ALREADY DID THIS. AGAIN?"
+     *
+     * The business key is derived from the inputs, so asking twice for the
+     * same removal is ONE logical action — that is what stops a retry becoming
+     * a second consequence, and it is not negotiable.
+     *
+     * But somebody who re-added the person and pressed the button again means
+     * a genuinely NEW removal, and the honest answer is not "nothing happened".
+     * It is to say what already exists and ask whether they want a second,
+     * separate action.
+     *
+     * ASKING FIRST IS SAFE because the call above created nothing: a
+     * deduplicated dispatch returns the existing record without touching the
+     * provider. So the question is asked from a position of fact rather than
+     * from a guess about what would happen.
+     *
+     * A YES gets a DISTINCT business key. It is a second logical action with
+     * its own evidence and its own receipt — never a retry of the first, which
+     * would be exactly the unsafe thing the dedup exists to prevent.
+     */
+    if (result.created === false) {
+      const again = confirm(
+        "Nyst has already run this exact removal for " + data.principal + " on "
+        + data.owner + "/" + data.repository + ".\\n\\nIt returned the existing record rather than acting "
+        + "twice — the same logical action is one action however many times you ask.\\n\\nIf you re-added "
+        + "them and want to remove them AGAIN, this creates a SECOND, SEPARATE action with its own evidence "
+        + "and its own receipt. It is not a retry of the first.\\n\\nRun it again as a new action?");
+      if (!again) { renderDispatch(form, result, businessKey); return; }
+
+      // A distinct key, and readable: an operator reading the ledger later can
+      // see this was a deliberate repeat and when it was asked for.
+      const repeatKey = businessKey + "#" + new Date().toISOString().replace(/[:.]/g, "-");
+      const repeated = await dispatch(repeatKey);
+      if (repeated) renderDispatch(form, repeated, repeatKey);
+      return;
+    }
+
+    renderDispatch(form, result, businessKey);
   });
 
   /**

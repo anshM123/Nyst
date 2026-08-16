@@ -1193,6 +1193,49 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
       "the control does not warn that pressing it changes the real world");
   });
 
+  /**
+   * "YOU ALREADY DID THIS. AGAIN?" rather than "nothing happened".
+   *
+   * The business key is derived from the inputs, so asking twice for the same
+   * removal is ONE logical action — that is what stops a retry becoming a
+   * second consequence, and it must not be negotiable. But somebody who
+   * re-added the person and pressed again means a genuinely NEW removal, and
+   * the honest response is to say what already exists and ask.
+   */
+  it("a repeat dispatch offers a SECOND action rather than reporting nothing", () => {
+    const handler = APP_JS.slice(APP_JS.indexOf("form[data-dispatch]"), APP_JS.indexOf("function renderDispatch"));
+    assert.match(handler, /result\.created === false/,
+      "the handler does not notice that Nyst deduplicated the request");
+    assert.match(handler, /already run this exact removal/i,
+      "the person is not told that the action already exists");
+    assert.match(handler, /SECOND, SEPARATE action/,
+      "the confirmation does not say a repeat is a new action rather than a retry of the first");
+  });
+
+  it("a repeat uses a DISTINCT business key, never a retry of the first", () => {
+    // Reusing the key would ask the server to redo an existing action, which
+    // is precisely the unsafe retry the dedup exists to prevent.
+    const handler = APP_JS.slice(APP_JS.indexOf("form[data-dispatch]"), APP_JS.indexOf("function renderDispatch"));
+    assert.match(handler, /const repeatKey = businessKey \+ "#"/,
+      "a repeat reuses the original business key, so it is a retry rather than a new action");
+    assert.match(handler, /dispatch\(repeatKey\)/, "the repeat does not use the distinct key");
+  });
+
+  it("ASKING IS SAFE: the question is only asked after a dispatch that created nothing", () => {
+    // The confirm must come AFTER the deduplicated call, never before it. A
+    // deduplicated dispatch touches no provider, so the question is asked from
+    // fact rather than from a guess about what would happen.
+    const handler = APP_JS.slice(APP_JS.indexOf("form[data-dispatch]"), APP_JS.indexOf("function renderDispatch"));
+    assert.ok(handler.indexOf("await dispatch(businessKey)") < handler.indexOf("already run this exact removal"),
+      "the repeat question is asked BEFORE Nyst has established that the action already exists");
+  });
+
+  it("declining a repeat still shows the existing record", () => {
+    const handler = APP_JS.slice(APP_JS.indexOf("form[data-dispatch]"), APP_JS.indexOf("function renderDispatch"));
+    assert.match(handler, /if \(!again\) \{ renderDispatch\(form, result, businessKey\); return; \}/,
+      "saying no leaves the person with nothing on screen");
+  });
+
   it("the result shows EFFECT and OUTCOME separately, never collapsed", () => {
     // The entire proposition is that these two can disagree. The one screen a
     // person is most likely to look at must not merge them into a "status".
