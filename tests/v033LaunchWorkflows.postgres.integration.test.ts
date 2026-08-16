@@ -474,6 +474,47 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
     assert.equal(await credentials.scopedTo(tenant).resolve(stored.credential_ref), FIXTURE_GITHUB);
   });
 
+  /**
+   * THE HAZARD THE BOOT-TIME RESOLVER INTRODUCES, and the guard that closes it.
+   *
+   * The provider runtime is built ONCE at boot, so it cannot be tenant-scoped
+   * and resolves a `tenant:` reference by id alone. That is only safe if an
+   * integration can never NAME a credential it does not own — otherwise one
+   * organization points its integration at another organization's credential
+   * id and acts with their token. Exactly the v0.3.2 Phase 2 defect, arriving
+   * through configuration instead of through resolution.
+   *
+   * So ownership is enforced at WRITE time, where the scope is certain.
+   */
+  it("THE ADVERSARIAL CASE: an integration cannot be configured with another tenant's credential", async () => {
+    const theirs = await credentials.store(other, other.user_id, "github", FIXTURE_GITHUB);
+
+    await assert.rejects(
+      () => repository.configureIntegration(tenant, "github", theirs.credential_ref, credentials),
+      (error: Error & { statusCode?: number }) => {
+        assert.equal(error.statusCode, 403,
+          "ANOTHER TENANT'S CREDENTIAL WAS ACCEPTED INTO THIS INTEGRATION. The boot-time runtime resolves "
+          + "tenant references by id, so this would let one organization act with another's token.");
+        return true;
+      });
+
+    // The owner's own credential is still accepted, or the guard is merely
+    // broken rather than safe.
+    const mine = await credentials.store(tenant, tenant.user_id, "github", FIXTURE_GITHUB);
+    const configured = await repository.configureIntegration(tenant, "github", mine.credential_ref, credentials);
+    assert.equal(configured.credential_ref, mine.credential_ref);
+  });
+
+  it("belongsToScope answers false for a foreign or revoked reference", async () => {
+    const theirs = await credentials.store(other, other.user_id, "okta", "okta-fixture-scope-check-000000");
+    assert.equal(await credentials.belongsToScope(tenant, theirs.credential_ref), false);
+    assert.equal(await credentials.belongsToScope(other, theirs.credential_ref), true);
+
+    await credentials.revoke(other, theirs.credential_ref, "Revoked in the scope test.");
+    assert.equal(await credentials.belongsToScope(other, theirs.credential_ref), false,
+      "a revoked credential still reports as belonging, so it could be reconfigured after revocation");
+  });
+
   it("a revoked credential stops resolving immediately — no cache, no window", async () => {
     const stored = await credentials.store(tenant, tenant.user_id, "github", FIXTURE_GITHUB);
     const source = credentials.scopedTo(tenant);

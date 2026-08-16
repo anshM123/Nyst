@@ -561,8 +561,26 @@ export class ProductRepository {
       (SELECT max(r.resolved_at) FROM nyst_action_scopes s JOIN outcome_actions a USING(action_id) JOIN outcome_resolutions r USING(action_id) WHERE s.organization_id=i.organization_id AND s.project_id=i.project_id AND s.environment_id=i.environment_id AND split_part(a.effect_name,'.',1)=i.provider) last_reconciliation_at
       FROM nyst_integrations i WHERE organization_id=$1 AND project_id=$2 AND environment_id=$3 ORDER BY provider`, [scope.organization_id, scope.project_id, scope.environment_id])).rows;
   }
-  async configureIntegration(scope: TenantScope, provider: string, credentialRef: string): Promise<Record<string, unknown>> {
+  async configureIntegration(scope: TenantScope, provider: string, credentialRef: string, ownership?: { belongsToScope(scope: TenantScope, reference: string): Promise<boolean> }): Promise<Record<string, unknown>> {
     await this.requireTenantScope(scope);
+    /**
+     * A `tenant:` REFERENCE MUST BELONG TO THIS SCOPE (v0.3.3).
+     *
+     * The runtime resolves a tenant reference by id. Storing whatever
+     * reference the caller supplies would therefore let one organization point
+     * its integration at ANOTHER organization's credential id — the exact
+     * cross-tenant hazard the scoped resolver exists to prevent, arriving
+     * through configuration instead of through resolution.
+     *
+     * Checked HERE because this is where the scope is known for certain.
+     */
+    if (typeof credentialRef === "string" && credentialRef.startsWith("tenant:") && ownership) {
+      if (!(await ownership.belongsToScope(scope, credentialRef))) {
+        throw Object.assign(new Error(
+          "That credential does not belong to this project and environment. A stored credential can only be "
+          + "used by the environment it was supplied to."), { statusCode: 403 });
+      }
+    }
     if (!["github","okta","stripe"].includes(provider)) throw new Error("Unsupported integration provider");
     // `tenant:` added in v0.3.3 for credentials the CUSTOMER supplied through
     // the UI. Still a NAME and never a secret: it is a row id, and the value it
@@ -1169,12 +1187,12 @@ export class ProductRepository {
    * because nothing here knows whether it still works. That is the same rule
    * rotation follows.
    */
-  async reconnectIntegration(scope: TenantScope, provider: string, credentialRef: string): Promise<Record<string, unknown>> {
+  async reconnectIntegration(scope: TenantScope, provider: string, credentialRef: string, ownership?: { belongsToScope(scope: TenantScope, reference: string): Promise<boolean> }): Promise<Record<string, unknown>> {
     await this.db.query(
       `UPDATE nyst_integrations SET disconnected_at=NULL, disconnected_by=NULL, disconnect_reason=NULL
        WHERE environment_id=$1 AND project_id=$2 AND organization_id=$3 AND provider=$4`,
       [scope.environment_id, scope.project_id, scope.organization_id, provider]);
-    return this.configureIntegration(scope, provider, credentialRef);
+    return this.configureIntegration(scope, provider, credentialRef, ownership);
   }
 
   async runIntegrationPreflight(scope:TenantScope,provider:string,secrets:SecretProvider,probe:PreflightProbe,now:Date=new Date()):Promise<Record<string,unknown>>{

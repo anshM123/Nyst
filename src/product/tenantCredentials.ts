@@ -253,6 +253,76 @@ export class TenantCredentialStore {
     };
   }
 
+  /**
+   * Does this reference belong to THIS scope? (v0.3.3)
+   *
+   * `configureIntegration` stores whatever reference it is given, and the
+   * runtime resolves a `tenant:` reference by id. Those two facts together
+   * would let one organization point its integration at ANOTHER
+   * organization's credential id — the exact cross-tenant hazard `scopedTo`
+   * exists to prevent, arriving through configuration instead of resolution.
+   *
+   * So ownership is checked at WRITE time, where the scope is known for
+   * certain, and a reference that does not belong here is refused before it is
+   * ever stored. Resolution by id is then safe because no integration can name
+   * a credential it does not own.
+   */
+  async belongsToScope(scope: TenantScope, reference: string): Promise<boolean> {
+    if (!TENANT_REFERENCE.test(reference)) return false;
+    const row = (await this.db.query(
+      `SELECT 1 FROM nyst_tenant_credentials
+       WHERE credential_id=$1 AND organization_id=$2 AND project_id=$3 AND environment_id=$4
+         AND revoked_at IS NULL`,
+      [reference.slice("tenant:".length), scope.organization_id, scope.project_id, scope.environment_id])).rows;
+    return row.length === 1;
+  }
+
+  /**
+   * Resolve by id alone, for the boot-time runtime.
+   *
+   * SAFE ONLY BECAUSE `belongsToScope` is enforced at configuration time: an
+   * integration cannot name a credential another tenant owns, so an id reached
+   * through a tenant's own integration row is always that tenant's. Never call
+   * this with a reference that came from anywhere else — `scopedTo` is the one
+   * to use whenever a scope is in hand.
+   */
+  unscopedResolverForConfiguredReferences(): CredentialSource {
+    const db = this.db;
+    const key = this.#key;
+    const aad = (scope: { organization_id: string; project_id: string; environment_id: string }, provider: string) =>
+      Buffer.from(
+        `nyst.tenant-credential.v1|${scope.organization_id}|${scope.project_id}|${scope.environment_id}|${provider}`,
+        "utf8");
+    return {
+      async resolve(reference: string): Promise<string> {
+        if (!TENANT_REFERENCE.test(reference)) {
+          throw new ScopedCredentialError("That is not a tenant credential reference.");
+        }
+        const row = (await db.query(
+          `SELECT organization_id,project_id,environment_id,provider,ciphertext,iv,auth_tag
+           FROM nyst_tenant_credentials WHERE credential_id=$1 AND revoked_at IS NULL`,
+          [reference.slice("tenant:".length)])).rows[0];
+        if (!row) {
+          throw new ScopedCredentialError(
+            "No live credential is stored for this reference. It may have been revoked or replaced.");
+        }
+        try {
+          const decipher = createDecipheriv("aes-256-gcm", key, toBuffer(row.iv));
+          decipher.setAAD(aad({
+            organization_id: String(row.organization_id), project_id: String(row.project_id),
+            environment_id: String(row.environment_id),
+          }, String(row.provider)));
+          decipher.setAuthTag(toBuffer(row.auth_tag));
+          return Buffer.concat([decipher.update(toBuffer(row.ciphertext)), decipher.final()]).toString("utf8");
+        } catch {
+          throw new ScopedCredentialError(
+            "A stored credential could not be decrypted. The deployment's credential encryption key may have "
+            + "changed since it was stored; the customer must supply it again.");
+        }
+      },
+    };
+  }
+
   /** What is currently loaded, without loading it. Safe for any page. */
   async describe(scope: TenantScope, provider: string): Promise<StoredCredential | null> {
     const row = (await this.db.query(

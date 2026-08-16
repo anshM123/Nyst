@@ -196,8 +196,43 @@ if (grantState || grantOrg) {
   }
 }
 
+/**
+ * THE RUNTIME NEEDS A SECRET PROVIDER, and never had one (v0.3.3).
+ *
+ * `createProductProviderRuntime` was called with no `secrets`, so every
+ * provider client fell back to `EnvironmentGitHubCredentialSource` and friends
+ * — which resolve exactly one hardcoded reference and refuse every other:
+ *
+ *     if (reference !== "env:NYST_GITHUB_TOKEN") throw "Unsupported ..."
+ *
+ * So a customer's connected credential passed the store, the resolver, the
+ * admission gate, the input schema and two database constraints, and was then
+ * refused by the credential source the action actually uses. Eleventh
+ * appearance of this shape in one release, and the last one in the chain.
+ *
+ * `tenant:` references resolve by id here, which is safe ONLY because
+ * `configureIntegration` refuses to store a reference that does not belong to
+ * the configuring scope — so an integration cannot name another tenant's
+ * credential, and an id reached through a tenant's own integration row is
+ * always that tenant's.
+ */
+const runtimeSecrets = {
+  async resolve(reference: string): Promise<string> {
+    if (reference.startsWith("tenant:")) {
+      if (!tenantCredentials) {
+        throw new Error(
+          "This deployment has no credential encryption key, so a customer-supplied credential cannot be "
+          + "resolved. Set NYST_CREDENTIAL_KEY.");
+      }
+      return tenantCredentials.unscopedResolverForConfiguredReferences().resolve(reference);
+    }
+    return secrets.resolve(reference);
+  },
+};
+
 const product = createProductProviderRuntime(store, repository, signer, clock, {
   production: config.production, enable_development_fake: config.enable_development_fake,
+  secrets: runtimeSecrets,
 });
 if (bootstrapScope && config.enable_development_fake) {
   const fake = product.descriptors.find((item) => item.provider === "fake");
