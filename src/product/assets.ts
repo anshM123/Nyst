@@ -478,7 +478,7 @@ export const APP_JS = `
      * carrying an approval nobody consciously gave.
      */
     const approved = confirm(
-      "You are about to remove " + data.principal + " from " + data.owner + "/" + data.repository
+      "You are about to remove access for " + data.principal + " on " + data.owner + "/" + data.repository
       + " on GitHub, for real.\\n\\nThis environment is ENFORCED and the effective policy requires a HUMAN "
       + "APPROVAL. Pressing OK records that YOU approved it, against your signed-in identity.\\n\\nProceed?");
     if (!approved) { announce(button, "Not approved. Nothing was sent.", false); return; }
