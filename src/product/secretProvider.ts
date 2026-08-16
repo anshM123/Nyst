@@ -46,6 +46,21 @@ export interface SecretProvider {
   resolve(reference: SecretReference): Promise<string>;
 }
 
+/**
+ * THE ONE COPY. Import this; never retype the scheme list.
+ *
+ * v0.3.3 added the tenant: scheme and it had to be added in FOUR places that
+ * had each spelled the list out independently: this pattern, the scoped
+ * credential source, the GitHub action input schema, and the admission gate in
+ * productRepository. The last was missed, so an integration could be connected,
+ * verified and Ready and still be refused at admission by a copy nobody
+ * remembered existed.
+ *
+ * A rule duplicated four times is four rules, three of which are wrong the
+ * moment the first one changes.
+ */
+export const CREDENTIAL_REFERENCE = SECRET_REFERENCE_PATTERN;
+
 export function assertSecretReference(reference: string): SecretReference {
   if (typeof reference !== "string" || !SECRET_REFERENCE_PATTERN.test(reference)) {
     throw new SecretResolutionError("malformed_reference", String(reference).slice(0, 60));

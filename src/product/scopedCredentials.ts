@@ -44,7 +44,7 @@
  * tenant's credential into another tenant's request, because no instance is
  * holding one to leak.
  */
-import type { SecretProvider } from "./secretProvider.js";
+import { CREDENTIAL_REFERENCE, type SecretProvider } from "./secretProvider.js";
 
 /** The shape every provider client already expects. */
 export interface CredentialSource {
@@ -57,7 +57,7 @@ export class ScopedCredentialError extends Error {
 }
 
 /** A reference is a NAME. It is never the secret. */
-const REFERENCE = /^(env|vault|secret-manager|tenant):[A-Za-z0-9_./:-]{3,280}$/;
+const REFERENCE = CREDENTIAL_REFERENCE;
 
 /**
  * Resolve whatever reference the tenant's IntegrationConnection recorded.

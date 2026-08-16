@@ -855,6 +855,51 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
     }
   });
 
+  /**
+   * FOUR COPIES OF ONE RULE, AND THE FOURTH WAS WRONG.
+   *
+   * Adding the `tenant:` scheme meant editing the scheme list in four places
+   * that had each spelled it out independently: the SecretProvider pattern, the
+   * scoped credential source, the GitHub action input schema, and the admission
+   * gate in productRepository. The last was missed — so an integration could be
+   * connected, preflighted, verified and Ready, and then refused at admission
+   * by a copy nobody remembered existed.
+   *
+   * A rule duplicated four times is four rules, three of which are wrong the
+   * moment the first one changes. This counts them.
+   */
+  it("THE DEFECT: the credential scheme list is not spelled out in many places", () => {
+    /**
+     * Scoped to the files that must AGREE about what a PROVIDER credential
+     * reference is — the chain a customer's credential travels: stored,
+     * resolved, validated at admission, accepted in action input.
+     *
+     * Deliberately excluded, with reasons rather than by oversight:
+     *  - secretProvider.ts is the canonical definition and must spell it out.
+     *  - googleAuth.ts and email.ts validate their OWN operator-configured
+     *    secrets (a Google client secret, an SMTP password). Those are not
+     *    customer-supplied and a `tenant:` reference is meaningless for them,
+     *    so sharing this constant would widen them for no reason.
+     *  - tenantCredentials.ts matches the schemes to REJECT a reference pasted
+     *    into the value box. That is the opposite check and must not follow
+     *    this one if it ever changes.
+     */
+    const mustAgree = ["src/product/scopedCredentials.ts", "src/product/productRepository.ts",
+      "src/providers/github/githubInput.ts"];
+    const offenders: string[] = [];
+    for (const file of sourceFiles(join(root, "src"))) {
+      const relative = file.slice(root.length + 1).replace(/\\/g, "/");
+      if (!mustAgree.includes(relative)) continue;
+      const text = readFileSync(file, "utf8");
+      for (const match of text.matchAll(/\(env\|vault\|secret-manager[^)]*\)/g)) {
+        offenders.push(`${file.slice(root.length + 1)}: ${match[0]}`);
+      }
+    }
+    assert.deepEqual(offenders, [],
+      "THE CREDENTIAL SCHEME LIST IS DUPLICATED. Every copy must be found and edited together, and the one "
+      + `that is missed refuses a credential every other layer accepted:\n  ${offenders.join("\n  ")}`);
+  });
+
   it("STRUCTURAL: no schema pins a credential reference to one deployment", () => {
     const input = readFileSync(join(root, "src/providers/github/githubInput.ts"), "utf8");
     assert.doesNotMatch(input, /credential_ref:\s*lit\(/,

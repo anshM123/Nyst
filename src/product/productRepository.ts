@@ -17,6 +17,7 @@ import { operationalHealth, recordWorkerHeartbeat, type OperationalHealth, type 
 import { emptyMetrics, METRIC_DEFINITIONS, optionalMetricNumber, requireBreakdown, requireMetricInt, resolveRange, type CanonicalMetrics, type InterventionKind, type InterventionSummary, type MetricRange } from "./canonicalMetrics.js";
 import type { OutcomeResolution } from "../model/resolution.js";
 import { runFailureLabEngine } from "./failureLabEngine.js";
+import { CREDENTIAL_REFERENCE } from "./secretProvider.js";
 import { sanitizeForProduct } from "./sanitize.js";
 
 export interface ProductDb {
@@ -496,10 +497,15 @@ export class ProductRepository {
      * resolving a secret on every admission, which is both slower and a wider
      * blast radius for a value that must live as briefly as possible.
      */
-    if (!/^(env|vault|secret-manager):[A-Za-z0-9_./:-]{3,280}$/.test(credentialRef)) {
+    // `tenant:` added in v0.3.3 — a credential the CUSTOMER supplied through the
+    // UI. The FOURTH place this scheme list appears, and the one that was
+    // missed: an integration could be connected, verified and Ready, and then
+    // refused here at admission because this copy had not been updated.
+    if (!CREDENTIAL_REFERENCE.test(credentialRef)) {
       throw Object.assign(new Error(
         "The configured credential reference is not a usable reference. It must name a secret — " +
-        "env:NAME, vault:path or secret-manager:name."), { statusCode: 409 });
+        "env:NAME, vault:path, secret-manager:name, or a credential connected on the Integrations page."),
+      { statusCode: 409 });
     }
     return { ...descriptor, enabled: true, credential_ref: credentialRef };
   }
@@ -561,7 +567,7 @@ export class ProductRepository {
     // `tenant:` added in v0.3.3 for credentials the CUSTOMER supplied through
     // the UI. Still a NAME and never a secret: it is a row id, and the value it
     // names lives encrypted in nyst_tenant_credentials.
-    const ref=bounded(credentialRef,300,"credential reference"); if (!/^(?:env|vault|secret-manager|tenant):[A-Za-z0-9_./:-]{3,280}$/.test(ref)) throw new Error("Integration requires an opaque credential reference");
+    const ref=bounded(credentialRef,300,"credential reference"); if (!CREDENTIAL_REFERENCE.test(ref)) throw new Error("Integration requires an opaque credential reference");
     /**
      * ROTATION INVALIDATES THE PREFLIGHT (v0.3.1 issue 11).
      *

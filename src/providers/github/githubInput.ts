@@ -1,3 +1,4 @@
+import { CREDENTIAL_REFERENCE } from "../../product/secretProvider.js";
 import { bool, en, lit, obj, opt, str, type Schema } from "../../core/validate.js";
 import {
   GITHUB_PERMISSIONS,
@@ -15,7 +16,6 @@ const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
  * SecretProvider accepts, including `tenant:` for a credential the customer
  * supplied through the UI.
  */
-const CREDENTIAL_REFERENCE = /^(?:env|vault|secret-manager|tenant):[A-Za-z0-9_./:-]{3,280}$/;
 
 const PublicInputSchema: Schema<GitHubPublicPermissionInput> = obj({
   owner: str({ min: 1, max: 39, pattern: OWNER_OR_LOGIN }),
