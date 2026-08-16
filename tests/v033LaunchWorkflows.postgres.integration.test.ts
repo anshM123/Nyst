@@ -861,6 +861,49 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
       "A CREDENTIAL REFERENCE IS PINNED TO A LITERAL. Only one deployment in the world can dispatch.");
   });
 
+  /**
+   * THE OPERATOR DOOR, and the three things it must not become.
+   *
+   * Entitlement is deliberately not self-service, which was right and left the
+   * operator of a deployment with no way to grant a plan at all — the method
+   * existed, nothing called it, and a free hosting tier has no shell. Every
+   * organization was permanently a trial and nobody could leave Shadow.
+   *
+   * A grant path is a dangerous thing to add, so this pins its shape.
+   */
+  it("the entitlement grant names ONE organization and cannot apply to all", () => {
+    const start = readFileSync(join(root, "scripts/startProduct.ts"), "utf8");
+    const grant = start.slice(start.indexOf("OPERATOR ENTITLEMENT GRANT"), start.indexOf("const product ="));
+    assert.ok(grant.length > 0, "the operator grant is missing entirely");
+    assert.match(grant, /NYST_GRANT_ENTITLEMENT_ORG/,
+      "THE GRANT DOES NOT NAME AN ORGANIZATION, so it could apply to every tenant on the deployment");
+    assert.match(grant, /WHERE slug=\$1/,
+      "the grant does not look the organization up by slug");
+    // Both variables, or nothing. One alone must not be enough.
+    assert.match(grant, /!grantState \|\| !grantOrg/,
+      "one variable alone is enough to trigger a grant");
+  });
+
+  it("the grant refuses an unknown plan rather than guessing", () => {
+    const start = readFileSync(join(root, "scripts/startProduct.ts"), "utf8");
+    const grant = start.slice(start.indexOf("OPERATOR ENTITLEMENT GRANT"), start.indexOf("const product ="));
+    assert.match(grant, /entitlement_grant_refused/, "an invalid plan is not refused");
+    assert.match(grant, /states as readonly string\[\]\)\.includes/,
+      "the plan is not checked against the known states");
+  });
+
+  it("the grant goes through the AUDITED path, not a raw UPDATE", () => {
+    // A direct UPDATE would change the plan and leave no record of who did it
+    // or why — and entitlement changes are exactly the thing an audit asks
+    // about later.
+    const start = readFileSync(join(root, "scripts/startProduct.ts"), "utf8");
+    const grant = start.slice(start.indexOf("OPERATOR ENTITLEMENT GRANT"), start.indexOf("const product ="));
+    assert.match(grant, /setEntitlement\(/, "the grant does not use the audited entitlement path");
+    assert.doesNotMatch(grant, /UPDATE nyst_organization_entitlements/,
+      "THE GRANT WRITES THE PLAN DIRECTLY, bypassing the audit row");
+    assert.match(grant, /reason:/, "the grant records no reason");
+  });
+
   it("STRUCTURAL: no probe resolves a hardcoded operator credential reference", () => {
     // The exact line that caused this. A probe that reaches for env:NYST_*_TOKEN
     // is single-tenant by construction, whatever else it does.

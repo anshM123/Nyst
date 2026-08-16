@@ -113,6 +113,68 @@ if (Number(count.rows[0]?.count ?? 0) === 0 && process.env.NYST_BOOTSTRAP_ORGANI
   structuredLog({ type: "bootstrap_created", organization_id: bootstrapScope.organization_id });
 }
 
+/**
+ * OPERATOR ENTITLEMENT GRANT (v0.3.3).
+ *
+ * Entitlement is deliberately NOT self-service — `setEntitlement` says so in
+ * its own comment, because an organization upgrading itself is a billing
+ * decision rather than a product setting. That is right, and it left the
+ * operator of a deployment with no way to grant a plan at all: the method
+ * exists, nothing calls it, and a free hosting tier has no shell to run a
+ * script from. So every organization was permanently a trial and nobody could
+ * ever leave Shadow.
+ *
+ * This is the OPERATOR's door, not the customer's. It requires two environment
+ * variables that only somebody who controls the deployment can set, it names
+ * one organization by slug rather than granting to everyone, and it goes
+ * through the same `setEntitlement` path as any other change — so it writes
+ * the same immutable audit row, with a reason saying where it came from.
+ *
+ * It is idempotent: setting the same plan twice changes nothing but the audit
+ * trail, which is the correct record of an operator asserting it twice.
+ */
+const grantState = process.env.NYST_GRANT_ENTITLEMENT?.trim();
+const grantOrg = process.env.NYST_GRANT_ENTITLEMENT_ORG?.trim();
+if (grantState || grantOrg) {
+  const states = ["trial", "protect", "scale", "enterprise"] as const;
+  if (!grantState || !grantOrg) {
+    structuredLog({
+      type: "entitlement_grant_skipped",
+      detail: "NYST_GRANT_ENTITLEMENT and NYST_GRANT_ENTITLEMENT_ORG must BOTH be set. Naming the "
+        + "organization is required so a grant cannot silently apply to every tenant on the deployment.",
+    });
+  } else if (!(states as readonly string[]).includes(grantState)) {
+    structuredLog({
+      type: "entitlement_grant_refused",
+      detail: `NYST_GRANT_ENTITLEMENT must be one of ${states.join(", ")}; received something else. `
+        + "Refusing rather than guessing which plan was meant.",
+    });
+  } else {
+    const org = (await pool.query(
+      `SELECT organization_id FROM nyst_organizations WHERE slug=$1`, [grantOrg])).rows[0];
+    if (!org) {
+      structuredLog({
+        type: "entitlement_grant_refused",
+        detail: `No organization has the slug "${grantOrg}". The grant names an organization that does not `
+          + "exist, so nothing was changed.",
+      });
+    } else {
+      await new EntitlementRepository(pool).setEntitlement({
+        organization_id: String(org.organization_id),
+        state: grantState as "trial" | "protect" | "scale" | "enterprise",
+        changed_by: null,
+        reason: "Granted by the deployment operator through NYST_GRANT_ENTITLEMENT at startup.",
+        note: "Operator grant. Not a customer self-service upgrade.",
+      });
+      structuredLog({
+        type: "entitlement_granted", organization_slug: grantOrg, state: grantState,
+        detail: "This permits the organization to ASK for Canary or Enforced. Whether either is SAFE is "
+          + "still decided independently by readiness, policy, the Autonomy Line, Freeze and Authority.",
+      });
+    }
+  }
+}
+
 const product = createProductProviderRuntime(store, repository, signer, clock, {
   production: config.production, enable_development_fake: config.enable_development_fake,
 });
