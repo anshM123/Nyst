@@ -61,9 +61,21 @@ export const APP_JS = `
     button.textContent = "Working…";
     try {
       await csrfReady;
-      // One Idempotency-Key for this button, reused across the retry below, so
-      // a retry can never become a second command.
-      const key = (button.dataset.idempotency ||= crypto.randomUUID());
+      /**
+       * ONE KEY PER ATTEMPT, NOT ONE PER BUTTON FOREVER.
+       *
+       * This was ||=, so a button minted a key once and reused it for the rest
+       * of the page's life. The CSRF retry below needs the same key — a retry
+       * must never become a second command — but a DELIBERATE second press is
+       * a new request, and reusing the key made the server answer it from the
+       * idempotency record of the first.
+       *
+       * So the key is fresh per press and stable within a press. A repeated
+       * press is still safe: the business key deduplicates the logical action
+       * on the server, which is the layer that should be doing it.
+       */
+      const key = crypto.randomUUID();
+      button.dataset.idempotency = key;
       const attempt = () => fetch(url, {
         method,
         headers: {
@@ -375,6 +387,7 @@ export const APP_JS = `
       row.parentElement.insertBefore(panel, row.nextSibling);
     }
     const evaluation = result.evaluation || {};
+    void evaluation;
     const verdict = String(evaluation.verdict || "indeterminate");
     const badge = verdict === "satisfied" ? "resolved" : verdict === "unsatisfied" ? "blocked" : "uncertain";
     const invariants = (evaluation.required || []).map((invariant) => {
@@ -513,9 +526,38 @@ export const APP_JS = `
       panel.dataset.dispatchResult = "true";
       form.parentElement.appendChild(panel);
     }
-    const effect = String(result.effect_state || result.state || "unknown");
+    /**
+     * READ THE SHAPE THE ROUTE ACTUALLY RETURNS.
+     *
+     * This read result.effect_state and result.control_decision, neither of
+     * which exists. POST /v1/actions returns { action, created, resolution },
+     * and the resolution document carries effect.state and control.primary.
+     *
+     * So the FIRST REAL CONSEQUENTIAL ACTION NYST EVER PERFORMED — a
+     * collaborator genuinely removed from a live GitHub repository — was
+     * displayed as "unknown", and the only way to discover it had worked was
+     * to go and look at GitHub. A result panel that cannot read its own
+     * response is worse than none: it turns a success into an apparent error.
+     */
+    const document = (result.resolution && result.resolution.document) || {};
+    const effect = String((document.effect && document.effect.state)
+      || (result.action && result.action.effect_state) || "unknown");
     const outcome = result.outcome ? String(result.outcome.verdict || "") : "";
-    const decision = String(result.control_decision || result.primary_directive || "");
+    const decision = String((document.control && document.control.primary) || "");
+    const explanation = String((document.control && document.control.explanation) || "");
+
+    /**
+     * created:false MEANS NYST DEDUPLICATED IT, NOT THAT IT FAILED.
+     *
+     * The business key is derived from the inputs, so re-running the same
+     * removal is ONE logical action by design — that is what stops a retry
+     * becoming a second consequence. Re-running after re-adding the person
+     * therefore returned the original record and looked, from the outside,
+     * exactly like nothing happening.
+     *
+     * Correct behaviour, invisible presentation. It is now stated.
+     */
+    const deduplicated = result.created === false;
     const badge = (value) => value === "verified" || value === "satisfied" ? "resolved"
       : value === "not_applied" || value === "unsatisfied" ? "blocked" : "uncertain";
     panel.innerHTML =
@@ -526,10 +568,17 @@ export const APP_JS = `
       + '<div><dt>Effect — what happened to the operation</dt><dd>' + text(effect) + '</dd></div>'
       + (outcome ? '<div><dt>Outcome — what became true</dt><dd>' + text(outcome) + '</dd></div>' : "")
       + (decision ? '<div><dt>Decision</dt><dd>' + text(decision) + '</dd></div>' : "")
+      + (explanation ? '<div><dt>Because</dt><dd>' + text(explanation) + '</dd></div>' : "")
       + '<div><dt>Business key</dt><dd class="mono">' + text(businessKey) + '</dd></div>'
       + '</dl>'
-      + (result.action_id
-        ? '<p class="small gap-m"><a href="/actions/' + text(result.action_id) + '">Open the full record →</a>'
+      + (deduplicated
+        ? '<p class="note gap-m"><strong>Nothing new was performed.</strong> An action already exists for this '
+          + 'business key, so Nyst returned it rather than acting twice. That is deduplication working — the '
+          + 'same logical action is one action however many times you ask. To perform a NEW removal after '
+          + 're-adding someone, change something in the inputs so the business key differs.</p>'
+        : "")
+      + (result.action && result.action.action_id
+        ? '<p class="small gap-m"><a href="/actions/' + text(result.action.action_id) + '">Open the full record →</a>'
           + ' Evidence, the facts used, and the signed receipt.</p>'
         : "")
       + '</div>';

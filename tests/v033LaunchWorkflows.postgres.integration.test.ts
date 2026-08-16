@@ -1122,7 +1122,15 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
       "the client does not store the refreshed token");
     // Exactly once, and the Idempotency-Key is reused, so a retry can never
     // become a second command.
-    assert.match(APP_JS, /const key = \(button\.dataset\.idempotency/,
+    // The key is minted ONCE PER PRESS and captured in `key`, so the CSRF
+    // retry below reuses it — a retry must never become a second command —
+    // while a deliberate second press gets a new one. It used to be `||=`,
+    // which reused a button's first key forever, so every later press was
+    // answered from the idempotency record of the first.
+    assert.match(APP_JS, /const key = crypto\.randomUUID\(\)/,
+      "the Idempotency-Key is not minted per press");
+    const attempt = APP_JS.slice(APP_JS.indexOf("const attempt = ()"), APP_JS.indexOf("let response"));
+    assert.match(attempt, /"idempotency-key": key/,
       "the retry does not reuse the Idempotency-Key, so it could create a second command");
   });
 
