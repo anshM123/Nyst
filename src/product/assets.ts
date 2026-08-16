@@ -462,9 +462,32 @@ export const APP_JS = `
     }
     const businessKey = "ui-" + data.owner + "/" + data.repository + "/" + data.principal
       + "/" + data.desired_permission;
+
+    /**
+     * THE HUMAN APPROVAL IS THE PERSON PRESSING THE BUTTON — SAID OUT LOUD.
+     *
+     * When the effective policy is approval_required, the route refuses a
+     * dispatch unless a SESSION principal sends approved:true. That is the
+     * design: an API key can never approve its own action, and a signed-in
+     * human can. The form did not send it, so the control refused itself with
+     * "Human approval required before execution" and no way to provide it.
+     *
+     * It is NOT attached silently. Approving is a distinct act from filling in
+     * a form, so it gets its own confirmation naming exactly what is about to
+     * happen — and the answer is what gets sent, rather than the request
+     * carrying an approval nobody consciously gave.
+     */
+    const approved = confirm(
+      "You are about to remove " + data.principal + " from " + data.owner + "/" + data.repository
+      + " on GitHub, for real.\\n\\nThis environment is ENFORCED and the effective policy requires a HUMAN "
+      + "APPROVAL. Pressing OK records that YOU approved it, against your signed-in identity.\\n\\nProceed?");
+    if (!approved) { announce(button, "Not approved. Nothing was sent.", false); return; }
+
     const result = await send(button, "POST", "/v1/actions", {
       effect: form.dataset.dispatch,
       businessKey,
+      // Only ever true because a person just said so, in the dialog above.
+      approved: true,
       input: {
         owner: String(data.owner).trim(),
         repository: String(data.repository).trim(),
