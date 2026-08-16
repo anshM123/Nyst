@@ -150,13 +150,34 @@ if (grantState || grantOrg) {
         + "Refusing rather than guessing which plan was meant.",
     });
   } else {
+    /**
+     * SLUG **OR** NAME, case-insensitively.
+     *
+     * The slug is what somebody types in the Organization field at sign-in —
+     * and a customer who signed up with Google never typed it at all, so
+     * requiring it exactly meant guessing at your own identifier. Matching the
+     * display name too costs nothing and removes the guess.
+     */
     const org = (await pool.query(
-      `SELECT organization_id FROM nyst_organizations WHERE slug=$1`, [grantOrg])).rows[0];
+      `SELECT organization_id,slug FROM nyst_organizations WHERE lower(slug)=lower($1) OR lower(name)=lower($1)`,
+      [grantOrg])).rows[0];
     if (!org) {
+      /**
+       * NAME THE CANDIDATES.
+       *
+       * "No organization has that slug" is true and useless: it leaves the
+       * operator guessing at an identifier they may never have typed. This is
+       * the operator's OWN deployment log, where they can already see
+       * everything, so listing what does exist is the difference between one
+       * redeploy and several.
+       */
+      const existing = (await pool.query(
+        `SELECT slug,name FROM nyst_organizations ORDER BY created_at LIMIT 20`)).rows
+        .map((row) => `${String(row.slug)} (${String(row.name)})`);
       structuredLog({
         type: "entitlement_grant_refused",
-        detail: `No organization has the slug "${grantOrg}". The grant names an organization that does not `
-          + "exist, so nothing was changed.",
+        detail: `No organization matches "${grantOrg}" by slug or name, so nothing was changed.`,
+        organizations_on_this_deployment: existing.length > 0 ? existing : ["none"],
       });
     } else {
       await new EntitlementRepository(pool).setEntitlement({
@@ -167,7 +188,7 @@ if (grantState || grantOrg) {
         note: "Operator grant. Not a customer self-service upgrade.",
       });
       structuredLog({
-        type: "entitlement_granted", organization_slug: grantOrg, state: grantState,
+        type: "entitlement_granted", organization_slug: String(org.slug), state: grantState,
         detail: "This permits the organization to ASK for Canary or Enforced. Whether either is SAFE is "
           + "still decided independently by readiness, policy, the Autonomy Line, Freeze and Authority.",
       });

@@ -877,8 +877,14 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
     assert.ok(grant.length > 0, "the operator grant is missing entirely");
     assert.match(grant, /NYST_GRANT_ENTITLEMENT_ORG/,
       "THE GRANT DOES NOT NAME AN ORGANIZATION, so it could apply to every tenant on the deployment");
-    assert.match(grant, /WHERE slug=\$1/,
+    // Slug OR display name, case-insensitively — a customer who signed up with
+    // Google never typed a slug, so requiring it exactly meant guessing at
+    // their own identifier. Still ONE named organization either way.
+    assert.match(grant, /FROM nyst_organizations WHERE lower\(slug\)/,
       "the grant does not look the organization up by slug");
+    assert.match(grant, /organizations_on_this_deployment/,
+      "a refusal does not name what DOES exist, leaving the operator guessing at an identifier they may "
+      + "never have typed");
     // Both variables, or nothing. One alone must not be enough.
     assert.match(grant, /!grantState \|\| !grantOrg/,
       "one variable alone is enough to trigger a grant");

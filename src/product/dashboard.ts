@@ -1143,6 +1143,16 @@ export function settingsPage(info: Record<string, unknown> | null, control: Reco
     <div class="section-head"><div><h2>Workspace</h2></div></div>
     <div class="panel panel-pad"><dl class="facts">
       <div><dt>Organization</dt><dd>${escape(String(info?.organization ?? ""))}</dd></div>
+      <!--
+        THE SLUG, shown (v0.3.3).
+
+        projectInfo has returned organization_slug all along and nothing
+        rendered it. It is the identifier somebody types to sign in, and the one
+        an operator needs to name this organization in configuration — and a
+        customer who signed up with Google never typed it, so there was no way
+        to find out what it was from inside the product.
+      -->
+      <div><dt>Organization slug</dt><dd class="mono">${escape(String(info?.organization_slug ?? ""))}</dd></div>
       <div><dt>Project</dt><dd>${escape(String(info?.project ?? ""))}</dd></div>
       <div><dt>Environment</dt><dd>${escape(String(info?.environment ?? ""))}</dd></div>
       <div><dt>Rollout mode</dt><dd>${control.mode ? `<span class="mode ${escape(String(control.mode))}">${escape(String(control.mode))}</span>` : "—"}</dd></div>
