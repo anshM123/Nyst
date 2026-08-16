@@ -150,8 +150,16 @@ export class EnvironmentGitHubCredentialSource implements GitHubCredentialSource
   }
 }
 
+/**
+ * The credential could not be resolved, or is malformed.
+ *
+ * A CONFIGURATION fact rather than a crash, so it carries 503 — the operator
+ * is told what is missing instead of being shown "internal_error" for
+ * something they could fix in a minute.
+ */
 export class GitHubCredentialError extends Error {
   override name = "GitHubCredentialError";
+  readonly statusCode = 503;
 }
 
 export class GitHubTransportError extends Error {
@@ -168,8 +176,30 @@ export class GitHubContractError extends Error {
   override name = "GitHubContractError";
 }
 
+/**
+ * A DELIBERATE REFUSAL, and it must not read as a crash (v0.3.3).
+ *
+ * Every one of these is Nyst declining to act because a precondition it
+ * requires is not true: the person is not a direct collaborator, the
+ * repository is not private, a role-setting PUT would create an invitation.
+ * They are the most informative thing the provider layer produces.
+ *
+ * None of them carried a `statusCode`, so the error handler — which surfaces a
+ * message only for statuses NYST SET ITSELF — collapsed all of them to 500
+ * `internal_error`. The operator was shown a crash for a decision, and the
+ * sentence explaining exactly which precondition failed was discarded.
+ *
+ * Third time this exact shape has appeared in one release: 503s collapsing,
+ * provider refusals collapsing, and the classify() word-match ordering. A
+ * refusal is a first-class result in this product, and a refusal that arrives
+ * as "internal_error" is indistinguishable from a bug.
+ *
+ * 409 CONFLICT: the request is well-formed and the world is not in a state
+ * where Nyst is willing to perform it.
+ */
 export class GitHubPreconditionError extends Error {
   override name = "GitHubPreconditionError";
+  readonly statusCode = 409;
 }
 
 export class GitHubObservationError extends GitHubPreconditionError {

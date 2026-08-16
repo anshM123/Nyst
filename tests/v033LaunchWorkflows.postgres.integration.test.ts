@@ -900,6 +900,37 @@ describe("Nyst v0.3.3 — connect a provider and leave Shadow, over HTTP", { ski
       + `that is missed refuses a credential every other layer accepted:\n  ${offenders.join("\n  ")}`);
   });
 
+  /**
+   * A PROVIDER REFUSAL IS NOT A CRASH. Third time this shape has appeared.
+   *
+   * Every GitHub precondition error is Nyst DECLINING to act because something
+   * it requires is not true — not a direct collaborator, not a private
+   * repository, a PUT that would create an invitation. They are the most
+   * informative thing the provider layer produces.
+   *
+   * None carried a `statusCode`, so the error handler — which surfaces a
+   * message only for statuses Nyst set itself — collapsed all of them to 500
+   * `internal_error`. The operator saw a crash where there was a decision, and
+   * the sentence naming the failed precondition was thrown away.
+   */
+  it("THE DEFECT: a provider precondition refusal carries a status, not a crash", async () => {
+    const { GitHubPreconditionError, GitHubCredentialError, GitHubContractError } =
+      await import("../src/providers/github/types.js");
+
+    const precondition = new GitHubPreconditionError("not a direct collaborator");
+    assert.equal((precondition as unknown as { statusCode?: number }).statusCode, 409,
+      "A DELIBERATE REFUSAL HAS NO STATUS, so it reaches the operator as internal_error and the reason "
+      + "is discarded as if it were an unvetted stack trace.");
+
+    // Configuration, not a crash: the operator can fix it in a minute if told.
+    assert.equal((new GitHubCredentialError("x") as unknown as { statusCode?: number }).statusCode, 503);
+
+    // And the one that genuinely IS unexpected keeps saying nothing. Asserted
+    // so the omission reads as a decision rather than the oversight above.
+    assert.equal((new GitHubContractError("x") as unknown as { statusCode?: number }).statusCode, undefined,
+      "an unrecognised provider response must NOT surface its message");
+  });
+
   it("STRUCTURAL: no schema pins a credential reference to one deployment", () => {
     const input = readFileSync(join(root, "src/providers/github/githubInput.ts"), "utf8");
     assert.doesNotMatch(input, /credential_ref:\s*lit\(/,

@@ -188,5 +188,5 @@ Things with new states, new routes, or changed responses:
 
 ---
 
-**1189 tests, 138 suites, 0 failing. 37 migrations.**
+**1190 tests, 138 suites, 0 failing. 37 migrations.**
 See `VERIFICATION.md` for what is verified and what is not.
